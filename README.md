@@ -15,7 +15,7 @@
 |------|-------|
 | License | MIT |
 | Phase | 1 — MVP (Windows file backup) |
-| Milestone | M1 in progress |
+| Milestone | M1 (review fixes; see PROGRESS.md) |
 | Production use | **Not ready** |
 
 ## What it is

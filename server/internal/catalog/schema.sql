@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
     id              TEXT PRIMARY KEY,
     ts              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     actor           TEXT NOT NULL DEFAULT '',  -- user id or system
+    actor_type      TEXT NOT NULL DEFAULT 'system', -- user|agent|system (PLAN)
     action          TEXT NOT NULL,             -- e.g. machine.enroll
     target          TEXT NOT NULL DEFAULT '',
     detail_json     TEXT NOT NULL DEFAULT '{}',
@@ -127,13 +128,15 @@ CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_events(action);
 
 CREATE TABLE IF NOT EXISTS enroll_tokens (
     id              TEXT PRIMARY KEY,
-    secret_hash     TEXT NOT NULL,             -- hash of secret portion
+    secret_hash     TEXT NOT NULL UNIQUE,      -- hash of secret portion
     expires_at      TEXT NOT NULL,
     used_at         TEXT,
     created_by      TEXT NOT NULL DEFAULT '',
     machine_id      TEXT,                      -- set when consumed
     created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_enroll_tokens_secret ON enroll_tokens(secret_hash);
 
 CREATE TABLE IF NOT EXISTS api_tokens (
     id              TEXT PRIMARY KEY,

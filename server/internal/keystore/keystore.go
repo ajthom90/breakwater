@@ -1,5 +1,6 @@
 // Package keystore holds the master key and per-repo encrypted secrets.
-// Agents never hold decryption keys — only the hashing key for content IDs.
+// Agents never hold decryption keys — only the hashing key for content IDs
+// (sourced from the vault's kopia ContentFormat after repo create).
 package keystore
 
 import (
@@ -49,29 +50,27 @@ func OpenOrCreate(db *catalog.DB, masterKeyPath string) (*Store, error) {
 	return &Store{db: db, master: master}, nil
 }
 
-// CreateRepoSecrets implements enroll.Keystore.
-func (s *Store) CreateRepoSecrets(ctx context.Context, repoID string) (repoPassword string, hashingKey []byte, err error) {
+// CreateRepoPassword generates a per-repo password and stores it.
+// Hashing key is stored later via SetHashingKey after the vault is created
+// (must come from kopia ContentFormat, not random bytes — REVIEW-M1 H1).
+func (s *Store) CreateRepoPassword(ctx context.Context, repoID string) (repoPassword string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	var pw [32]byte
 	if _, err := rand.Read(pw[:]); err != nil {
-		return "", nil, err
+		return "", err
 	}
 	repoPassword = fmt.Sprintf("%x", pw[:])
 
-	hashingKey = make([]byte, 32)
-	if _, err := rand.Read(hashingKey); err != nil {
-		return "", nil, err
-	}
-
 	pwEnc, err := s.seal([]byte(repoPassword))
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
-	hkEnc, err := s.seal(hashingKey)
+	// Placeholder empty hashing key until SetHashingKey; column is NOT NULL.
+	hkEnc, err := s.seal([]byte{})
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
 
 	err = s.db.WithTx(ctx, func(tx *sql.Tx) error {
@@ -81,9 +80,35 @@ func (s *Store) CreateRepoSecrets(ctx context.Context, repoID string) (repoPassw
 		return err
 	})
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
-	return repoPassword, hashingKey, nil
+	return repoPassword, nil
+}
+
+// SetHashingKey stores the vault-sourced content-ID HMAC secret for a repo.
+func (s *Store) SetHashingKey(ctx context.Context, repoID string, hashingKey []byte) error {
+	if len(hashingKey) == 0 {
+		return fmt.Errorf("hashing key must not be empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	hkEnc, err := s.seal(hashingKey)
+	if err != nil {
+		return err
+	}
+	return s.db.WithTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `
+			UPDATE keystore SET hashing_key_enc = ? WHERE repo_id = ?`, hkEnc, repoID)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		if n != 1 {
+			return fmt.Errorf("keystore row not found for repo %s", repoID)
+		}
+		return nil
+	})
 }
 
 // GetRepoPassword decrypts the repository password.
@@ -153,4 +178,3 @@ func DerivePurposeKey(master *[32]byte, purpose string) [32]byte {
 	copy(out[:], h.Sum(nil))
 	return out
 }
-

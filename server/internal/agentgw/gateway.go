@@ -200,16 +200,22 @@ type enrollmentServer struct {
 }
 
 func (e *enrollmentServer) Enroll(ctx context.Context, req *EnrollRequest) (*EnrollResponse, error) {
+	pi, ok := PeerFromContext(ctx)
+	if !ok || pi.CertFP == "" {
+		return nil, status.Error(codes.Unauthenticated, "missing peer certificate")
+	}
 	resp, err := e.svc.Enroll(ctx, enroll.EnrollRequest{
-		Token:         req.Token,
-		Hostname:      req.Hostname,
-		OS:            req.OS,
-		OSVersion:     req.OSVersion,
-		AgentVersion:  req.AgentVersion,
-		Arch:          req.Arch,
-		ClientCertPEM: req.ClientCertPEM,
+		Token:            req.Token,
+		Hostname:         req.Hostname,
+		OS:               req.OS,
+		OSVersion:        req.OSVersion,
+		AgentVersion:     req.AgentVersion,
+		Arch:             req.Arch,
+		ClientCertPEM:    req.ClientCertPEM,
+		ConnectionCertFP: pi.CertFP, // B2: bind TLS peer, not body alone
 	})
 	if err != nil {
+		// Map known client errors; do not leak raw DB internals (REVIEW-M1 M6 partial).
 		return nil, status.Errorf(codes.InvalidArgument, "enroll: %v", err)
 	}
 	return &EnrollResponse{

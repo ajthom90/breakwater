@@ -72,12 +72,18 @@ const (
 // Implementations MUST confine all kopia usage behind this boundary.
 //
 // Concurrency: backup/replication share a read lock; prune/verify take exclusive.
+// OpenObject readers must complete before Prune on the same vault (scheduler
+// serializes jobs per-repo in M2+; see REVIEW-M1 M2).
 type Vault interface {
-	// Close releases repository resources.
+	// Close releases repository resources. Subsequent method calls return an error.
 	Close(ctx context.Context) error
 
-	// PutContent stores raw bytes as a content-addressed blob and returns its ID.
-	// Server re-computes the ID from data (integrity check for agent uploads).
+	// HashingKey returns the repo's content-ID HMAC secret and algorithm name
+	// (e.g. BLAKE2B-256-128). Never returns encryption keys or the master key.
+	HashingKey(ctx context.Context) (secret []byte, algorithm string, err error)
+
+	// PutContent stores raw bytes as a single content-addressed blob (max 4MiB)
+	// and returns its content ID. Larger data must use WriteObject.
 	PutContent(ctx context.Context, data []byte) (ContentID, error)
 
 	// HasContents reports which of the given content IDs already exist (have/want).
@@ -120,10 +126,15 @@ type Vault interface {
 
 // VaultStats is a snapshot of repository usage.
 type VaultStats struct {
-	// ContentCount is the number of content items (approx via iteration).
+	// ContentCount is non-deleted contents (including system/manifest-prefixed).
 	ContentCount int64
-	// TotalSizeBytes is summed packed lengths when available.
+	// TotalSizeBytes is summed packed lengths of non-deleted contents.
 	TotalSizeBytes int64
+	// UserContentCount is non-deleted unprefixed contents (backup payloads).
+	// Use this for reclamation assertions — maintenance may add manifest blobs.
+	UserContentCount int64
+	// UserSizeBytes is packed size of unprefixed non-deleted contents.
+	UserSizeBytes int64
 }
 
 // Manager owns per-machine vaults under a repos root directory.

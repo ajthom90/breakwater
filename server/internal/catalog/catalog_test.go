@@ -3,6 +3,8 @@ package catalog_test
 import (
 	"context"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,7 +44,6 @@ func TestMigrateAndMachineRoundTrip(t *testing.T) {
 		t.Fatalf("hostname: %s", got.Hostname)
 	}
 
-	// Default policy seeded
 	var n int
 	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM policies WHERE is_default = 1`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("default policy: n=%d err=%v", n, err)
@@ -70,5 +71,57 @@ func TestEnrollTokenSingleUse(t *testing.T) {
 	_, err = db.ConsumeEnrollToken(ctx, secret, "machine-2")
 	if err == nil {
 		t.Fatal("expected reuse to fail")
+	}
+}
+
+func TestEnrollTokenExpired(t *testing.T) {
+	ctx := context.Background()
+	db, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	secret := "expired-secret"
+	exp := time.Now().UTC().Add(-time.Hour)
+	if err := db.InsertEnrollToken(ctx, "tok-exp", secret, "admin", exp); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ConsumeEnrollToken(ctx, secret, "m")
+	if err == nil {
+		t.Fatal("expected expired token rejection")
+	}
+	t.Logf("expired rejected: %v", err)
+}
+
+func TestEnrollTokenConcurrentConsume(t *testing.T) {
+	ctx := context.Background()
+	db, err := catalog.Open(filepath.Join(t.TempDir(), "catalog.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	secret := "race-secret"
+	if err := db.InsertEnrollToken(ctx, "tok-race", secret, "admin", time.Now().UTC().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 16
+	var success atomic.Int32
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, err := db.ConsumeEnrollToken(ctx, secret, "machine")
+			if err == nil {
+				success.Add(1)
+			}
+		}(i)
+	}
+	wg.Wait()
+	if success.Load() != 1 {
+		t.Fatalf("expected exactly 1 successful consume, got %d", success.Load())
 	}
 }

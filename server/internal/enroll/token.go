@@ -22,10 +22,10 @@ const (
 
 // Token is a parsed enrollment token.
 type Token struct {
-	HostPort  string // host:port of agent gRPC endpoint
-	ServerFP  string // SHA-256 hex of server cert
-	Secret    string // single-use secret
-	Raw       string
+	HostPort string // host:port of agent gRPC endpoint
+	ServerFP string // SHA-256 hex of server cert
+	Secret   string // single-use secret
+	Raw      string
 }
 
 // Mint creates a new token string and returns (rawToken, secret, error).

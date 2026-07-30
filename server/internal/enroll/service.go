@@ -15,24 +15,27 @@ import (
 
 // Keystore stores per-repo secrets. Narrow interface to avoid vault import cycles.
 type Keystore interface {
-	// CreateRepoSecrets generates and stores password + hashing key for a repo.
-	// Returns (repoPassword, hashingKey, error).
-	CreateRepoSecrets(ctx context.Context, repoID string) (repoPassword string, hashingKey []byte, err error)
+	// CreateRepoPassword generates and stores a repo password (hashing key set later).
+	CreateRepoPassword(ctx context.Context, repoID string) (repoPassword string, err error)
+	// SetHashingKey stores the vault-sourced content-ID HMAC secret.
+	SetHashingKey(ctx context.Context, repoID string, hashingKey []byte) error
 }
 
-// VaultCreator initializes a per-machine vault repository.
+// VaultCreator initializes a per-machine vault and returns its hashing key.
 type VaultCreator interface {
-	Create(ctx context.Context, repoID, password string) error
+	// Create initializes the repo and returns (hashingSecret, algorithm, error).
+	// Hashing secret is from kopia ContentFormat — never a random placeholder.
+	Create(ctx context.Context, repoID, password string) (hashingKey []byte, algorithm string, err error)
 }
 
 // Service handles enrollment: token consume → machine row → repo → hashing key.
 type Service struct {
-	DB           *catalog.DB
-	Keystore     Keystore
-	Vaults       VaultCreator
-	ServerFP     string
+	DB            *catalog.DB
+	Keystore      Keystore
+	Vaults        VaultCreator
+	ServerFP      string
 	DefaultPolicy string
-	Log          *slog.Logger
+	Log           *slog.Logger
 }
 
 // EnrollRequest is the in-process enroll payload (mirrors proto without codegen dependency).
@@ -43,15 +46,19 @@ type EnrollRequest struct {
 	OSVersion     string
 	AgentVersion  string
 	Arch          string
-	ClientCertPEM []byte
+	ClientCertPEM []byte // optional; if set must match ConnectionCertFP
+	// ConnectionCertFP is the SHA-256 fingerprint of the TLS peer certificate.
+	// Required. Identity is always bound from the connection, never the body alone.
+	ConnectionCertFP string
 }
 
 // EnrollResponse is returned to the agent after successful enrollment.
 type EnrollResponse struct {
-	MachineID              string
-	HashingKey             []byte
-	ServerCertFingerprint  string
-	PolicyID               string
+	MachineID             string
+	HashingKey            []byte
+	HashingAlgorithm      string
+	ServerCertFingerprint string
+	PolicyID              string
 }
 
 // Enroll performs the enrollment handshake.
@@ -64,11 +71,22 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 		return nil, fmt.Errorf("token server fingerprint does not match this server")
 	}
 
-	cert, err := mtls.ParseCertPEM(req.ClientCertPEM)
-	if err != nil {
-		return nil, fmt.Errorf("client cert: %w", err)
+	// B2: identity comes from the TLS connection peer, not the request body alone.
+	if req.ConnectionCertFP == "" {
+		return nil, fmt.Errorf("missing connection certificate fingerprint")
 	}
-	clientFP := mtls.CertFingerprintFromTLS(cert)
+	clientFP := req.ConnectionCertFP
+
+	if len(req.ClientCertPEM) > 0 {
+		cert, err := mtls.ParseCertPEM(req.ClientCertPEM)
+		if err != nil {
+			return nil, fmt.Errorf("client cert: %w", err)
+		}
+		bodyFP := mtls.CertFingerprintFromTLS(cert)
+		if bodyFP != clientFP {
+			return nil, fmt.Errorf("client certificate does not match TLS connection")
+		}
+	}
 
 	// Reject if this cert is already enrolled.
 	existing, err := s.DB.MachineByCertFP(ctx, clientFP)
@@ -88,13 +106,23 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 	}
 	_ = tokenID
 
-	repoPassword, hashingKey, err := s.Keystore.CreateRepoSecrets(ctx, machineID)
+	repoPassword, err := s.Keystore.CreateRepoPassword(ctx, machineID)
 	if err != nil {
 		return nil, fmt.Errorf("keystore: %w", err)
 	}
+
+	var hashingKey []byte
+	var hashingAlgo string
 	if s.Vaults != nil {
-		if err := s.Vaults.Create(ctx, machineID, repoPassword); err != nil {
+		hashingKey, hashingAlgo, err = s.Vaults.Create(ctx, machineID, repoPassword)
+		if err != nil {
 			return nil, fmt.Errorf("create vault: %w", err)
+		}
+		if len(hashingKey) == 0 {
+			return nil, fmt.Errorf("vault returned empty hashing key")
+		}
+		if err := s.Keystore.SetHashingKey(ctx, machineID, hashingKey); err != nil {
+			return nil, fmt.Errorf("store hashing key: %w", err)
 		}
 	}
 
@@ -123,20 +151,14 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 	return &EnrollResponse{
 		MachineID:             machineID,
 		HashingKey:            hashingKey,
+		HashingAlgorithm:      hashingAlgo,
 		ServerCertFingerprint: s.ServerFP,
 		PolicyID:              policyID,
 	}, nil
 }
 
-// VerifyClientCert is a tls.Config VerifyPeerCertificate for the agent port.
-// During enrollment the client may not yet be in the catalog — Enroll RPC
-// is allowed with any valid client cert; other RPCs require a known FP.
-//
-// allowedUnknown is true when the connection may be an enroll attempt
-// (checked by the gRPC interceptor via peer state). For the M1 gateway we use
-// a two-phase approach: RequireAnyClientCert + per-RPC pin check.
+// KnownClientFingerprint looks up an enrolled machine by client cert FP.
 func (s *Service) KnownClientFingerprint(fp string) (machineID string, ok bool) {
-	// Synchronous lookup — catalog is local SQLite.
 	m, err := s.DB.MachineByCertFP(context.Background(), fp)
 	if err != nil || m == nil {
 		return "", false

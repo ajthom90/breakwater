@@ -5,7 +5,6 @@ go 1.23.0
 require (
 	github.com/kopia/kopia v0.19.0
 	github.com/oklog/ulid/v2 v2.1.1
-	github.com/pkg/errors v0.9.1
 	golang.org/x/crypto v0.32.0
 	google.golang.org/grpc v1.69.4
 	modernc.org/sqlite v1.34.5
@@ -34,6 +33,7 @@ require (
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/petar/GoLLRB v0.0.0-20210522233825-ae3b015fd3e9 // indirect
 	github.com/pierrec/lz4 v2.6.1+incompatible // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.20.5 // indirect
 	github.com/prometheus/client_model v0.6.1 // indirect
 	github.com/prometheus/common v0.62.0 // indirect

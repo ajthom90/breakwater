@@ -29,23 +29,39 @@ jobs:
       - name: Go work sync
         run: go work sync
 
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l server pkg agent cli restore)
+          if [ -n "$unformatted" ]; then
+            echo "unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: Build breakwaterd
         working-directory: server
         run: |
           CGO_ENABLED=0 go build -o /tmp/breakwaterd ./cmd/breakwaterd
           /tmp/breakwaterd -version
 
-      - name: Unit tests (short — skips 10GB engine gate)
+      - name: Server unit tests (short + race)
         working-directory: server
-        run: go test ./... -count=1 -short -timeout 10m
+        run: go test ./... -count=1 -short -race -timeout 10m
 
-      - name: Engine gate (10GB write/restore/verify/GC)
+      - name: pkg unit tests
+        working-directory: pkg
+        run: go test ./... -count=1 -race -timeout 5m
+
+      - name: Engine gate (reduced — PR/push)
         working-directory: server
-        run: go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -timeout 45m -v
+        env:
+          BW_GATE_BYTES: "268435456" # 256 MiB
+        run: go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -timeout 15m -v
 
       - name: Enrollment + mTLS demo
         working-directory: server
-        run: go test ./internal/agentgw/ -count=1 -run TestM1_EnrollmentAndWrongCertRejection -v
+        run: |
+          go test ./internal/agentgw/ -count=1 -run 'TestM1_EnrollmentAndWrongCertRejection|TestEnroll_BodyCertMismatch' -v
 
       - name: Windows cross-compile (server)
         working-directory: server
@@ -65,6 +81,19 @@ jobs:
 
       - name: Docker build
         run: docker build -f packaging/docker/Dockerfile -t breakwater:ci .
+
+  engine-gate-full:
+    name: Engine gate (10GB nightly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+      - name: Full 10GB engine gate
+        working-directory: server
+        run: go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -timeout 45m -v
 
   windows:
     name: Windows agent unit tests

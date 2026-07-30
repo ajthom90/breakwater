@@ -59,12 +59,13 @@ func GenerateServerIdentity(commonName string, hosts []string, validFor time.Dur
 			Organization: []string{"Breakwater"},
 			CommonName:   commonName,
 		},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(validFor),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment | x509.KeyUsageCertSign,
+		NotBefore: time.Now().Add(-time.Hour),
+		NotAfter:  time.Now().Add(validFor),
+		// Leaf server cert for fingerprint pinning — not a CA (REVIEW-M1 M5).
+		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
-		IsCA:                  true,
+		IsCA:                  false,
 	}
 	for _, h := range hosts {
 		if ip := net.ParseIP(h); ip != nil {

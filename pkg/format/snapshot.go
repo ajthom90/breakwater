@@ -18,9 +18,9 @@ type TreeObject struct {
 
 // TreeEntry is one name within a directory.
 type TreeEntry struct {
-	Name string   `json:"name"`
+	Name string    `json:"name"`
 	Type EntryType `json:"type"` // file|dir|symlink|reparse
-	Size int64    `json:"size,omitempty"`
+	Size int64     `json:"size,omitempty"`
 	// Timestamps as Unix nanoseconds (UTC).
 	MtimeNS int64 `json:"mtime_ns,omitempty"`
 	CtimeNS int64 `json:"ctime_ns,omitempty"`
@@ -59,10 +59,10 @@ type ADSEntry struct {
 // 4MiB aligned blocks; all-zero → well-known zero content ID.
 // Reserved for Phase 3/4; schema frozen for format versioning.
 type ImageManifest struct {
-	Version   int              `json:"v"`
-	BlockSize int              `json:"block_size"` // bytes; default 4MiB
-	Size      int64            `json:"size"`       // total image bytes
-	Blocks    []ImageBlockRef  `json:"blocks"`
+	Version   int             `json:"v"`
+	BlockSize int             `json:"block_size"` // bytes; default 4MiB
+	Size      int64           `json:"size"`       // total image bytes
+	Blocks    []ImageBlockRef `json:"blocks"`
 }
 
 // ImageBlockRef is one fixed block in an image.

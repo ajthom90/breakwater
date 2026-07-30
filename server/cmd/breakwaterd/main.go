@@ -25,12 +25,12 @@ var version = "0.0.1-dev"
 
 func main() {
 	var (
-		dataDir    = flag.String("data", "/data", "data directory (catalog + keys)")
-		reposDir   = flag.String("repos", "/repos", "repositories root")
-		agentAddr  = flag.String("agent-addr", ":9443", "agent gRPC listen address (mTLS)")
-		webAddr    = flag.String("web-addr", ":8443", "web/REST listen address")
-		hostname   = flag.String("hostname", "breakwater", "server certificate CN / hostname")
-		showVer    = flag.Bool("version", false, "print version and exit")
+		dataDir   = flag.String("data", "/data", "data directory (catalog + keys)")
+		reposDir  = flag.String("repos", "/repos", "repositories root")
+		agentAddr = flag.String("agent-addr", ":9443", "agent gRPC listen address (mTLS)")
+		webAddr   = flag.String("web-addr", ":8443", "web/REST listen address")
+		hostname  = flag.String("hostname", "breakwater", "server certificate CN / hostname")
+		showVer   = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 	if *showVer {
@@ -138,9 +138,12 @@ type vaultAdapter struct {
 	m *vault.Manager
 }
 
-func (a *vaultAdapter) Create(ctx context.Context, repoID, password string) error {
-	_, err := a.m.Create(ctx, repoID, password)
-	return err
+func (a *vaultAdapter) Create(ctx context.Context, repoID, password string) ([]byte, string, error) {
+	v, err := a.m.Create(ctx, repoID, password)
+	if err != nil {
+		return nil, "", err
+	}
+	return v.HashingKey(ctx)
 }
 
 func loadOrCreateServerIdentity(keysDir, hostname string) (*mtls.Identity, error) {

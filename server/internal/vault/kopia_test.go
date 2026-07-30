@@ -17,12 +17,12 @@ import (
 
 // TestEngineGate_Kopia is the M1 storage-engine decision gate (PLAN.md).
 //
-// Criterion: write chunked data → restore → verify → retention + GC.
-// Default size is 10 GiB on Linux (full gate). Use BW_GATE_BYTES to override
-// (e.g. smaller for quick local iteration). Skip with -short.
+// Criterion: write chunked data → restore → verify → retention + GC with real
+// reclamation (forgotten contents gone, stats shrink, live object intact).
+// Default size is 10 GiB. Use BW_GATE_BYTES to override. Skip with -short.
 func TestEngineGate_Kopia(t *testing.T) {
 	if testing.Short() {
-		t.Skip("skipping 10GB engine gate in -short mode")
+		t.Skip("skipping engine gate in -short mode")
 	}
 
 	ctx := context.Background()
@@ -37,8 +37,6 @@ func TestEngineGate_Kopia(t *testing.T) {
 			totalBytes = n
 		}
 	}
-	// On non-CI local runs without override, still honor full size if disk allows;
-	// shrink only when explicitly requested via BW_GATE_BYTES.
 
 	t.Logf("engine gate: writing %d bytes (%.2f GiB) into kopia vault", totalBytes, float64(totalBytes)/(1<<30))
 
@@ -49,6 +47,13 @@ func TestEngineGate_Kopia(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create vault: %v", err)
 	}
+
+	// Hashing key must come from repo format (not random).
+	hk, algo, err := v.HashingKey(ctx)
+	if err != nil || len(hk) == 0 || algo == "" {
+		t.Fatalf("HashingKey: keyLen=%d algo=%q err=%v", len(hk), algo, err)
+	}
+	t.Logf("hashing key: algo=%s secretLen=%d", algo, len(hk))
 
 	// --- Write chunked data (CDC) ---
 	const chunk = 4 << 20 // 4 MiB generation blocks
@@ -65,7 +70,6 @@ func TestEngineGate_Kopia(t *testing.T) {
 			if remain := totalBytes - written; remain < int64(n) {
 				n = int(remain)
 			}
-			// Deterministic pseudo-random-looking data (compressible + unique).
 			fillDeterministic(buf[:n], seq)
 			seq++
 			if _, err := pw.Write(buf[:n]); err != nil {
@@ -104,10 +108,15 @@ func TestEngineGate_Kopia(t *testing.T) {
 	t.Logf("snapshot record: %s", recID)
 
 	// Second smaller snapshot that we will forget (retention exercise).
-	small := bytes.Repeat([]byte("orphan-payload-for-gc-"), 64<<10)
+	// Unique payload so content is not shared with the live object.
+	small := bytes.Repeat([]byte("orphan-payload-for-gc-UNIQUE-"), 64<<10)
 	smallOID, err := v.WriteObject(ctx, vault.SplitterFixed4M, bytes.NewReader(small))
 	if err != nil {
 		t.Fatalf("WriteObject small: %v", err)
+	}
+	forgetContentIDs, err := v.VerifyObject(ctx, smallOID)
+	if err != nil || len(forgetContentIDs) == 0 {
+		t.Fatalf("VerifyObject small: ids=%v err=%v", forgetContentIDs, err)
 	}
 	forgetID, err := v.PutSnapshotRecord(ctx, vault.SnapshotRecord{
 		Kind:         vault.KindFileSnapshot,
@@ -188,12 +197,17 @@ func TestEngineGate_Kopia(t *testing.T) {
 	if len(listed) < 2 {
 		t.Fatalf("expected ≥2 snapshots, got %d", len(listed))
 	}
+	// M8: Timestamp populated
+	for _, m := range listed {
+		if m.Timestamp.IsZero() {
+			t.Fatalf("ListSnapshotRecords Timestamp empty for %s", m.ID)
+		}
+	}
 
-	// --- Retention (forget) + GC ---
+	// --- Retention (forget) + GC with reclamation assertions ---
 	if err := v.DeleteSnapshotRecord(ctx, forgetID); err != nil {
 		t.Fatalf("DeleteSnapshotRecord: %v", err)
 	}
-	// Live snapshot must remain
 	if _, err := v.GetSnapshotRecord(ctx, recID); err != nil {
 		t.Fatalf("live snapshot missing after forget: %v", err)
 	}
@@ -202,19 +216,40 @@ func TestEngineGate_Kopia(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stats before prune: %v", err)
 	}
-	t.Logf("stats before prune: contents=%d size=%d", before.ContentCount, before.TotalSizeBytes)
+	t.Logf("stats before prune: user_contents=%d user_size=%d all=%d",
+		before.UserContentCount, before.UserSizeBytes, before.ContentCount)
 
 	if err := v.Prune(ctx); err != nil {
 		t.Fatalf("Prune/GC: %v", err)
 	}
 	t.Logf("Prune completed")
 
-	// Primary object still readable after GC
+	// Forgotten content IDs must be absent from have/want.
+	hasForget, err := v.HasContents(ctx, forgetContentIDs)
+	if err != nil {
+		t.Fatalf("HasContents forgotten: %v", err)
+	}
+	for i, present := range hasForget {
+		if present {
+			t.Fatalf("forgotten content %s still present after prune", forgetContentIDs[i])
+		}
+	}
+	// Forgotten object must be unreadable (contents dropped from index).
+	if rBad, err := v.OpenObject(ctx, smallOID); err == nil {
+		_, _ = io.Copy(io.Discard, rBad)
+		_ = rBad.Close()
+		t.Fatalf("forgotten object %s still readable after prune", smallOID)
+	} else {
+		t.Logf("forgotten object unreadable as expected: %v", err)
+	}
+
+	// Live object still readable with correct size + checksum after GC
 	r2, err := v.OpenObject(ctx, objID)
 	if err != nil {
 		t.Fatalf("OpenObject after prune: %v", err)
 	}
-	n2, err := io.Copy(io.Discard, r2)
+	h2 := sha256.New()
+	n2, err := io.Copy(h2, r2)
 	_ = r2.Close()
 	if err != nil {
 		t.Fatalf("read after prune: %v", err)
@@ -222,12 +257,26 @@ func TestEngineGate_Kopia(t *testing.T) {
 	if n2 != totalBytes {
 		t.Fatalf("size after prune %d, want %d", n2, totalBytes)
 	}
+	if !bytes.Equal(h2.Sum(nil), wantSum) {
+		t.Fatalf("checksum mismatch after prune")
+	}
 
 	after, err := v.Stats(ctx)
 	if err != nil {
 		t.Fatalf("Stats after prune: %v", err)
 	}
-	t.Logf("stats after prune: contents=%d size=%d", after.ContentCount, after.TotalSizeBytes)
+	t.Logf("stats after prune: user_contents=%d user_size=%d all=%d",
+		after.UserContentCount, after.UserSizeBytes, after.ContentCount)
+	if after.UserContentCount >= before.UserContentCount {
+		t.Fatalf("reclamation failed: user content count did not shrink (%d → %d)",
+			before.UserContentCount, after.UserContentCount)
+	}
+	if after.UserSizeBytes >= before.UserSizeBytes {
+		t.Fatalf("reclamation failed: user size did not shrink (%d → %d)",
+			before.UserSizeBytes, after.UserSizeBytes)
+	}
+	t.Logf("reclamation OK: user contents %d→%d user size %d→%d",
+		before.UserContentCount, after.UserContentCount, before.UserSizeBytes, after.UserSizeBytes)
 
 	// Re-open from disk (crash recovery path)
 	if err := mgr.CloseAll(ctx); err != nil {
@@ -256,7 +305,15 @@ func TestEngineGate_Kopia(t *testing.T) {
 		t.Fatalf("missing config %s: %v", cfg, err)
 	}
 
-	t.Log("ENGINE GATE PASSED: kopia repo/content/object/manifest/maintenance implement vault interface")
+	// M3: methods after Close return error, not panic
+	if err := v2.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := v2.Stats(ctx); err == nil {
+		t.Fatal("expected error on Stats after Close")
+	}
+
+	t.Log("ENGINE GATE PASSED: write/restore/verify + mark-sweep reclamation + re-open")
 }
 
 // TestVault_SmallRoundTrip is a fast unit test always run in CI.
@@ -305,14 +362,43 @@ func TestVault_SmallRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPutContent_RejectsOversize is H2: payloads >4MiB must error.
+func TestPutContent_RejectsOversize(t *testing.T) {
+	ctx := context.Background()
+	mgr := vault.NewManager(t.TempDir())
+	defer mgr.CloseAll(ctx)
+
+	v, err := mgr.Create(ctx, "oversize", "pw")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	big := make([]byte, vault.MaxPutContentBytes+1)
+	_, err = v.PutContent(ctx, big)
+	if err == nil {
+		t.Fatal("expected PutContent to reject >4MiB payload")
+	}
+	t.Logf("oversize rejected: %v", err)
+
+	// Exactly 4MiB is allowed.
+	ok := make([]byte, vault.MaxPutContentBytes)
+	for i := range ok {
+		ok[i] = byte(i)
+	}
+	cid, err := v.PutContent(ctx, ok)
+	if err != nil {
+		t.Fatalf("PutContent 4MiB: %v", err)
+	}
+	if cid == "" {
+		t.Fatal("empty content id")
+	}
+}
+
 func fillDeterministic(buf []byte, seq uint64) {
-	// Mix seq into a simple LCG-ish stream so blocks differ and compress modestly.
 	var state uint64 = 0x9e3779b97f4a7c15 ^ seq
 	for i := 0; i < len(buf); {
 		state = state*6364136223846793005 + 1
 		if i+8 <= len(buf) {
 			binary.LittleEndian.PutUint64(buf[i:], state^seq)
-			// Sprinkle zeros for zstd friendliness every 64 bytes.
 			if i%64 == 0 {
 				binary.LittleEndian.PutUint64(buf[i:], 0)
 			}
