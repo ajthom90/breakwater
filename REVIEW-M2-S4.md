@@ -156,3 +156,41 @@ Covers CJK, emoji, Greek, precomposed Latin — but no right-to-left script and 
 | S4-F10 | ✅ Fixed | RTL (`مرحبا.txt`) + NFD (`cafe\u0301.txt`) fixtures |
 
 Red-first captures and after-fix evidence: see `PROGRESS.md` stage-4 fix round.
+
+---
+
+## Reviewer verification (fix round, 2026-07-30)
+
+Independently verified `6092ed8`. Both confirmed defects re-tested with the
+reviewer's own probes:
+
+- **S4-F6:** extra data behind a chmod-000 directory now yields
+  `err="restored walk: … permission denied"` instead of `Equal=true` — an
+  incomplete scan can no longer certify a match.
+- **S4-F1:** the `-race` probe (concurrent jobs + fast heartbeat) is clean;
+  `sendMu` serializes every `Send`/`CloseSend`, and an existing control test now
+  uses a 50 ms heartbeat so the condition is permanently exercised.
+
+Mutation battery — three for three killed: restored-walk error discarded →
+`TestS4F6_ExtraBehindUnreadableDirMustNotEqual` fails; `sendMu` removed →
+`TestS4F1_ConcurrentSendUnderRace` reports DATA RACE; replay hardcoded to
+`Success: true` → `TestS4F3_FailedJobReplayMustNotClaimSuccess` fails.
+
+Spot-verified the rest: `BWTOKEN` is `Hidden="yes"` + listed in
+`MsiHiddenProperties`, and the token now lands in
+`C:\ProgramData\Breakwater\pending-enroll.token` (SecureDir-restricted) rather
+than world-readable HKLM; `writeAtomic` fsyncs the temp file and the directory
+(platform-split); ACL comparison is SDDL-based with `icacls` demoted to
+mismatch detail. Full suites green under `-race` across server/agent/pkg/tools;
+`GOOS=windows` cross-build OK.
+
+**Stage 4 closed.**
+
+Nit for a later sweep (not gating): `Compare` now returns `(nil, err)` on walk
+failure, so callers that log `res.Equal()` before checking `err` nil-panic — the
+reviewer's own probe hit this. Consider returning the partial result alongside
+the error, or document the nil contract at the call site.
+
+Carried into stage 5: the untested-on-Windows list is now 12 items and is the
+gating checklist for the first real Windows run — M2 cannot be called done on
+Windows evidence until CI's `windows-latest` job has actually run green.
