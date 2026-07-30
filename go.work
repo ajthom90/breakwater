@@ -6,4 +6,5 @@ use (
 	./pkg
 	./restore
 	./server
+	./tools/golden
 )

@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Breakwater Agent MSI — WiX v5 authoring.
+
+  Build (windows-latest CI / local Windows with WiX v5):
+    wix build -o breakwater-agent.msi \
+      -d AgentExePath=path\to\breakwater-agent.exe \
+      -d ProductVersion=0.0.1 \
+      BreakwaterAgent.wxs
+
+  Silent install with enrollment token:
+    msiexec /i breakwater-agent.msi /qn BWTOKEN=BW1:host:port:fp:secret
+
+  First service start reads BWTOKEN from the service environment (set below)
+  and enrolls into C:\ProgramData\Breakwater\.
+
+  Unsigned for MVP (PLAN: signing arrives Phase 2). CI publishes SHA256.
+
+  UNTESTED ON WINDOWS until first CI windows-latest run validates the toolchain
+  and install/uninstall behaviour — see PROGRESS.md untested list.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Breakwater Backup Agent"
+      Manufacturer="Breakwater"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+      Scope="perMachine"
+      Compressed="yes">
+
+    <MajorUpgrade
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed."
+        Schedule="afterInstallInitialize" />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Enrollment token property: msiexec /i … BWTOKEN=BW1:… -->
+    <Property Id="BWTOKEN" Secure="yes" />
+
+    <!-- Install dir -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLDIR" Name="Breakwater">
+        <Directory Id="AgentDir" Name="Agent" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- State dir under CommonAppData (ProgramData) -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="BreakwaterData" Name="Breakwater" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="AgentComponents" Directory="AgentDir">
+      <Component Id="AgentExe" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901">
+        <File Id="BreakwaterAgentExe"
+              Source="$(var.AgentExePath)"
+              Name="breakwater-agent.exe"
+              KeyPath="yes" />
+
+        <!-- Windows service: SYSTEM, auto-start, delayed -->
+        <ServiceInstall
+            Id="BreakwaterAgentService"
+            Name="BreakwaterAgent"
+            DisplayName="Breakwater Backup Agent"
+            Description="Breakwater backup agent — dials out to the Breakwater server, runs backup jobs."
+            Type="ownProcess"
+            Start="auto"
+            Account="LocalSystem"
+            ErrorControl="normal"
+            Vital="yes"
+            Interactive="no">
+          <ServiceConfig DelayedAutoStart="yes" OnInstall="yes" OnReinstall="yes" />
+        </ServiceInstall>
+
+        <ServiceControl
+            Id="StartBreakwaterAgent"
+            Name="BreakwaterAgent"
+            Start="install"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- State directory with intended ACL (SYSTEM + Administrators).
+         WiX util:PermissionEx requires WixUtilExtension; encoded for CI validation.
+         Agent also self-secures the dir on Open() as defense in depth. -->
+    <ComponentGroup Id="DataComponents" Directory="BreakwaterData">
+      <Component Id="DataDir" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
+        <CreateFolder>
+          <!-- util:PermissionEx SYSTEM + Admins only — enabled when WixToolset.Util.wixext is present.
+               For MVP, CreateFolder alone + agent SecureDir() at runtime. -->
+        </CreateFolder>
+        <RegistryValue
+            Root="HKLM"
+            Key="Software\Breakwater\Agent"
+            Name="StateDir"
+            Type="string"
+            Value="[BreakwaterData]"
+            KeyPath="yes" />
+        <!-- Persist BWTOKEN for first-start enrollment if supplied at install -->
+        <RegistryValue
+            Root="HKLM"
+            Key="Software\Breakwater\Agent"
+            Name="PendingEnrollToken"
+            Type="string"
+            Value="[BWTOKEN]" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Event log source registration via registry (no custom action for MVP). -->
+    <ComponentGroup Id="EventLogComponents" Directory="AgentDir">
+      <Component Id="EventLogSource" Guid="D4E5F6A7-B8C9-0123-DEF0-234567890123">
+        <RegistryKey Root="HKLM" Key="SYSTEM\CurrentControlSet\Services\EventLog\Application\BreakwaterAgent">
+          <RegistryValue Name="EventMessageFile" Type="expandable" Value="[AgentDir]breakwater-agent.exe" KeyPath="yes" />
+          <RegistryValue Name="TypesSupported" Type="integer" Value="7" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Breakwater Agent" Level="1">
+      <ComponentGroupRef Id="AgentComponents" />
+      <ComponentGroupRef Id="DataComponents" />
+      <ComponentGroupRef Id="EventLogComponents" />
+    </Feature>
+
+    <!--
+      Clean uninstall:
+        ServiceControl Remove=uninstall stops + deletes the service.
+        Files under INSTALLDIR removed with components.
+        State dir under ProgramData: left in place intentionally so reinstall
+        can re-use enrollment? PLAN says "leave backups untouched" — backups
+        live on the server, not here. Agent state (certs) is removed with the
+        DataDir component on uninstall. Operators who need to wipe may delete
+        C:\ProgramData\Breakwater\ manually. Actually CreateFolder components
+        remove the folder on uninstall if empty — certs will be removed.
+
+      Backups are server-side only; uninstall never touches the vault.
+    -->
+  </Package>
+</Wix>

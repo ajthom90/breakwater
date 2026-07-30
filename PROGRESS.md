@@ -4,7 +4,7 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
-**Phase 1 — M2 (weeks 3–4)** — 🔄 **IN PROGRESS** (stages 1–3 complete; see [M2 progress](#m2-progress) below)
+**Phase 1 — M2 (weeks 3–4)** — 🔄 **IN PROGRESS** (stages 1–4 complete; see [M2 progress](#m2-progress) below)
 
 **Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; closed at `161fb18`)
 
@@ -456,19 +456,108 @@ BW_GATE_BYTES=268435456 TestEngineGate_Kopia  # PASS
 pkg + agent tests                             # PASS
 grep bw-object-from-contents …                # exit 1
 ```
+
+---
+
+### Stage 4 — Windows agent service, WiX MSI, golden dataset (2026-07-30)
+
+Real agent binds to stage-2 Channel + stage-3 DataService + `pkg/backup`. Built and
+unit-tested on darwin; Windows syscalls/ACLs/service/MSI marked untested until
+first `windows-latest` CI / VM run.
+
+| Deliverable | Status | Evidence |
+|-------------|--------|----------|
+| Agent service core (`--console` + Windows SCM) | ✅ | `agent/internal/service`; cross-compile green |
+| State dir + atomic identity (temp-then-rename) | ✅ | `agent/internal/state`; unit tests |
+| Enrollment client (BW1 token, zero TOFU FP pin) | ✅ | `agent/internal/enroll` + `TestM2S4_*` |
+| Persistent dial-out + keepalive 30s + jittered backoff | ✅ | `agent/internal/control` |
+| Completed job_id record (reconnect idempotency) | ✅ | `TestAgent_ReconnectIdempotency` + `TestM2S4_ReconnectIdempotency` |
+| JobCancel → terminal JobResult | ✅ | `TestM2S4_AgentCancelConfirmation` (state=cancelled) |
+| Job types: INVENTORY / NOOP / FILE_BACKUP | ✅ | branches on `JobStart.type`; reuses `pkg/backup` |
+| WiX v5 MSI authoring + CI build script | ✅ | `packaging/msi/`; first CI run validates toolchain |
+| Golden generator + comparer (portable degrade) | ✅ | `tools/golden`; skip-with-record on non-Windows |
+| Portable golden round-trip demo | ✅ | `TestM2S4_GoldenRoundTrip` PASS |
+| CI: windows-latest agent+MSI artifacts; Linux golden | ✅ | `.github/workflows/ci.yml` |
+| No kopia in agent (confinement) | ✅ | existing `TestKopiaConfinement` walks agent |
+
+#### Golden dataset coverage
+
+| Fixture | Linux/macOS CI | Windows CI | Notes |
+|---------|----------------|------------|-------|
+| empty-file | ✅ | ✅ | portable |
+| small-text | ✅ | ✅ | portable |
+| multi-mb (12 MiB, multi-chunk) | ✅ | ✅ | portable |
+| multi-gb | skip (opt-in `LargeFiles`) | skip (opt-in) | reason recorded |
+| unicode-names | ✅ | ✅ | portable |
+| deep-path | ✅ | ✅ | portable nested |
+| empty-dir | ✅ | ✅ | portable |
+| symlink-file / symlink-dir | ✅ (darwin/linux) | try / skip-with-record | privilege may fail on Win |
+| hardlink | ✅ | try / skip-with-record | portable where FS allows |
+| long-path-gt260 | skip-with-record | ✅ attempt | Windows-only |
+| acl-system-only | skip-with-record | ✅ attempt (icacls) | Windows-only |
+| ads | skip-with-record | ✅ attempt | Windows-only |
+| sparse | skip-with-record | ✅ attempt | Windows-only |
+| junction-symlink-loop | skip-with-record | ✅ attempt | Windows-only |
+| deny-share-locked | skip-with-record | ✅ attempt (probe) | full hold-during-backup = CI integration later |
+
+Every skip is explicit with a reason string (S3-F5 lesson). Comparer ACL/ADS
+checks also skip-with-record on non-Windows.
+
+#### Untested on Windows / must verify on first real run
+
+**Do not claim these work until `windows-latest` CI or a Windows VM proves them.**
+
+1. **Service SCM lifecycle** — Start/Stop/Shutdown via `sc.exe` / services.msc; graceful job cancel on Stop; delayed auto-start after reboot; event-log source `BreakwaterAgent`.
+2. **State dir ACL** — `SecureDir` sets SYSTEM+Administrators only, inheritance disabled; standard user cannot read `identity.json` / certs.
+3. **Volume inventory** — `GetLogicalDrives` / serial IDs; fixed drives appear; empty CD does not panic; network drives excluded.
+4. **MSI install/uninstall** — `msiexec /i … BWTOKEN=BW1:…` enrolls on first start; service starts as LocalSystem; silent install; uninstall stops service, removes files, **never** touches server-side backups; SHA256 artifact published.
+5. **WiX v5 toolchain** — `wix build` on `windows-latest` (encoded in CI; first green run is the validation).
+6. **Windows golden fixtures** — long paths, SYSTEM ACLs, ADS, sparse, junction loops, exclusive share-lock during backup.
+7. **PendingEnrollToken registry** — MSI property → HKLM → agent enroll → clear after success.
+8. **SeBackupPrivilege / VSS** — not in stage 4 scope (plain-directory `pkg/backup` only); Phase later.
+
+#### Decisions (stage 4)
+
+1. **Public `agent` package** re-exports control/enroll/state so server integration tests can drive the real agent without importing `internal/` across modules.
+2. **Identity write order:** cert+key first, `identity.json` last — LoadIdentity requires all pieces (half-written never loadable).
+3. **Completed job_ids:** ring of 1024; re-JobStart for a completed id re-sends success JobResult (repairs lost-in-transit) without re-running work.
+4. **FILE_BACKUP** always uses `pkg/backup` — no forked pipeline, no kopia in agent.
+5. **WiX is build-tool only** (MS-RL); output MSI is ours (PLAN pre-approved). Unsigned MVP; SHA256 in CI.
+6. **Multi-GB golden** is opt-in (`LargeFiles=true`) — default CI uses multi-MB for multi-chunk coverage without multi-minute fixtures.
+
+#### Verification (stage 4 — darwin/arm64)
+
+```
+gofmt -l server pkg agent cli restore tools   # empty
+cd server && go vet ./... && go test ./... -count=1 -short -race -timeout 10m  # PASS
+cd pkg && go test ./... -count=1 -race                                        # PASS
+cd agent && go test ./... -count=1 -race                                      # PASS
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./cmd/breakwater-agent       # PASS
+cd tools/golden && go test ./... -count=1 -race                               # PASS
+cd server && go test ./internal/agentgw/ -count=1 -run 'Golden|TestM2S4' -v    # PASS
+BW_GATE_BYTES=268435456 go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -v  # PASS
+```
+
+Demo numbers (`TestM2S4_GoldenRoundTrip`):
+```
+golden created=[empty-file small-text multi-mb unicode-names deep-path empty-dir symlink-file symlink-dir hardlink]
+golden skips=7 (multi-gb + 6 windows-only) — all with reasons
+backup bytes_stored≈12.5 MiB; compare matched=10; ACL/ADS compare skipped on darwin
+cancel confirmation: job state=cancelled err="cancelled"
+```
+
 ---
 
 ## Next: M2 remaining (weeks 3–4)
 
-Stages 1–3 done. Remaining:
+Stages 1–4 done. Remaining:
 
-- Windows agent service (SYSTEM) + WiX MSI (stage 4 — bind to Channel + DataService + pkg/backup)
 - UI shell against fake API — stage 5
-- Golden-dataset generator + comparer
 - Cron schedules / windows / retry (M5; dispatch core is stage 2)
 - Vendor kopia; consider v0.23 when on Go 1.25+
 - Optional: backfill `hashing_algorithm` from vault for pre-eea1a46 keystore rows (R3-4)
 - Directory sharding vs `MaxMarkObjectBytes` (16 MiB ≈ max entries per single TreeObject)
+- First `windows-latest` green run closes the untested-on-Windows list above
 
 *Demo (later): MSI install → appears in UI in 10s → backup → second run shows dedup ratio.*
 

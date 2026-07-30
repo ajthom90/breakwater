@@ -14,7 +14,11 @@ require (
 	modernc.org/sqlite v1.34.5
 )
 
-require google.golang.org/protobuf v1.36.3
+require (
+	github.com/ajthom90/breakwater/agent v0.0.0-00010101000000-000000000000
+	github.com/ajthom90/breakwater/tools/golden v0.0.0-00010101000000-000000000000
+	google.golang.org/protobuf v1.36.3
+)
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.17.0 // indirect
@@ -64,3 +68,7 @@ require (
 )
 
 replace github.com/ajthom90/breakwater/pkg => ../pkg
+
+replace github.com/ajthom90/breakwater/agent => ../agent
+
+replace github.com/ajthom90/breakwater/tools/golden => ../tools/golden
