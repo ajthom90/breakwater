@@ -8,16 +8,16 @@
 //	portable (Linux/macOS/Windows CI):
 //	  - empty (0-byte) files
 //	  - multi-MB files (multi-GB is opt-in via Options.LargeFiles)
-//	  - unicode names
+//	  - unicode names (CJK/emoji + RTL + NFD combining marks)
 //	  - nested deep paths (approaching OS limits portably)
 //	  - symlink to file + directory
 //	  - hardlinks (where supported)
 //	  - empty directories
+//	  - sparse files (seek-past-end holes; portable)
 //
 //	Windows-only (skip-with-record on non-Windows — never silent):
 //	  - SYSTEM-only ACLs
 //	  - Alternate Data Streams (ADS)
-//	  - sparse files
 //	  - >260-char paths (\\?\ extended)
 //	  - junction / symlink loops
 //	  - deny-share-locked files
@@ -42,15 +42,17 @@ const (
 	FixMultiMB         FixtureID = "multi-mb"
 	FixMultiGB         FixtureID = "multi-gb"
 	FixUnicodeNames    FixtureID = "unicode-names"
+	FixUnicodeRTL      FixtureID = "unicode-rtl"
+	FixUnicodeNFD      FixtureID = "unicode-nfd"
 	FixDeepPath        FixtureID = "deep-path"
 	FixEmptyDir        FixtureID = "empty-dir"
 	FixSymlinkFile     FixtureID = "symlink-file"
 	FixSymlinkDir      FixtureID = "symlink-dir"
 	FixHardlink        FixtureID = "hardlink"
+	FixSparse          FixtureID = "sparse"          // portable seek-past-end
 	FixLongPath        FixtureID = "long-path-gt260" // Windows extended path
 	FixACLSystemOnly   FixtureID = "acl-system-only"
 	FixADS             FixtureID = "ads"
-	FixSparse          FixtureID = "sparse"
 	FixJunctionLoop    FixtureID = "junction-symlink-loop"
 	FixDenyShareLocked FixtureID = "deny-share-locked"
 )
@@ -69,9 +71,10 @@ type Options struct {
 	LargeFiles bool
 	// MultiMBSize defaults to 12 MiB (forces multi-chunk CDC).
 	MultiMBSize int64
-	// IncludeWindows attempts Windows-only fixtures (default: true on Windows).
-	// On non-Windows they are always skipped with a record.
-	IncludeWindows bool
+	// NoWindowsFixtures, when true, skips Windows-only fixtures even on Windows
+	// (S4-F8). Default false: on Windows, Windows-only fixtures are attempted;
+	// on non-Windows they are always skipped with a record.
+	NoWindowsFixtures bool
 }
 
 // Result describes what was generated.
@@ -147,6 +150,33 @@ func Generate(opts Options) (*Result, error) {
 	res.Created = append(res.Created, FixUnicodeNames)
 	res.Paths[FixUnicodeNames] = []string{uniFile}
 
+	// RTL (Arabic) — distinct path so normalization regressions have something to fail against (S4-F10).
+	rtlFile := filepath.Join("portable", "unicode-rtl", "مرحبا.txt")
+	if err := writeFile(opts.Root, rtlFile, []byte("rtl payload\n")); err != nil {
+		return nil, err
+	}
+	res.Created = append(res.Created, FixUnicodeRTL)
+	res.Paths[FixUnicodeRTL] = []string{rtlFile}
+
+	// NFD / combining mark: "cafe" + COMBINING ACUTE ACCENT (U+0301), not precomposed é (S4-F10).
+	nfdName := "cafe\u0301.txt"
+	nfdFile := filepath.Join("portable", "unicode-nfd", nfdName)
+	if err := writeFile(opts.Root, nfdFile, []byte("nfd payload\n")); err != nil {
+		return nil, err
+	}
+	res.Created = append(res.Created, FixUnicodeNFD)
+	res.Paths[FixUnicodeNFD] = []string{nfdFile}
+
+	// Portable sparse file (seek-past-end holes on ext4/APFS) — PLAN fixture, not Windows-only (S4-F9).
+	sparsePath := filepath.Join(opts.Root, "portable", "sparse.bin")
+	const sparseSize = int64(64 << 20) // 64 MiB logical
+	if err := writeLargeFile(sparsePath, sparseSize); err != nil {
+		res.Skipped = append(res.Skipped, Skip{Fixture: FixSparse, Reason: "sparse write: " + err.Error()})
+	} else {
+		res.Created = append(res.Created, FixSparse)
+		res.Paths[FixSparse] = []string{"portable/sparse.bin"}
+	}
+
 	// Deep nested path (portable depth, not full 260+).
 	deep := "portable/deep"
 	for i := 0; i < 20; i++ {
@@ -202,19 +232,18 @@ func Generate(opts Options) (*Result, error) {
 		res.Paths[FixHardlink] = []string{"portable/hardlink-a.txt", "portable/hardlink-b.txt"}
 	}
 
-	// --- Windows-only fixtures ---
-	wantWin := opts.IncludeWindows || runtime.GOOS == "windows"
-	if runtime.GOOS != "windows" {
-		// Always skip-with-record (S3-F5 lesson: never silent).
-		for _, id := range []FixtureID{
-			FixLongPath, FixACLSystemOnly, FixADS, FixSparse, FixJunctionLoop, FixDenyShareLocked,
-		} {
-			res.Skipped = append(res.Skipped, Skip{
-				Fixture: id,
-				Reason:  fmt.Sprintf("windows-only (running on %s)", runtime.GOOS),
-			})
+	// --- Windows-only fixtures (S4-F8: honor NoWindowsFixtures) ---
+	winOnly := []FixtureID{
+		FixLongPath, FixACLSystemOnly, FixADS, FixJunctionLoop, FixDenyShareLocked,
+	}
+	if opts.NoWindowsFixtures || runtime.GOOS != "windows" {
+		reason := fmt.Sprintf("windows-only (running on %s)", runtime.GOOS)
+		if opts.NoWindowsFixtures && runtime.GOOS == "windows" {
+			reason = "NoWindowsFixtures=true"
 		}
-		_ = wantWin
+		for _, id := range winOnly {
+			res.Skipped = append(res.Skipped, Skip{Fixture: id, Reason: reason})
+		}
 		return res, nil
 	}
 
@@ -423,9 +452,14 @@ func Compare(original, restored string, opts CompareOptions) (*CompareResult, er
 	}
 
 	// Extra files in restored (not in original) — report as diffs.
-	_ = filepath.WalkDir(restored, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
+	// S4-F6: propagate walk errors (fail-loud). Never certify equality when the
+	// restored tree could not be fully scanned (permission-denied, ELOOP, …).
+	err = filepath.WalkDir(restored, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err // fail-loud; incomplete scan must not look like a match
+		}
+		if d.IsDir() {
+			return nil
 		}
 		rel, err := filepath.Rel(restored, path)
 		if err != nil {
@@ -436,6 +470,9 @@ func Compare(original, restored string, opts CompareOptions) (*CompareResult, er
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, fmt.Errorf("restored walk: %w", err)
+	}
 
 	return out, nil
 }

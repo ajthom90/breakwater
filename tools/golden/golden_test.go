@@ -31,12 +31,27 @@ func TestGenerate_Portable(t *testing.T) {
 	if !sawGBSkip {
 		t.Fatal("expected multi-gb skip record")
 	}
-	// Windows fixtures skipped with reason on non-Windows.
+	// Portable sparse + RTL + NFD must be created (S4-F9, S4-F10).
+	var sawSparse, sawRTL, sawNFD bool
+	for _, id := range res.Created {
+		switch id {
+		case golden.FixSparse:
+			sawSparse = true
+		case golden.FixUnicodeRTL:
+			sawRTL = true
+		case golden.FixUnicodeNFD:
+			sawNFD = true
+		}
+	}
+	if !sawSparse || !sawRTL || !sawNFD {
+		t.Fatalf("expected portable sparse+rtl+nfd in created; got %v", res.Created)
+	}
+	// Windows fixtures skipped with reason on non-Windows (sparse is portable — not here).
 	if runtime.GOOS != "windows" {
 		winSkips := 0
 		for _, s := range res.Skipped {
 			switch s.Fixture {
-			case golden.FixADS, golden.FixACLSystemOnly, golden.FixSparse,
+			case golden.FixADS, golden.FixACLSystemOnly,
 				golden.FixLongPath, golden.FixJunctionLoop, golden.FixDenyShareLocked:
 				winSkips++
 				if s.Reason == "" {
@@ -44,8 +59,8 @@ func TestGenerate_Portable(t *testing.T) {
 				}
 			}
 		}
-		if winSkips < 6 {
-			t.Fatalf("expected 6 windows-only skips, got %d: %+v", winSkips, res.Skipped)
+		if winSkips < 5 {
+			t.Fatalf("expected 5 windows-only skips, got %d: %+v", winSkips, res.Skipped)
 		}
 	}
 	// Round-trip compare against itself.

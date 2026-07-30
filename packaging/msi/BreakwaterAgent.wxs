@@ -11,8 +11,9 @@
   Silent install with enrollment token:
     msiexec /i breakwater-agent.msi /qn BWTOKEN=BW1:host:port:fp:secret
 
-  First service start reads BWTOKEN from the service environment (set below)
-  and enrolls into C:\ProgramData\Breakwater\.
+  First service start reads the token from
+  C:\ProgramData\Breakwater\pending-enroll.token (SecureDir-restricted)
+  written by a deferred custom action, then enrolls.
 
   Unsigned for MVP (PLAN: signing arrives Phase 2). CI publishes SHA256.
 
@@ -34,8 +35,9 @@
 
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Enrollment token property: msiexec /i … BWTOKEN=BW1:… -->
-    <Property Id="BWTOKEN" Secure="yes" />
+    <!-- Enrollment token: Secure for elevation; MsiHiddenProperties redacts from logs (S4-F2). -->
+    <Property Id="BWTOKEN" Secure="yes" Hidden="yes" />
+    <Property Id="MsiHiddenProperties" Value="BWTOKEN" />
 
     <!-- Install dir -->
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -81,15 +83,18 @@
       </Component>
     </ComponentGroup>
 
-    <!-- State directory with intended ACL (SYSTEM + Administrators).
-         WiX util:PermissionEx requires WixUtilExtension; encoded for CI validation.
-         Agent also self-secures the dir on Open() as defense in depth. -->
+    <!--
+      State directory. ACL: agent SecureDir() at first Open() restricts to
+      SYSTEM/Administrators. Token at rest is written into this directory
+      (pending-enroll.token), NOT world-readable HKLM (S4-F2).
+
+      Window between CreateFolder and first service start (folder inherits
+      default ACLs until SecureDir runs) is listed on the untested-on-Windows
+      list — empty until token write / enroll.
+    -->
     <ComponentGroup Id="DataComponents" Directory="BreakwaterData">
       <Component Id="DataDir" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
-        <CreateFolder>
-          <!-- util:PermissionEx SYSTEM + Admins only — enabled when WixToolset.Util.wixext is present.
-               For MVP, CreateFolder alone + agent SecureDir() at runtime. -->
-        </CreateFolder>
+        <CreateFolder />
         <RegistryValue
             Root="HKLM"
             Key="Software\Breakwater\Agent"
@@ -97,15 +102,26 @@
             Type="string"
             Value="[BreakwaterData]"
             KeyPath="yes" />
-        <!-- Persist BWTOKEN for first-start enrollment if supplied at install -->
-        <RegistryValue
-            Root="HKLM"
-            Key="Software\Breakwater\Agent"
-            Name="PendingEnrollToken"
-            Type="string"
-            Value="[BWTOKEN]" />
+        <!-- NOTE: PendingEnrollToken is NOT written to HKLM (S4-F2).
+             Token is written to [BreakwaterData]pending-enroll.token by CA below. -->
       </Component>
     </ComponentGroup>
+
+    <!--
+      Write enrollment token into the SecureDir-bound state directory.
+      Deferred + no impersonation → SYSTEM. MsiHiddenProperties redacts BWTOKEN
+      from logs. UNTESTED ON WINDOWS until first MSI install.
+    -->
+    <CustomAction Id="WritePendingEnrollToken"
+                  Directory="BreakwaterData"
+                  ExeCommand="cmd.exe /c if not &quot;[BWTOKEN]&quot;==&quot;&quot; (echo|[BWTOKEN])&gt;pending-enroll.token"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="WritePendingEnrollToken" After="CreateFolders" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
 
     <!-- Event log source registration via registry (no custom action for MVP). -->
     <ComponentGroup Id="EventLogComponents" Directory="AgentDir">
@@ -124,17 +140,15 @@
     </Feature>
 
     <!--
-      Clean uninstall:
-        ServiceControl Remove=uninstall stops + deletes the service.
-        Files under INSTALLDIR removed with components.
-        State dir under ProgramData: left in place intentionally so reinstall
-        can re-use enrollment? PLAN says "leave backups untouched" — backups
-        live on the server, not here. Agent state (certs) is removed with the
-        DataDir component on uninstall. Operators who need to wipe may delete
-        C:\ProgramData\Breakwater\ manually. Actually CreateFolder components
-        remove the folder on uninstall if empty — certs will be removed.
+      Clean uninstall: ServiceControl removes the service; files under INSTALLDIR
+      and state under ProgramData are removed with components. Server-side backups
+      are never touched.
 
-      Backups are server-side only; uninstall never touches the vault.
+      Enroll-then-persist recovery (S4-F5): if the Enroll RPC succeeds but the
+      agent cannot write identity files, the single-use token is already burned
+      and the machine row exists. Recovery: admin removes the stale machine row,
+      mints a fresh BW1 token, and reinstalls/re-runs with a new agent keypair
+      (same cert cannot re-enroll — already-enrolled).
     -->
   </Package>
 </Wix>

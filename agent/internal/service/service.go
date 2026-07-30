@@ -66,7 +66,8 @@ func runAgent(ctx context.Context, cfg Config, log *slog.Logger) error {
 	if !dir.IsEnrolled() {
 		token := cfg.EnrollToken
 		if token == "" {
-			token = readPendingEnrollToken() // MSI BWTOKEN → registry
+			// Prefer SecureDir-restricted file; migrate/delete legacy HKLM (S4-F2).
+			token = readPendingEnrollToken(dir.Path)
 		}
 		if token == "" {
 			return fmt.Errorf("not enrolled: pass --enroll-token, set BWTOKEN, or install with BWTOKEN=")
@@ -80,7 +81,7 @@ func runAgent(ctx context.Context, cfg Config, log *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("enroll: %w", err)
 		}
-		clearPendingEnrollToken()
+		clearPendingEnrollToken(dir.Path) // delete file + registry value, not blank
 		log.Info("enrolled", "machine_id", res.MachineID)
 	}
 

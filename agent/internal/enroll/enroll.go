@@ -123,7 +123,9 @@ func Run(ctx context.Context, opts Options) (*Result, error) {
 		Hostname:         hostname,
 	}
 	if err := opts.StateDir.SaveEnrolled(meta, creds); err != nil {
-		return nil, fmt.Errorf("enroll: persist: %w", err)
+		// S4-F5: server has already burned the single-use token and created the
+		// machine row. Retrying with this cert hits already-enrolled.
+		return nil, fmt.Errorf("enroll: persist failed after server accepted enrollment (token already burned): %w — recovery: an admin must remove the stale machine row and mint a fresh BW1 token; the agent must generate a new keypair (same cert cannot re-enroll)", err)
 	}
 	return &Result{MachineID: meta.MachineID, Meta: meta, Creds: creds}, nil
 }

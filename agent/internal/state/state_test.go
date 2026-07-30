@@ -91,11 +91,15 @@ func TestCompletedJobs_Idempotency(t *testing.T) {
 	if dir.HasCompleted("job-1") {
 		t.Fatal("unexpected")
 	}
-	if err := dir.MarkCompleted("job-1"); err != nil {
+	if err := dir.MarkCompleted("job-1", true, ""); err != nil {
 		t.Fatal(err)
 	}
 	if !dir.HasCompleted("job-1") {
 		t.Fatal("expected completed")
+	}
+	ok, success, msg := dir.CompletedOutcome("job-1")
+	if !ok || !success || msg != "" {
+		t.Fatalf("outcome ok=%v success=%v msg=%q", ok, success, msg)
 	}
 	// Persist across reopen.
 	dir2, err := state.Open(dir.Path)
@@ -105,6 +109,24 @@ func TestCompletedJobs_Idempotency(t *testing.T) {
 	if !dir2.HasCompleted("job-1") {
 		t.Fatal("completed job lost after reopen")
 	}
+	ok, success, _ = dir2.CompletedOutcome("job-1")
+	if !ok || !success {
+		t.Fatal("outcome not persisted")
+	}
+}
+
+func TestCompletedJobs_FailureOutcome(t *testing.T) {
+	dir, err := state.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dir.MarkCompleted("job-fail", false, "disk full"); err != nil {
+		t.Fatal(err)
+	}
+	ok, success, msg := dir.CompletedOutcome("job-fail")
+	if !ok || success || msg != "disk full" {
+		t.Fatalf("ok=%v success=%v msg=%q", ok, success, msg)
+	}
 }
 
 func TestCompletedJobs_RingBound(t *testing.T) {
@@ -113,7 +135,7 @@ func TestCompletedJobs_RingBound(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < state.MaxCompletedJobs+10; i++ {
-		if err := dir.MarkCompleted(string(rune('a'+(i%26))) + "-" + itoa(i)); err != nil {
+		if err := dir.MarkCompleted(string(rune('a'+(i%26)))+"-"+itoa(i), true, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

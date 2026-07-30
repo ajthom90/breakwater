@@ -137,3 +137,22 @@ Covers CJK, emoji, Greek, precomposed Latin — but no right-to-left script and 
 5. **Correctness:** S4-F3, S4-F4, S4-F5.
 6. **Verification-asset quality:** S4-F7 (SD comparison), S4-F8, S4-F9, S4-F10.
 7. PROGRESS.md: red-first captures; new untested-on-Windows entries (SD comparison path, token-at-rest).
+
+---
+
+## Fix dispositions (post-37e5fc3)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| S4-F1 | ✅ Fixed | `Agent.sendMu` serializes every Channel `Send`/`CloseSend`; `TestS4F1_ConcurrentSendUnderRace` under `-race`; `TestAgent_NoopAndInventory` uses 50 ms heartbeat |
+| S4-F2 | ✅ Fixed | `MsiHiddenProperties` + `Hidden=yes` on BWTOKEN; token written to `pending-enroll.token` under SecureDir (not HKLM); delete file/registry value (not blank); legacy HKLM migrated then deleted |
+| S4-F3 | ✅ Fixed | `completed.json` stores `success` + `error_message`; replay uses `CompletedOutcome`; `TestS4F3_FailedJobReplayMustNotClaimSuccess` |
+| S4-F4 | ✅ Fixed | `writeAtomic` fsyncs temp before rename and dir after; Windows dir fsync soft-fails; corrupt completed.json logged via slog |
+| S4-F5 | ✅ Fixed | enroll persist error names token-burned recovery; MSI README recovery section |
+| S4-F6 | ✅ Fixed | restored `WalkDir` error propagated (`restored walk: …`); `TestS4F6_PlainExtraFileDetected` + `TestS4F6_ExtraBehindUnreadableDirMustNotEqual` |
+| S4-F7 | ✅ Fixed | `compareACL` uses GetNamedSecurityInfo → SDDL; icacls only as mismatch detail |
+| S4-F8 | ✅ Fixed | `IncludeWindows` removed; `NoWindowsFixtures` skips Windows-only fixtures with record |
+| S4-F9 | ✅ Fixed | portable `sparse.bin` via seek-past-end; Linux CI exercises it |
+| S4-F10 | ✅ Fixed | RTL (`مرحبا.txt`) + NFD (`cafe\u0301.txt`) fixtures |
+
+Red-first captures and after-fix evidence: see `PROGRESS.md` stage-4 fix round.

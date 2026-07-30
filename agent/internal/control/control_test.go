@@ -3,10 +3,12 @@ package control_test
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -187,9 +189,10 @@ func TestAgent_NoopAndInventory(t *testing.T) {
 	dir, meta, creds := testState(t)
 	ag := control.New(control.Config{
 		State: dir, Meta: meta, Creds: creds, Version: "test",
-		Log:               slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
-		Dial:              dial,
-		HeartbeatInterval: time.Hour, // don't spam in unit tests
+		Log:  slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
+		Dial: dial,
+		// Realistic heartbeat so concurrent Send regressions cannot hide (S4-F1).
+		HeartbeatInterval: 50 * time.Millisecond,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -418,4 +421,107 @@ func itoa(i int) string {
 		i /= 10
 	}
 	return string(b[n:])
+}
+
+// TestS4F1_ConcurrentSendUnderRace must report a data race on unmodified 37e5fc3
+// (heartbeat + concurrent JobResult/Inventory sends without a single send path).
+// After the fix, -race must be clean with a realistic heartbeat interval.
+func TestS4F1_ConcurrentSendUnderRace(t *testing.T) {
+	// Many concurrent inventory jobs + aggressive heartbeats.
+	var script []serverEvent
+	const n = 12
+	for i := 0; i < n; i++ {
+		script = append(script, serverEvent{
+			start: &breakwaterv1.JobStart{
+				JobId: "job-race-" + itoa(i),
+				Type:  breakwaterv1.JobType_JOB_TYPE_INVENTORY,
+			},
+			delay: time.Duration(i) * time.Millisecond,
+		})
+	}
+	fc := &fakeControl{script: script}
+	dial, stop := startFake(t, fc)
+	defer stop()
+
+	dir, meta, creds := testState(t)
+	ag := control.New(control.Config{
+		State: dir, Meta: meta, Creds: creds, Version: "test",
+		Log:               slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
+		Dial:              dial,
+		HeartbeatInterval: time.Millisecond, // realistic pressure; was time.Hour in other tests
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ag.Run(ctx) }()
+
+	results := fc.waitResults(n, 10*time.Second)
+	if len(results) < n {
+		t.Fatalf("results=%d want %d (race may also have aborted sends)", len(results), n)
+	}
+	// Give heartbeats time to overlap job sends.
+	time.Sleep(50 * time.Millisecond)
+	ag.Stop()
+	cancel()
+}
+
+// TestS4F3_FailedJobReplayMustNotClaimSuccess: a job whose real outcome was
+// failure must never be re-acked as Success on reconnect.
+// Must FAIL on unmodified 37e5fc3 (hardcoded Success:true on replay).
+func TestS4F3_FailedJobReplayMustNotClaimSuccess(t *testing.T) {
+	src := t.TempDir()
+	_ = os.WriteFile(filepath.Join(src, "a.txt"), []byte("x"), 0o644)
+	params, _ := json.Marshal(map[string]string{"source": src})
+
+	fc := &fakeControl{
+		script: []serverEvent{
+			// FILE_BACKUP without DataService → failure terminal result.
+			{
+				start: &breakwaterv1.JobStart{
+					JobId: "job-fail", Type: breakwaterv1.JobType_JOB_TYPE_FILE_BACKUP,
+					ParamsJson: params,
+				},
+				delay: 20 * time.Millisecond,
+			},
+			// Re-dispatch same id (simulates lost result + mistaken re-send).
+			{
+				start: &breakwaterv1.JobStart{
+					JobId: "job-fail", Type: breakwaterv1.JobType_JOB_TYPE_FILE_BACKUP,
+					ParamsJson: params,
+				},
+				delay: 150 * time.Millisecond,
+			},
+		},
+	}
+	dial, stop := startFake(t, fc)
+	defer stop()
+
+	dir, meta, creds := testState(t)
+	ag := control.New(control.Config{
+		State: dir, Meta: meta, Creds: creds, Version: "test",
+		Log:               slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
+		Dial:              dial,
+		HeartbeatInterval: time.Hour,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ag.Run(ctx) }()
+
+	results := fc.waitResults(2, 5*time.Second)
+	if len(results) < 2 {
+		t.Fatalf("want 2 results (first failure + replay), got %d", len(results))
+	}
+	// First result must be a failure.
+	if results[0].Success {
+		t.Fatalf("first result should fail (no DataService): %+v", results[0])
+	}
+	// Second result must NOT claim success (S4-F3).
+	replay := results[1]
+	if replay.Success {
+		t.Fatalf("S4-F3: failed job_id replayed as Success=true (error_message=%q) — must replay real outcome", replay.ErrorMessage)
+	}
+	if !dir.HasCompleted("job-fail") {
+		t.Fatal("expected completed record for failed job")
+	}
+	ag.Stop()
+	cancel()
 }

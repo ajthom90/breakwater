@@ -76,15 +76,8 @@ func generateWindows(root string, res *Result) error {
 		res.Paths[FixADS] = []string{rel}
 	}
 
-	// Sparse file
-	sp := filepath.Join(root, `windows\sparse.bin`)
-	if err := createSparse(sp, 64<<20); err != nil {
-		res.Skipped = append(res.Skipped, Skip{Fixture: FixSparse, Reason: err.Error()})
-	} else {
-		rel, _ := filepath.Rel(root, sp)
-		res.Created = append(res.Created, FixSparse)
-		res.Paths[FixSparse] = []string{rel}
-	}
+	// Sparse via FSCTL_SET_SPARSE is covered by the portable sparse fixture (S4-F9).
+	// Windows-only list no longer includes FixSparse.
 
 	// Junction loop
 	loopDir := filepath.Join(root, `windows\loop`)
@@ -122,36 +115,6 @@ func generateWindows(root string, res *Result) error {
 	return nil
 }
 
-func createSparse(path string, size int64) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	const fsctlSetSparse = 0x000900c4
-	var bytesReturned uint32
-	err = windows.DeviceIoControl(
-		windows.Handle(f.Fd()),
-		fsctlSetSparse,
-		nil, 0, nil, 0, &bytesReturned, nil,
-	)
-	if err != nil {
-		return fmt.Errorf("FSCTL_SET_SPARSE: %w", err)
-	}
-	if err := f.Truncate(size); err != nil {
-		return err
-	}
-	if _, err := f.Seek(size-4096, 0); err != nil {
-		return err
-	}
-	buf := make([]byte, 4096)
-	for i := range buf {
-		buf[i] = 0xEF
-	}
-	_, err = f.Write(buf)
-	return err
-}
-
 func openExclusive(path string) (windows.Handle, error) {
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
@@ -168,26 +131,63 @@ func openExclusive(path string) (windows.Handle, error) {
 	)
 }
 
+// compareACL compares security descriptors via SDDL (S4-F7), not icacls text.
+// icacls output is attached only as human-readable detail on mismatch.
+//
+// UNTESTED ON WINDOWS until first real CI run — verify:
+//   - GetNamedSecurityInfo + SDDL round-trip on NTFS
+//   - equal SDs with different ACE display order still match (or document if not)
+//   - SYSTEM-only fixture SD matches after restore
 func compareACL(a, b string) error {
-	outA, err := exec.Command("icacls", a).CombinedOutput()
+	sddlA, err := fileSDDL(a)
 	if err != nil {
-		return fmt.Errorf("icacls a: %w", err)
+		return fmt.Errorf("SDDL a: %w", err)
 	}
-	outB, err := exec.Command("icacls", b).CombinedOutput()
+	sddlB, err := fileSDDL(b)
 	if err != nil {
-		return fmt.Errorf("icacls b: %w", err)
+		return fmt.Errorf("SDDL b: %w", err)
 	}
-	na := normalizeICACLS(string(outA), a)
-	nb := normalizeICACLS(string(outB), b)
-	if na != nb {
-		return fmt.Errorf("ACL mismatch:\n--- a ---\n%s\n--- b ---\n%s", na, nb)
+	if sddlA == sddlB {
+		return nil
 	}
-	return nil
+	// Human-readable detail only — not the equality oracle.
+	detailA := icaclsDetail(a)
+	detailB := icaclsDetail(b)
+	return fmt.Errorf("ACL/SD mismatch:\n sddl a=%s\n sddl b=%s\n icacls a: %s\n icacls b: %s",
+		sddlA, sddlB, detailA, detailB)
 }
 
-func normalizeICACLS(out, path string) string {
-	s := strings.ReplaceAll(out, path, "<path>")
-	return strings.TrimSpace(s)
+func fileSDDL(path string) (string, error) {
+	// Owner + Group + DACL + SACL + Label — full descriptor for equality.
+	const si = windows.OWNER_SECURITY_INFORMATION |
+		windows.GROUP_SECURITY_INFORMATION |
+		windows.DACL_SECURITY_INFORMATION |
+		windows.SACL_SECURITY_INFORMATION |
+		windows.LABEL_SECURITY_INFORMATION
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, si)
+	if err != nil {
+		// SACL may require privilege; fall back to owner+group+dacl.
+		const si2 = windows.OWNER_SECURITY_INFORMATION |
+			windows.GROUP_SECURITY_INFORMATION |
+			windows.DACL_SECURITY_INFORMATION
+		sd, err = windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT, si2)
+		if err != nil {
+			return "", err
+		}
+	}
+	s := sd.String()
+	if s == "" {
+		return "", fmt.Errorf("empty SDDL for %s", path)
+	}
+	return s, nil
+}
+
+func icaclsDetail(path string) string {
+	out, err := exec.Command("icacls", path).CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("(icacls failed: %v)", err)
+	}
+	return strings.TrimSpace(strings.ReplaceAll(string(out), path, "<path>"))
 }
 
 func compareADS(a, b string) error {

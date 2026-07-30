@@ -149,6 +149,7 @@ func Save(dir string, id *Identity) error {
 	return nil
 }
 
+// writeAtomic: temp → write → fsync → chmod → close → rename → fsync dir (S4-F4).
 func writeAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
@@ -166,6 +167,10 @@ func writeAtomic(path string, data []byte, perm os.FileMode) error {
 		_ = tmp.Close()
 		return err
 	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
 	if err := tmp.Chmod(perm); err != nil {
 		_ = tmp.Close()
 		return err
@@ -177,6 +182,11 @@ func writeAtomic(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	cleanup = false
+	// Best-effort directory fsync (same durability goal as state.writeAtomic).
+	if f, err := os.Open(dir); err == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
 	return nil
 }
 

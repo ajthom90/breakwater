@@ -496,53 +496,99 @@ first `windows-latest` CI / VM run.
 | long-path-gt260 | skip-with-record | ✅ attempt | Windows-only |
 | acl-system-only | skip-with-record | ✅ attempt (icacls) | Windows-only |
 | ads | skip-with-record | ✅ attempt | Windows-only |
-| sparse | skip-with-record | ✅ attempt | Windows-only |
+| sparse | ✅ portable | ✅ | seek-past-end (S4-F9) |
+| unicode-rtl / unicode-nfd | ✅ | ✅ | S4-F10 |
+| long-path-gt260 | skip-with-record | ✅ attempt | Windows-only |
+| acl-system-only | skip-with-record | ✅ attempt | Windows-only; compare via SDDL (S4-F7) |
+| ads | skip-with-record | ✅ attempt | Windows-only |
 | junction-symlink-loop | skip-with-record | ✅ attempt | Windows-only |
 | deny-share-locked | skip-with-record | ✅ attempt (probe) | full hold-during-backup = CI integration later |
 
 Every skip is explicit with a reason string (S3-F5 lesson). Comparer ACL/ADS
 checks also skip-with-record on non-Windows.
 
+#### Fix round S4-F1…F10 (post-37e5fc3 review)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| S4-F6 | ✅ Fixed | restored WalkDir error propagated; `TestS4F6_*` |
+| S4-F1 | ✅ Fixed | `sendMu` on all Channel sends; realistic HB in existing test + race test |
+| S4-F2 | ✅ Fixed | MsiHiddenProperties; token → state dir file; delete-not-blank |
+| S4-F3 | ✅ Fixed | completed outcomes store success+err; replay real result |
+| S4-F4 | ✅ Fixed | fsync temp + dir after rename; corrupt completed.json logged |
+| S4-F5 | ✅ Fixed | persist-after-enroll error names recovery; MSI README |
+| S4-F7 | ✅ Fixed | SDDL via GetNamedSecurityInfo; icacls detail only on mismatch |
+| S4-F8 | ✅ Fixed | `NoWindowsFixtures` honors skip; dead IncludeWindows removed |
+| S4-F9 | ✅ Fixed | portable sparse fixture |
+| S4-F10 | ✅ Fixed | RTL + NFD unicode fixtures |
+
+##### Red-first against unmodified `37e5fc3`
+
+```
+=== RUN   TestS4F6_ExtraBehindUnreadableDirMustNotEqual
+    … Compare certified Equal=true diffs=0 skipped=0 err=<nil> while extra data sits behind unreadable dir
+--- FAIL: TestS4F6_ExtraBehindUnreadableDirMustNotEqual
+
+=== RUN   TestS4F1_ConcurrentSendUnderRace
+WARNING: DATA RACE
+  Write … CloseSend / Read … SendMsg (heartbeat vs job)
+--- FAIL: TestS4F1_ConcurrentSendUnderRace
+
+=== RUN   TestS4F3_FailedJobReplayMustNotClaimSuccess
+    … failed job_id replayed as Success=true (error_message="already completed (idempotent)")
+--- FAIL: TestS4F3_FailedJobReplayMustNotClaimSuccess
+```
+
+##### After fixes
+
+```
+TestS4F6… TestS4F1… TestS4F3…  # PASS under -race
+gofmt / go vet / short+race / agent -race / golden -race / M2S4 -race / gate 256MB  # green
+```
+
 #### Untested on Windows / must verify on first real run
 
 **Do not claim these work until `windows-latest` CI or a Windows VM proves them.**
 
 1. **Service SCM lifecycle** — Start/Stop/Shutdown via `sc.exe` / services.msc; graceful job cancel on Stop; delayed auto-start after reboot; event-log source `BreakwaterAgent`.
-2. **State dir ACL** — `SecureDir` sets SYSTEM+Administrators only, inheritance disabled; standard user cannot read `identity.json` / certs.
+2. **State dir ACL** — `SecureDir` sets SYSTEM+Administrators only, inheritance disabled; standard user cannot read `identity.json` / certs. Window between MSI CreateFolder and first SecureDir (inherited ACLs while folder empty / token write).
 3. **Volume inventory** — `GetLogicalDrives` / serial IDs; fixed drives appear; empty CD does not panic; network drives excluded.
 4. **MSI install/uninstall** — `msiexec /i … BWTOKEN=BW1:…` enrolls on first start; service starts as LocalSystem; silent install; uninstall stops service, removes files, **never** touches server-side backups; SHA256 artifact published.
 5. **WiX v5 toolchain** — `wix build` on `windows-latest` (encoded in CI; first green run is the validation).
-6. **Windows golden fixtures** — long paths, SYSTEM ACLs, ADS, sparse, junction loops, exclusive share-lock during backup.
-7. **PendingEnrollToken registry** — MSI property → HKLM → agent enroll → clear after success.
-8. **SeBackupPrivilege / VSS** — not in stage 4 scope (plain-directory `pkg/backup` only); Phase later.
+6. **Windows golden fixtures** — long paths, SYSTEM ACLs, ADS, junction loops, exclusive share-lock during backup.
+7. **Token-at-rest (S4-F2)** — deferred CA writes `pending-enroll.token` under ProgramData; MsiHiddenProperties redacts BWTOKEN from `/l*v` logs; agent deletes file (not blank) after enroll; legacy HKLM value migrated then deleted.
+8. **SD comparison path (S4-F7)** — GetNamedSecurityInfo + SDDL equality on NTFS after restore; SACL privilege fallback.
+9. **Directory fsync after rename (S4-F4)** — FlushFileBuffers on a directory handle after identity.json rename survives hard power loss.
+10. **SeBackupPrivilege / VSS** — not in stage 4 scope (plain-directory `pkg/backup` only); Phase later.
 
 #### Decisions (stage 4)
 
 1. **Public `agent` package** re-exports control/enroll/state so server integration tests can drive the real agent without importing `internal/` across modules.
-2. **Identity write order:** cert+key first, `identity.json` last — LoadIdentity requires all pieces (half-written never loadable).
-3. **Completed job_ids:** ring of 1024; re-JobStart for a completed id re-sends success JobResult (repairs lost-in-transit) without re-running work.
+2. **Identity write order:** cert+key first, `identity.json` last — LoadIdentity requires all pieces (half-written never loadable). fsync before rename (S4-F4).
+3. **Completed job outcomes:** ring of 1024 stores success+error_message; re-JobStart replays the real outcome (S4-F3) — never synthesizes success.
 4. **FILE_BACKUP** always uses `pkg/backup` — no forked pipeline, no kopia in agent.
 5. **WiX is build-tool only** (MS-RL); output MSI is ours (PLAN pre-approved). Unsigned MVP; SHA256 in CI.
 6. **Multi-GB golden** is opt-in (`LargeFiles=true`) — default CI uses multi-MB for multi-chunk coverage without multi-minute fixtures.
+7. **Control send path (S4-F1):** single `sendMu` choke point for every Channel client Send/CloseSend.
+8. **Enrollment token (S4-F2):** MsiHiddenProperties + file under SecureDir; never world-readable HKLM as the at-rest store.
 
-#### Verification (stage 4 — darwin/arm64)
+#### Verification (stage 4 + fix round — darwin/arm64)
 
 ```
 gofmt -l server pkg agent cli restore tools   # empty
 cd server && go vet ./... && go test ./... -count=1 -short -race -timeout 10m  # PASS
 cd pkg && go test ./... -count=1 -race                                        # PASS
-cd agent && go test ./... -count=1 -race                                      # PASS
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./cmd/breakwater-agent       # PASS
-cd tools/golden && go test ./... -count=1 -race                               # PASS
-cd server && go test ./internal/agentgw/ -count=1 -run 'Golden|TestM2S4' -v    # PASS
+cd agent && go test ./... -count=1 -race                                      # PASS (incl. S4-F1 under -race)
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build ./...                        # PASS
+cd tools/golden && go test ./... -count=1 -race                               # PASS (S4-F6)
+cd server && go test ./internal/agentgw/ -count=1 -race -run 'TestM2S4|Golden' -v  # PASS
 BW_GATE_BYTES=268435456 go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -v  # PASS
 ```
 
-Demo numbers (`TestM2S4_GoldenRoundTrip`):
+Demo numbers after fix round (`TestM2S4_GoldenRoundTrip`):
 ```
-golden created=[empty-file small-text multi-mb unicode-names deep-path empty-dir symlink-file symlink-dir hardlink]
-golden skips=7 (multi-gb + 6 windows-only) — all with reasons
-backup bytes_stored≈12.5 MiB; compare matched=10; ACL/ADS compare skipped on darwin
+golden created=12 (incl. sparse, unicode-rtl, unicode-nfd); skipped_gen=6
+backup bytes_stored≈80 MiB (sparse logical size); compare matched=13
 cancel confirmation: job state=cancelled err="cancelled"
 ```
 

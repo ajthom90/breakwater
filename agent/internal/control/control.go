@@ -77,6 +77,11 @@ type Agent struct {
 	running  bool
 	stopOnce sync.Once
 	stopCh   chan struct{}
+
+	// sendMu serializes every stream.Send / CloseSend on the control channel.
+	// gRPC forbids concurrent SendMsg (S4-F1). Heartbeat, JobProgress, JobResult,
+	// InventoryReport, and Hello all take this lock — no exceptions.
+	sendMu sync.Mutex
 }
 
 // New creates an Agent. Call Run.
@@ -197,7 +202,7 @@ func (a *Agent) session(ctx context.Context) error {
 	if ver == "" {
 		ver = "0.0.1-dev"
 	}
-	if err := stream.Send(&breakwaterv1.AgentToServer{
+	if err := a.send(stream, &breakwaterv1.AgentToServer{
 		Msg: &breakwaterv1.AgentToServer_Hello{
 			Hello: &breakwaterv1.Hello{
 				MachineId:    a.cfg.Meta.MachineID,
@@ -275,13 +280,13 @@ func (a *Agent) session(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		sessCancel()
-		_ = stream.CloseSend()
+		_ = a.closeSend(stream)
 		return ctx.Err()
 	case <-a.stopCh:
 		sessCancel()
 		// Cancel active jobs; they must send JobResult.
 		a.cancelAll()
-		_ = stream.CloseSend()
+		_ = a.closeSend(stream)
 		return nil
 	case err := <-hbErr:
 		sessCancel()
@@ -295,8 +300,21 @@ func (a *Agent) session(ctx context.Context) error {
 	}
 }
 
+// send is the single choke point for ControlService.Channel client sends (S4-F1).
+func (a *Agent) send(stream breakwaterv1.ControlService_ChannelClient, msg *breakwaterv1.AgentToServer) error {
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+	return stream.Send(msg)
+}
+
+func (a *Agent) closeSend(stream breakwaterv1.ControlService_ChannelClient) error {
+	a.sendMu.Lock()
+	defer a.sendMu.Unlock()
+	return stream.CloseSend()
+}
+
 func (a *Agent) sendHeartbeat(stream breakwaterv1.ControlService_ChannelClient) error {
-	return stream.Send(&breakwaterv1.AgentToServer{
+	return a.send(stream, &breakwaterv1.AgentToServer{
 		Msg: &breakwaterv1.AgentToServer_Heartbeat{
 			Heartbeat: &breakwaterv1.Heartbeat{
 				ClientTime: timestamppb.Now(),
@@ -366,16 +384,24 @@ func (a *Agent) startJob(
 	if jobID == "" {
 		return
 	}
-	// Reconnect idempotency: never re-run a completed job_id.
-	if a.cfg.State != nil && a.cfg.State.HasCompleted(jobID) {
-		a.log.Info("skip already-completed job_id", "job_id", jobID)
-		// Re-send success result so a lost-in-transit JobResult is repaired.
-		_ = stream.Send(&breakwaterv1.AgentToServer{
-			Msg: &breakwaterv1.AgentToServer_JobResult{
-				JobResult: &breakwaterv1.JobResult{JobId: jobID, Success: true, ErrorMessage: "already completed (idempotent)"},
-			},
-		})
-		return
+	// Reconnect idempotency: never re-run a completed job_id; replay the *real*
+	// outcome (S4-F3) — never synthesize Success for a failed job.
+	if a.cfg.State != nil {
+		if ok, success, errMsg := a.cfg.State.CompletedOutcome(jobID); ok {
+			a.log.Info("skip already-completed job_id", "job_id", jobID, "success", success)
+			msg := "already completed (idempotent)"
+			if errMsg != "" {
+				msg = errMsg + " [idempotent replay]"
+			}
+			_ = a.send(stream, &breakwaterv1.AgentToServer{
+				Msg: &breakwaterv1.AgentToServer_JobResult{
+					JobResult: &breakwaterv1.JobResult{
+						JobId: jobID, Success: success, ErrorMessage: msg,
+					},
+				},
+			})
+			return
+		}
 	}
 
 	jobCtx, cancel := context.WithCancel(ctx)
@@ -398,14 +424,14 @@ func (a *Agent) startJob(
 		}()
 		res := a.runJob(jobCtx, stream, dataCl, hasher, js)
 		// Always send a terminal JobResult (cancel confirmation contract).
-		if err := stream.Send(&breakwaterv1.AgentToServer{
+		if err := a.send(stream, &breakwaterv1.AgentToServer{
 			Msg: &breakwaterv1.AgentToServer_JobResult{JobResult: res},
 		}); err != nil {
 			a.log.Error("send JobResult", "job_id", jobID, "err", err)
 			return
 		}
 		if a.cfg.State != nil {
-			if err := a.cfg.State.MarkCompleted(jobID); err != nil {
+			if err := a.cfg.State.MarkCompleted(jobID, res.Success, res.ErrorMessage); err != nil {
 				a.log.Error("mark completed", "job_id", jobID, "err", err)
 			}
 		}
@@ -436,7 +462,7 @@ func (a *Agent) runJob(
 
 	case breakwaterv1.JobType_JOB_TYPE_INVENTORY:
 		inv := inventory.Collect()
-		if err := stream.Send(&breakwaterv1.AgentToServer{
+		if err := a.send(stream, &breakwaterv1.AgentToServer{
 			Msg: &breakwaterv1.AgentToServer_Inventory{Inventory: inv},
 		}); err != nil {
 			res.Success = false
@@ -481,7 +507,7 @@ func (a *Agent) runFileBackup(
 		Hasher: hasher,
 		Client: &backup.GRPCClient{DS: dataCl},
 		Progress: func(done, total int64, phase, msg string) {
-			_ = stream.Send(&breakwaterv1.AgentToServer{
+			_ = a.send(stream, &breakwaterv1.AgentToServer{
 				Msg: &breakwaterv1.AgentToServer_JobProgress{
 					JobProgress: &breakwaterv1.JobProgress{
 						JobId: jobID, BytesDone: done, BytesTotal: total, Phase: phase, Message: msg,
