@@ -22,6 +22,7 @@ import (
 	"github.com/ajthom90/breakwater/server/internal/mtls"
 	"github.com/ajthom90/breakwater/server/internal/scheduler"
 	"github.com/ajthom90/breakwater/server/internal/vault"
+	"github.com/ajthom90/breakwater/server/internal/web"
 )
 
 var version = "0.0.1-dev"
@@ -91,13 +92,21 @@ func main() {
 	// existing repo must go through leases from these locks (enrollment Create is
 	// the documented exception — brand-new repo, no concurrent jobs).
 	repoLocks := scheduler.NewRepoLocks()
+	eventHub := scheduler.NewEventHub()
 	jobEngine := scheduler.NewEngine(db, repoLocks, log)
+	jobEngine.Events = eventHub
 	// S2-F5: orphaned running rows from a previous process cannot resume.
 	if err := jobEngine.RecoverOnStartup(context.Background()); err != nil {
 		log.Error("job recovery", "err", err)
 		os.Exit(1)
 	}
 	controlReg := agentgw.NewRegistry(log)
+
+	apiToken, err := web.LoadOrCreateAPIToken(*dataDir, log)
+	if err != nil {
+		log.Error("api token", "err", err)
+		os.Exit(1)
+	}
 
 	enrollSvc := &enroll.Service{
 		DB:       db,
@@ -121,23 +130,19 @@ func main() {
 	}
 	defer gw.GracefulStop()
 
-	// Minimal web surface: healthz over HTTPS (M11). UI arrives later in M2.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		if err := db.Ping(r.Context()); err != nil {
-			http.Error(w, "catalog unhealthy", http.StatusServiceUnavailable)
-			return
-		}
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte("ok\n"))
-	})
-	mux.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprintf(w, "%s\n", version)
+	// HTTPS :8443 — REST + SSE + embedded UI (M2-S5). Auth: dev API token.
+	webHandler := web.NewHandler(web.Config{
+		DB:       db,
+		Auditor:  auditor,
+		Events:   eventHub,
+		APIToken: apiToken,
+		Version:  version,
+		Log:      log,
 	})
 
 	webSrv := &http.Server{
 		Addr:    *webAddr,
-		Handler: mux,
+		Handler: webHandler,
 		TLSConfig: &tls.Config{
 			Certificates: []tls.Certificate{serverID.TLSCert},
 			MinVersion:   tls.VersionTLS13,

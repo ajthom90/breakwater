@@ -1,4 +1,4 @@
-.PHONY: test test-short test-gate test-m1 build cross docker tidy
+.PHONY: test test-short test-gate test-m1 build cross docker tidy web web-typecheck
 
 test-short:
 	cd server && go test ./... -count=1 -short -timeout 10m
@@ -12,7 +12,20 @@ test-gate:
 
 test: test-short test-m1
 
-build:
+# Build the React UI into server/internal/web/dist for go:embed.
+# Backend-only contributors: a committed placeholder dist/index.html keeps
+# `go build ./...` working without Node. Run `make web` for the real shell.
+web:
+	cd web && npm ci && npm run build
+
+web-typecheck:
+	cd web && npm ci && npx tsc --noEmit -p tsconfig.app.json
+
+build: web
+	cd server && CGO_ENABLED=0 go build -o ../bin/breakwaterd ./cmd/breakwaterd
+
+# Server binary only (uses whatever is already in server/internal/web/dist).
+build-server:
 	cd server && CGO_ENABLED=0 go build -o ../bin/breakwaterd ./cmd/breakwaterd
 
 cross:

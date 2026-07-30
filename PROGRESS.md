@@ -4,7 +4,7 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
-**Phase 1 — M2 (weeks 3–4)** — 🔄 **IN PROGRESS** (stages 1–4 complete; see [M2 progress](#m2-progress) below)
+**Phase 1 — M2 (weeks 3–4)** — ✅ **COMPLETE** on Linux/darwin evidence (stage 5 closed; Windows demo subset still gated — see [M2 closeout](#m2-closeout))
 
 **Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; closed at `161fb18`)
 
@@ -594,18 +594,135 @@ cancel confirmation: job state=cancelled err="cancelled"
 
 ---
 
-## Next: M2 remaining (weeks 3–4)
+### Stage 5 — UI shell + REST API (2026-07-30)
 
-Stages 1–4 done. Remaining:
+PLAN M2 line: **"UI shell against fake API"**. Delivered as a read-only REST
+surface over the **real** catalog (not fakes) + React shell with live SSE,
+behind a single dev-token middleware (sessions/argon2id/TOTP deferred to M6).
 
-- UI shell against fake API — stage 5
-- Cron schedules / windows / retry (M5; dispatch core is stage 2)
-- Vendor kopia; consider v0.23 when on Go 1.25+
-- Optional: backfill `hashing_algorithm` from vault for pre-eea1a46 keystore rows (R3-4)
-- Directory sharding vs `MaxMarkObjectBytes` (16 MiB ≈ max entries per single TreeObject)
-- First `windows-latest` green run closes the untested-on-Windows list above
+| Deliverable | Status | Evidence |
+|-------------|--------|----------|
+| REST skeleton on :8443 (`server/internal/web`) | ✅ | `GET /api/v1/{machines,machines/{id},jobs,snapshots,audit,summary,events}` |
+| Real catalog data (not fakes) | ✅ | catalog `ListJobs`/`ListSnapshots`/`Summary`; audit `ListEvents`+`VerifyChain` |
+| Dev API token middleware (all `/api/v1/*`) | ✅ | `<dataDir>/api-token`; `RequireAPIToken`; unauth 401 test; full token not logged |
+| `/healthz` open | ✅ | unchanged |
+| SSE `GET /api/v1/events` ↔ scheduler transitions | ✅ | `scheduler.EventHub` + `Engine.Events`; disconnect unsub tests |
+| SSE no goroutine leak on disconnect | ✅ | `TestSSE_UnsubscribeOnDisconnect` + churn + hub unit |
+| React 18 + TS + Vite + Tailwind + TanStack Router/Query | ✅ | `web/`; dark appliance shell |
+| Screens: Dashboard, Machines(+detail), Activity | ✅ | real API data |
+| Stubs: Restore, Settings | ✅ | explicit "Not implemented in M2" |
+| Audit screen | ✅ | simple table over real audit API (cheap; not stubbed) |
+| Placeholders visibly labeled | ✅ | capacity/dedup tiles + stub screens |
+| `go:embed` + placeholder for backend-only | ✅ | `server/internal/web/dist/`; `make web` → embed path |
+| CI: npm ci + tsc + build on Linux job | ✅ | `.github/workflows/ci.yml` |
+| `package-lock.json` committed; no `node_modules` | ✅ | `web/.gitignore` |
+| THIRD_PARTY_NOTICES UI deps (MIT/Apache) | ✅ | React/Vite/Tailwind/TanStack/Recharts |
+| No mutating :8443 endpoints | ✅ | GET-only API |
+| Proto untouched | ✅ | frozen |
+| Demo `TestM2S5_UIDemo` | ✅ | enroll → API machines → backup×2 dedup |
 
-*Demo (later): MSI install → appears in UI in 10s → backup → second run shows dedup ratio.*
+#### Auth decision (M2 — document; do not "forget unauthenticated")
+
+Every `/api/v1/*` route is behind **one** middleware (`RequireAPIToken`). Today it
+enforces a single **dev-only** token at `<dataDir>/api-token` (generated on first
+boot, mode 0600, log prints **preview only** `TokenPreview` — never full token).
+This is the single attachment point for M6 sessions + argon2id + TOTP. Query
+`?token=` is allowed solely because `EventSource` cannot set headers (dev-only;
+cookies replace this in M6). `/healthz` and `/version` stay open.
+
+#### Audit decision (M2-S5)
+
+Read-only REST GETs are **not** audited (noise). Documented in `server/internal/audit`
+package comment. Any future mutating endpoint on :8443 **must** be audited
+(`job.run_manual`, `job.cancel`, policy/settings/user/enroll-token, etc.).
+
+#### Build integration
+
+```
+make web              # npm ci && vite build → server/internal/web/dist
+make build-server     # go build only (uses current embed tree)
+make build            # web + server
+```
+
+Backend-only: a minimal `dist/index.html` placeholder is always present so
+`go build ./...` never breaks without Node. Production/CI runs `make web` (or the
+CI npm steps) before packaging.
+
+#### Demo numbers (`TestM2S5_UIDemo`)
+
+```
+machine appeared in /api/v1/machines (status=active)
+run1 bytes_stored=1048586
+run2 bytes_stored=21
+dedup ratio run2/run1 ≈ 0.0000  (≪ 5%)
+snapshots=2; audit chain_ok=true; unauth API → 401
+```
+
+#### Verification (stage 5)
+
+```
+gofmt -l server pkg agent cli restore tools   # empty
+cd server && go vet ./... && go test ./... -count=1 -short -race -timeout 10m  # PASS
+cd agent && go test ./... -count=1 -race                                      # PASS
+cd pkg && go test ./... -count=1 -race                                        # PASS
+cd tools/golden && go test ./... -count=1 -race                               # PASS
+cd web && npm ci && npx tsc --noEmit -p tsconfig.app.json && npm run build    # PASS
+cd server && go build ./... && go test ./internal/web/ -count=1 -race -v      # PASS
+go test ./internal/agentgw/ -count=1 -race -run 'TestM2S5|TestM2S4|Golden' -v # PASS
+BW_GATE_BYTES=268435456 go test ./internal/vault/ -run TestEngineGate_Kopia -v # PASS
+```
+
+---
+
+## M2 closeout
+
+### PLAN M2 deliverables (honest status)
+
+| PLAN M2 item | Status | Evidence / caveat |
+|--------------|--------|-------------------|
+| Windows agent service (SYSTEM) + WiX MSI | ⚠️ **Code complete; Windows runtime unproven** | Service/MSI authored; see [untested-on-Windows list](#untested-on-windows--must-verify-on-first-real-run) — **do not claim MSI install works** until `windows-latest` / VM proves it |
+| Persistent dial-out + keepalives | ✅ | `agent/internal/control` + server Channel; demos green on darwin/linux |
+| Server-dispatched jobs | ✅ | scheduler Engine + control plane (stage 2–4) |
+| Plain-directory backup (chunk → have/want → upload → manifest) | ✅ | `pkg/backup` + DataService; M2S3/M2S4/M2S5 demos |
+| UI shell against API | ✅ | stage 5 REST + React shell (real catalog; placeholders labeled) |
+| Golden dataset generator + comparer | ✅ | `tools/golden`; portable subset CI-green; Windows fixtures gated |
+| **Demo:** MSI install → UI in 10s → backup → 2nd run dedup | ⚠️ **Partial** | See below |
+
+### Demo: what is proven vs unproven
+
+| Step | Proven on Linux/darwin | Unproven pending Windows run |
+|------|------------------------|------------------------------|
+| MSI install (`msiexec /i … BWTOKEN=…`) | ❌ | Yes — WiX/MSI path untested on real Windows |
+| Service start as LocalSystem | ❌ | Yes — SCM lifecycle untested |
+| Agent enroll + appears | ✅ via gRPC enroll | UI "in 10s after msiexec" not measured on Windows |
+| Appears in `/api/v1/machines` | ✅ `TestM2S5_UIDemo` | — |
+| File backup job | ✅ | VSS/SYSTEM/SeBackup not in M2 (plain dir only) |
+| Second run reduced upload (dedup) | ✅ run2≪run1 | — |
+
+**M2 is closed on the evidence that exists.** Declaring the full Barracuda-style
+"MSI → UI in 10s" demo complete would be Windows evidence that does not exist yet.
+The untested-on-Windows list (stage 4) remains the gating checklist for that claim.
+
+### Carried forward (deferred, with reason)
+
+| Item | Reason |
+|------|--------|
+| Multi-admin sessions, argon2id, TOTP | PLAN Phase 2 / M6; M2 ships dev API token middleware only |
+| Mutating REST (job submit/cancel, mint token, policies) | M2 deliberately GET-only; mutating lives on :8443 later with audit |
+| Full six screens (Restore/Settings depth) | Shell stubs; restore path is a later Phase 1 milestone |
+| Capacity / fleet dedup tiles | Need vault stats aggregation — labeled placeholder |
+| Cron schedules / windows / retry | M5; dispatch core exists (stage 2) |
+| Vendor kopia; v0.23 on Go 1.25+ | M1 decision #7 |
+| Optional keystore `hashing_algorithm` backfill | R3-4 pre-eea1a46 rows |
+| Directory sharding vs `MaxMarkObjectBytes` | Scale note for huge trees |
+| First `windows-latest` green run | Closes untested-on-Windows list |
+| VSS / SeBackupPrivilege | Not stage 4/5 scope; later Phase 1 |
+
+### Next after M2
+
+- M3+ Phase 1: restore path, schedules/retention UI, alerts, scrub
+- First Windows CI/VM validation of the stage-4 untested list
+- M6: real web auth replacing the dev token middleware
 
 ---
 

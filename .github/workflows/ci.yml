@@ -31,6 +31,12 @@ jobs:
             restore/go.sum
             tools/golden/go.sum
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Go work sync
         run: go work sync
 
@@ -42,6 +48,13 @@ jobs:
             echo "$unformatted"
             exit 1
           fi
+
+      - name: Web UI typecheck + build (embed path)
+        working-directory: web
+        run: |
+          npm ci
+          npx tsc --noEmit -p tsconfig.app.json
+          npm run build
 
       - name: Build breakwaterd
         working-directory: server

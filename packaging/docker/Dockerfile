@@ -2,6 +2,14 @@
 # Build from repository root:
 #   docker build -f packaging/docker/Dockerfile -t breakwater:dev .
 
+FROM node:22-bookworm AS web
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+# Vite outDir is server/internal/web/dist (relative to web/)
+RUN mkdir -p /src/server/internal/web && npm run build
+
 FROM golang:1.23-bookworm AS build
 WORKDIR /src
 ENV GOTOOLCHAIN=local
@@ -21,6 +29,8 @@ RUN go mod download
 WORKDIR /src
 COPY pkg/ ./pkg/
 COPY server/ ./server/
+# Embed real UI (overwrites placeholder if present)
+COPY --from=web /src/server/internal/web/dist ./server/internal/web/dist
 
 WORKDIR /src/server
 RUN go build -trimpath -ldflags="-s -w -X main.version=0.0.1-dev" \

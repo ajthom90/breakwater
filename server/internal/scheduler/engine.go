@@ -38,6 +38,9 @@ type Engine struct {
 	Log   *slog.Logger
 	// Dispatch is optional until the control registry is wired.
 	Dispatch Dispatcher
+	// Events is optional; when set, successful job state changes are published
+	// for the web SSE stream (M2-S5 GET /api/v1/events).
+	Events *EventHub
 
 	// MaxPending is the offline queue bound; defaults to MaxPendingJobsPerMachine.
 	MaxPending int
@@ -128,6 +131,7 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (jobID string, e
 		return "", err
 	}
 	e.Log.Info("job created", "job_id", id, "machine_id", req.MachineID, "type", req.Type)
+	e.publishJob(j.ID, j.MachineID, j.Type, catalog.JobStatePending, 0, 0, "")
 
 	if e.Dispatch != nil && e.Dispatch.IsOnline(req.MachineID) {
 		if err := e.tryDispatch(ctx, id); err != nil {
@@ -214,6 +218,7 @@ func (e *Engine) tryDispatch(ctx context.Context, jobID string) error {
 		return nil
 	}
 	e.Log.Info("job dispatched", "job_id", jobID, "machine_id", j.MachineID, "type", j.Type)
+	e.publishJob(jobID, j.MachineID, j.Type, catalog.JobStateRunning, 0, 0, "")
 	return nil
 }
 
@@ -326,7 +331,11 @@ func (e *Engine) HandleProgress(ctx context.Context, machineID, jobID string, by
 	if j.State != catalog.JobStateRunning {
 		return nil
 	}
-	return e.DB.UpdateJobProgress(ctx, jobID, bytesDone, bytesTotal)
+	if err := e.DB.UpdateJobProgress(ctx, jobID, bytesDone, bytesTotal); err != nil {
+		return err
+	}
+	e.publishJob(jobID, j.MachineID, j.Type, catalog.JobStateRunning, bytesDone, bytesTotal, "")
+	return nil
 }
 
 // HandleResult applies a JobResult. Duplicate results for terminal jobs are no-ops.
@@ -448,6 +457,7 @@ func (e *Engine) Cancel(ctx context.Context, jobID, reason string) error {
 			e.Log.Info("job cancelling (lease held until agent confirms or timeout)",
 				"job_id", jobID, "reason", reason)
 			e.scheduleCancelDeadline(jobID)
+			e.publishJob(jobID, j.MachineID, j.Type, catalog.JobStateCancelling, j.BytesRead, j.BytesStored, reason)
 		}
 		return nil
 	}
@@ -474,6 +484,7 @@ func (e *Engine) Cancel(ctx context.Context, jobID, reason string) error {
 		e.untrackRunning(j.MachineID, jobID)
 		e.releaseLease(jobID)
 		e.Log.Info("job cancelled", "job_id", jobID, "reason", reason)
+		e.publishJob(jobID, j.MachineID, j.Type, catalog.JobStateCancelled, j.BytesRead, j.BytesStored, reason)
 	}
 	return nil
 }
@@ -597,6 +608,7 @@ func (e *Engine) completeJobFrom(ctx context.Context, jobID, fromState string, b
 		e.untrackRunning(j.MachineID, jobID)
 		e.releaseLease(jobID)
 		e.Log.Info("job success", "job_id", jobID)
+		e.publishJob(jobID, j.MachineID, j.Type, catalog.JobStateSuccess, bytesRead, bytesStored, "")
 	}
 	return nil
 }
@@ -621,6 +633,7 @@ func (e *Engine) finishCancelled(ctx context.Context, jobID, msg string) error {
 		e.untrackRunning(j.MachineID, jobID)
 		e.releaseLease(jobID)
 		e.Log.Info("job cancelled (agent confirmed)", "job_id", jobID)
+		e.publishJob(jobID, j.MachineID, j.Type, catalog.JobStateCancelled, j.BytesRead, j.BytesStored, msg)
 	}
 	return nil
 }
@@ -651,8 +664,24 @@ func (e *Engine) failJob(ctx context.Context, jobID, msg string) (bool, error) {
 		e.untrackRunning(j.MachineID, jobID)
 		e.releaseLease(jobID)
 		e.Log.Info("job failed", "job_id", jobID, "err", msg)
+		e.publishJob(jobID, j.MachineID, j.Type, catalog.JobStateFailed, j.BytesRead, j.BytesStored, msg)
 	}
 	return applied, nil
+}
+
+func (e *Engine) publishJob(jobID, machineID, jobType, state string, bytesRead, bytesStored int64, errMsg string) {
+	if e.Events == nil {
+		return
+	}
+	e.Events.Publish(JobEvent{
+		JobID:        jobID,
+		MachineID:    machineID,
+		Type:         jobType,
+		State:        state,
+		BytesRead:    bytesRead,
+		BytesStored:  bytesStored,
+		ErrorMessage: errMsg,
+	})
 }
 
 func (e *Engine) releaseLease(jobID string) {

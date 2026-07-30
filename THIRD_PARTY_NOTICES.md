@@ -23,6 +23,20 @@ GPL tools (e.g. wimlib, partclone, ntfs-3g) may appear only as separate processe
 | [klauspost/compress](https://github.com/klauspost/compress) | Apache-2.0 / BSD | Compression |
 | go-ole / microsoft-wmi | MIT | Hyper-V WMI (Phase 3) |
 
+### Web UI (`web/` — embedded via go:embed into breakwaterd)
+
+| Component | License | Notes |
+|-----------|---------|-------|
+| [React](https://github.com/facebook/react) 18 | MIT | UI runtime |
+| [Vite](https://github.com/vitejs/vite) | MIT | Static build tooling (devDependency) |
+| [TypeScript](https://github.com/microsoft/TypeScript) | Apache-2.0 | Typecheck (devDependency) |
+| [Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) | MIT | Utility CSS |
+| [@tanstack/react-router](https://github.com/TanStack/router) | MIT | Client routing |
+| [@tanstack/react-query](https://github.com/TanStack/query) | MIT | Data fetching/cache |
+| [Recharts](https://github.com/recharts/recharts) | MIT | Charts (available; M2 dashboard uses simple tiles) |
+
+All UI dependencies are MIT or Apache-2.0. No AGPL/GPL packages are used in `web/package.json`.
+
 ---
 
 ## Vendored / copied code

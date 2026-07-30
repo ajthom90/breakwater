@@ -22,7 +22,7 @@
 // detail_json blob). row_hash and prev_hash are lowercase hex encodings of the
 // 32-byte SHA-256 digest (64 hex chars).
 //
-// # Audit policy (M2 stage 2–3 — explicit)
+// # Audit policy (M2 stage 2–5 — explicit)
 //
 // PLAN taxonomy: audit records ADMIN actions and security-boundary events.
 // Scope of this package's interceptors and current emitters:
@@ -33,13 +33,17 @@
 //   - NOT audited: agent heartbeats, control-channel traffic (Hello/JobProgress/…),
 //     automatic job state transitions, inventory reports, per-chunk PutContents /
 //     CheckContents (would drown the log).
-//   - Deferred: job.run_manual and job.cancel begin when jobs become human-triggerable
-//     on the web surface (later stage). The job engine already stores `initiator` in
-//     params_json so those events can name the actor without a schema change.
+//   - NOT audited (M2-S5 decision): read-only REST GETs on :8443
+//     (/api/v1/machines, /jobs, /snapshots, /audit, /summary, /events). Auditing
+//     every dashboard poll would drown the chain; list/read noise is not admin action.
+//   - MUST audit (when added): every mutating REST endpoint on :8443 (job submit/
+//     cancel, policy change, enroll token mint, user/settings, forget/undelete/prune).
+//     job.run_manual and job.cancel begin when those become human-triggerable.
+//     The job engine already stores `initiator` in params_json so those events can
+//     name the actor without a schema change.
 //
-// Placeholder Unary/Stream interceptors remain pass-through; method-level audit for
-// human REST/gRPC will attach there when the web API lands. Do not log agent Channel
-// messages as audit rows.
+// Placeholder Unary/Stream interceptors remain pass-through for gRPC method-level
+// audit. Do not log agent Channel messages as audit rows.
 //
 // Decision (M2-S3): CommitSnapshot emits snapshot.commit with actor=machine id,
 // target=snapshot id. No per-chunk audit.
