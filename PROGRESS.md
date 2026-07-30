@@ -548,8 +548,8 @@ gofmt / go vet / short+race / agent -race / golden -race / M2S4 -race / gate 256
 
 #### Windows CI vs still-unproven runtime
 
-**Proven by `windows-latest` CI** (steps that actually ran green before MSI authoring
-failed — confirmed on failed runs through M2-s5; re-confirmed when MSI build is green):
+**Proven by `windows-latest` CI** (run `30581280420` on `78d8d33` — both jobs
+success; MSI build step green after WiX fix):
 
 | Item | CI evidence |
 |------|-------------|
@@ -557,6 +557,7 @@ failed — confirmed on failed runs through M2-s5; re-confirmed when MSI build i
 | Golden fixtures (Windows set) | ACLs, ADS, sparse, junction loops, long paths, deny-share-locked — `tools/golden` tests pass |
 | Agent windows/amd64 build + `--version` | CI build step executes the binary |
 | WiX v5 toolchain install | `dotnet tool install wix` + `wix --version` |
+| **MSI product build** (`wix build`) | Build MSI + upload artifacts succeeded |
 
 **Still unproven** (no `msiexec` / service runtime on a real box yet — a green MSI
 *build* is not an MSI *install*):
@@ -569,7 +570,6 @@ failed — confirmed on failed runs through M2-s5; re-confirmed when MSI build i
 6. **SD comparison path (S4-F7)** — GetNamedSecurityInfo + SDDL equality on NTFS after restore; SACL privilege fallback (unit path exercises in golden CI; full restore-from-backup still needs an install+backup cycle).
 7. **Directory fsync after rename (S4-F4)** — FlushFileBuffers on a directory handle after identity.json rename survives hard power loss.
 8. **SeBackupPrivilege / VSS** — not in stage 4 scope (plain-directory `pkg/backup` only); Phase later.
-9. **MSI product build** — `wix build` of `BreakwaterAgent.wxs` (CI was red on WIX0070 from invalid `MsiHiddenProperties`; fixed — green MSI *build* still does not prove install).
 
 #### Decisions (stage 4)
 
