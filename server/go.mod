@@ -6,13 +6,15 @@ require (
 	// pkg version is a workspace stub; go.work (and Docker/CI local checkouts)
 	// resolve github.com/ajthom90/breakwater/pkg to ../pkg. Do not treat this
 	// pseudo-version as a published module pin (R3 nit).
-	github.com/ajthom90/breakwater/pkg v0.0.0-20260730144734-755f41736ae3
+	github.com/ajthom90/breakwater/pkg v0.0.0
 	github.com/kopia/kopia v0.19.0
 	github.com/oklog/ulid/v2 v2.1.1
 	golang.org/x/crypto v0.32.0
 	google.golang.org/grpc v1.69.4
 	modernc.org/sqlite v1.34.5
 )
+
+require google.golang.org/protobuf v1.36.3
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.17.0 // indirect
@@ -56,8 +58,9 @@ require (
 	golang.org/x/sys v0.29.0 // indirect
 	golang.org/x/text v0.21.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250115164207-1a7da9e5054f // indirect
-	google.golang.org/protobuf v1.36.3 // indirect
 	modernc.org/libc v1.55.3 // indirect
 	modernc.org/mathutil v1.6.0 // indirect
 	modernc.org/memory v1.8.0 // indirect
 )
+
+replace github.com/ajthom90/breakwater/pkg => ../pkg

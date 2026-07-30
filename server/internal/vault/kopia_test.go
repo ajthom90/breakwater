@@ -382,7 +382,8 @@ func TestVault_SmallRoundTrip(t *testing.T) {
 	}
 }
 
-// TestPutContent_RejectsOversize is H2: payloads >4MiB must error.
+// TestPutContent_RejectsOversize is H2 (amended M2-S3): payloads >
+// MaxPutContentBytes (8 MiB, DYNAMIC-4M max segment) must error.
 func TestPutContent_RejectsOversize(t *testing.T) {
 	ctx := context.Background()
 	mgr := vault.NewManager(t.TempDir(), t.TempDir())
@@ -395,18 +396,18 @@ func TestPutContent_RejectsOversize(t *testing.T) {
 	big := make([]byte, vault.MaxPutContentBytes+1)
 	_, err = v.PutContent(ctx, big)
 	if err == nil {
-		t.Fatal("expected PutContent to reject >4MiB payload")
+		t.Fatal("expected PutContent to reject oversized payload")
 	}
 	t.Logf("oversize rejected: %v", err)
 
-	// Exactly 4MiB is allowed.
+	// Exactly MaxPutContentBytes is allowed.
 	ok := make([]byte, vault.MaxPutContentBytes)
 	for i := range ok {
 		ok[i] = byte(i)
 	}
 	cid, err := v.PutContent(ctx, ok)
 	if err != nil {
-		t.Fatalf("PutContent 4MiB: %v", err)
+		t.Fatalf("PutContent max size: %v", err)
 	}
 	if cid == "" {
 		t.Fatal("empty content id")

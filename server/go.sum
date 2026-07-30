@@ -14,8 +14,6 @@ github.com/AzureAD/microsoft-authentication-library-for-go v1.3.2 h1:kYRSnvJju5g
 github.com/AzureAD/microsoft-authentication-library-for-go v1.3.2/go.mod h1:wP83P5OoQ5p6ip3ScPr0BAq0BvuPAvacpEuSzyouqAI=
 github.com/GehirnInc/crypt v0.0.0-20230320061759-8cc1b52080c5 h1:IEjq88XO4PuBDcvmjQJcQGg+w+UaafSy8G5Kcb5tBhI=
 github.com/GehirnInc/crypt v0.0.0-20230320061759-8cc1b52080c5/go.mod h1:exZ0C/1emQJAw5tHOaUDyY1ycttqBAPcxuzf7QbY6ec=
-github.com/ajthom90/breakwater/pkg v0.0.0-20260730144734-755f41736ae3 h1:8jPLEhn4ClD7lFNDZnRlMyM3b67kSazS192GQ+0WwZU=
-github.com/ajthom90/breakwater/pkg v0.0.0-20260730144734-755f41736ae3/go.mod h1:0tk1ogEClyCGjJuyl1PAV/D8ZdDUo1fHboZiOCUJ1ws=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=

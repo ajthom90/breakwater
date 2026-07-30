@@ -4,7 +4,7 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
-**Phase 1 — M2 (weeks 3–4)** — 🔄 **IN PROGRESS** (stages 1–2 complete; see [M2 progress](#m2-progress) below)
+**Phase 1 — M2 (weeks 3–4)** — 🔄 **IN PROGRESS** (stages 1–3 complete; see [M2 progress](#m2-progress) below)
 
 **Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; closed at `161fb18`)
 
@@ -346,12 +346,97 @@ pkg tests                               # PASS
 
 ---
 
+### Stage 3 — data plane: DataService, content IDs, backup pipeline (2026-07-30)
+
+Append-only agent data path on :9443; agent-side content IDs; portable plain-directory
+backup proven by fake agent. Windows agent (stage 4) reuses `pkg/backup` as a library.
+
+| Deliverable | Status | Evidence |
+|-------------|--------|----------|
+| **pkg/contentid** (keyed hash + DYNAMIC-4M-BUZHASH) | ✅ | `pkg/contentid`; unit tests; vault `TestPkgContentID_RoundTripWithVault` |
+| **kopia carve-out** (hashing+splitter only in pkg) | ✅ | `TestKopiaConfinement_PkgOnlyContentID`; pin v0.19.0 |
+| **DataService** CheckContents / PutContents / PutTree / PutImage / CommitSnapshot | ✅ | `server/internal/agentgw/data.go` |
+| Machine binding + cross-client isolation | ✅ | `TestM2S3_CrossMachineIsolation` (B+A's job denied; CheckContents not oracle) |
+| ID-mismatch / oversized batch / content rejection | ✅ | `TestM2S3_IDMismatchRejected`, `TestM2S3_OversizedBatchAndContentRejected` |
+| Lease-only vault access (`VaultForJob`) | ✅ | `TestM2S3_LeaseRequiredForVaultAccess`; data plane never Open without lease |
+| Append-only (no delete RPCs; PutContents dedup no-op) | ✅ | DataService methods Put/Has/Write/Commit only |
+| **snapshot.commit** audit (not per-chunk) | ✅ | audit taxonomy + CommitSnapshot emitter |
+| **pkg/backup** portable pipeline | ✅ | walk → CDC → have/want → tree → CommitSnapshot |
+| Fake agent FILE_BACKUP | ✅ | demo `onJob` + fileback pipeline |
+| Scheduler: non-blocking dispatch lease | ✅ | `TestS3_DispatchLeaseNonBlocking` |
+| Scheduler: Cancel lease-on-confirm (vault types) | ✅ | `TestS3_CancelVaultJobHoldsLeaseUntilResult` (cancelling state) |
+| Heartbeat pending retrigger | ✅ | Channel Heartbeat → DeliverPending |
+| F4 failure-result hardening | ✅ | `TestS2F4_ResultIgnoredForPendingJob` covers Success+Failure |
+| **Demo** `TestM2S3_BackupDedupDemo` | ✅ | PASS under `-race` |
+
+#### Decisions (stage 3)
+
+1. **kopia confinement amendment (PLAN-sanctioned):** `pkg/contentid` may import
+   `repo/hashing` + `repo/splitter` only (pure-Go). Enforced by
+   `TestKopiaConfinement_PkgOnlyContentID`. Vault still owns content/object/manifest/maintenance.
+2. **MaxPutContentBytes = 8 MiB** (DYNAMIC-4M max segment), up from 4 MiB FIXED-4M.
+   gRPC MaxRecv/SendMsgSize = 16 MiB on :9443. Image fixed blocks remain 4 MiB.
+3. **ObjectFromContents** via vault `ConcatenateObjects` for multi-chunk files after
+   have/want PutContents (no payload re-upload). Wire: ephemeral PutTreeObject
+   sentinel entry name `.bw-object-from-contents` (not stored as a tree) —
+   freezes no new proto field under the frozen contract.
+4. **Backup library in `pkg/backup`** (not `agent/internal` only) so server demo
+   tests share it; agent/internal/fileback re-exports for stage-4 discoverability.
+5. **Cancel for vault-writing jobs:** running → `cancelling`, JobCancel sent, lease
+   held until JobResult or disconnect (S2-F6 stage-3 contract).
+
+#### Red-first (security boundaries)
+
+```
+=== RUN   TestM2S3_CrossMachineIsolation
+    … B with A's job → PermissionDenied; B CheckContents of A's content id → absent
+--- PASS (after structural machine+lease checks)
+
+=== RUN   TestM2S3_IDMismatchRejected
+    … content id mismatch: client=0000… server=<real>
+--- PASS
+
+=== RUN   TestM2S3_OversizedBatchAndContentRejected
+    … batch 4097 exceeds max 4096; payload 8388609 exceeds max 8388608
+--- PASS
+
+=== RUN   TestM2S3_LeaseRequiredForVaultAccess
+    … no vault lease held for job (FailedPrecondition)
+--- PASS
+
+=== RUN   TestS2F4 … failure path
+    ignoring JobResult for non-running job state=pending  (success then failure)
+--- PASS
+```
+
+#### Demo numbers
+
+```
+run1 uploaded=10485783 (~10 MiB multi-chunk file + small files)
+run2 uploaded=28  (mutate hello.txt + add new.txt only)
+dedup ratio run2/run1 ≈ 0.0003%  (≪ 5% criterion)
+After forget snap1 + prune min-age 0: snap2 fully restorable
+```
+
+#### Verification (stage 3)
+
+```
+gofmt -l server pkg agent cli restore   # empty
+go vet ./...                            # clean
+go test ./... -short -race              # all ok
+go test ./internal/scheduler/ ./internal/agentgw/ -race  # PASS incl. M2S3_*
+BW_GATE_BYTES=268435456 TestEngineGate_Kopia  # PASS
+full 10 GiB TestEngineGate_Kopia              # PASS (~130s)
+pkg + agent tests                             # PASS
+```
+
+---
+
 ## Next: M2 remaining (weeks 3–4)
 
-Stages 1–2 done. Remaining:
+Stages 1–3 done. Remaining:
 
-- Windows agent service (SYSTEM) + WiX MSI (stage 4 — bind to Channel contract above)
-- Plain-directory backup (chunk → have/want → append-only upload → manifest) — stage 3
+- Windows agent service (SYSTEM) + WiX MSI (stage 4 — bind to Channel + DataService + pkg/backup)
 - UI shell against fake API — stage 5
 - Golden-dataset generator + comparer
 - Cron schedules / windows / retry (M5; dispatch core is stage 2)

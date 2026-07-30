@@ -111,6 +111,10 @@ func main() {
 	gw.Auditor = auditor
 	gw.ServerVersion = version
 	gw.AttachControlPlane(db, jobEngine, controlReg)
+	// M2-S3: append-only DataService (have/want + PutContents + CommitSnapshot).
+	gw.DataService = &agentgw.DataServer{
+		Engine: jobEngine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
+	}
 	if _, err := gw.Start(*agentAddr); err != nil {
 		log.Error("agent gateway", "err", err)
 		os.Exit(1)

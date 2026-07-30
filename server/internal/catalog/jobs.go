@@ -10,11 +10,12 @@ import (
 
 // Job states (schema + engine). Terminal states never resurrect to running.
 const (
-	JobStatePending   = "pending"
-	JobStateRunning   = "running"
-	JobStateSuccess   = "success"
-	JobStateFailed    = "failed"
-	JobStateCancelled = "cancelled"
+	JobStatePending    = "pending"
+	JobStateRunning    = "running"
+	JobStateCancelling = "cancelling" // vault-writing: JobCancel sent, lease held until result/teardown
+	JobStateSuccess    = "success"
+	JobStateFailed     = "failed"
+	JobStateCancelled  = "cancelled"
 )
 
 // Job is a catalog row for a scheduled or dispatched unit of work.

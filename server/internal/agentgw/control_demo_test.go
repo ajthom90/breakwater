@@ -133,6 +133,9 @@ type fakeAgent struct {
 	// skipResult when true (with onJob nil) records JobStart but does not send JobResult.
 	skipResult bool
 
+	// uploadLog maps jobID → bytes uploaded (M2-S3 file backup stats).
+	uploadLog map[string]int64
+
 	stop chan struct{}
 	wg   sync.WaitGroup
 }

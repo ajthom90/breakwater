@@ -87,6 +87,7 @@ func TestS2F3_ExclusiveNotStarvedBySharedChain(t *testing.T) {
 
 // TestS2F4_ResultIgnoredForPendingJob (S2-F4): JobResult for a still-pending job
 // must not terminal-ize it; later delivery still works. FAILS on 70e26a2.
+// M2-S3 hardening: also covers FAILURE JobResult for pending (reviewer F4 mutant).
 func TestS2F4_ResultIgnoredForPendingJob(t *testing.T) {
 	e, db, d := setupEngine(t)
 	ctx := context.Background()
@@ -107,11 +108,23 @@ func TestS2F4_ResultIgnoredForPendingJob(t *testing.T) {
 	if err := e.HandleResult(ctx, "mach1", scheduler.Result{
 		JobID: id, Success: true, BytesRead: 999,
 	}); err != nil {
-		t.Fatalf("HandleResult: %v", err)
+		t.Fatalf("HandleResult success: %v", err)
 	}
 	j, _ = e.Job(ctx, id)
 	if j.State != catalog.JobStatePending {
-		t.Fatalf("S2-F4: pending job terminal-ized by result: state=%s want pending", j.State)
+		t.Fatalf("S2-F4: pending job terminal-ized by success result: state=%s want pending", j.State)
+	}
+
+	// FAILURE path must also be ignored (stage-3 hardening — completeJob double-guard
+	// does not cover failJob which historically allowed pending→failed).
+	if err := e.HandleResult(ctx, "mach1", scheduler.Result{
+		JobID: id, Success: false, ErrorMessage: "fake failure for pending",
+	}); err != nil {
+		t.Fatalf("HandleResult failure: %v", err)
+	}
+	j, _ = e.Job(ctx, id)
+	if j.State != catalog.JobStatePending {
+		t.Fatalf("S2-F4: pending job terminal-ized by failure result: state=%s want pending", j.State)
 	}
 
 	// Later delivery still works.
@@ -129,6 +142,105 @@ func TestS2F4_ResultIgnoredForPendingJob(t *testing.T) {
 		t.Fatalf("after real result: %s", j.State)
 	}
 	_ = db
+}
+
+// TestS3_CancelVaultJobHoldsLeaseUntilResult: file-backup Cancel → cancelling,
+// lease held; JobResult releases lease.
+func TestS3_CancelVaultJobHoldsLeaseUntilResult(t *testing.T) {
+	e, _, d := setupEngine(t)
+	ctx := context.Background()
+	d.SetOnline("mach1", true)
+
+	id, err := e.Submit(ctx, scheduler.SubmitRequest{
+		MachineID: "mach1", Type: scheduler.TypeFileBackup, Initiator: "s3-cancel",
+		ParamsJSON: `{"source":"/tmp"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wait for dispatch.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		j, _ := e.Job(ctx, id)
+		if j != nil && j.State == catalog.JobStateRunning {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	j, _ := e.Job(ctx, id)
+	if j.State != catalog.JobStateRunning {
+		t.Fatalf("state=%s want running", j.State)
+	}
+	if !e.HasLease(id) {
+		t.Fatal("expected lease held while running")
+	}
+
+	if err := e.Cancel(ctx, id, "operator cancel"); err != nil {
+		t.Fatal(err)
+	}
+	j, _ = e.Job(ctx, id)
+	if j.State != catalog.JobStateCancelling {
+		t.Fatalf("after Cancel: state=%s want cancelling", j.State)
+	}
+	if !e.HasLease(id) {
+		t.Fatal("lease must remain held while cancelling (agent may still write)")
+	}
+	if got := d.Cancels(); len(got) < 1 || got[0] != id {
+		t.Fatalf("expected JobCancel sent, got %v", got)
+	}
+
+	if err := e.HandleResult(ctx, "mach1", scheduler.Result{
+		JobID: id, Success: false, ErrorMessage: "cancelled by agent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	j, _ = e.Job(ctx, id)
+	if j.State != catalog.JobStateCancelled {
+		t.Fatalf("after result: state=%s want cancelled", j.State)
+	}
+	if e.HasLease(id) {
+		t.Fatal("lease should be released after agent confirmation")
+	}
+}
+
+// TestS3_DispatchLeaseNonBlocking: exclusive holder blocks shared; file job
+// stays pending and DeliverPending does not hang.
+func TestS3_DispatchLeaseNonBlocking(t *testing.T) {
+	e, _, d := setupEngine(t)
+	ctx := context.Background()
+	d.SetOnline("mach1", true)
+
+	// Hold exclusive (prune).
+	ex, err := e.Locks.AcquireExclusive(ctx, "mach1", "prune-block")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ex.Release()
+
+	start := time.Now()
+	id, err := e.Submit(ctx, scheduler.SubmitRequest{
+		MachineID: "mach1", Type: scheduler.TypeFileBackup, Initiator: "s3-lease",
+		ParamsJSON: `{"source":"/tmp"}`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// DeliverPending must return promptly (non-blocking lease).
+	e.DeliverPending(ctx, "mach1")
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("DeliverPending blocked too long: %s", time.Since(start))
+	}
+	j, _ := e.Job(ctx, id)
+	if j.State != catalog.JobStatePending {
+		t.Fatalf("state=%s want pending (lease blocked)", j.State)
+	}
+
+	ex.Release()
+	e.DeliverPending(ctx, "mach1")
+	j, _ = e.Job(ctx, id)
+	if j.State != catalog.JobStateRunning {
+		t.Fatalf("after exclusive release: state=%s want running", j.State)
+	}
 }
 
 // TestS2F5_RecoverOnStartup fails orphaned running rows.

@@ -22,16 +22,17 @@
 // detail_json blob). row_hash and prev_hash are lowercase hex encodings of the
 // 32-byte SHA-256 digest (64 hex chars).
 //
-// # Audit policy (M2 stage 2 — explicit)
+// # Audit policy (M2 stage 2–3 — explicit)
 //
-// PLAN taxonomy: audit records ADMIN actions. Scope of this package's interceptors
-// and current emitters:
+// PLAN taxonomy: audit records ADMIN actions and security-boundary events.
+// Scope of this package's interceptors and current emitters:
 //
 //   - Audited: machine.enroll (success + reject), auth.fail (unknown cert pin denials
-//     on non-enroll methods). These are security-boundary / admin-visible events.
+//     on non-enroll methods), snapshot.commit (agent CommitSnapshot — first-class
+//     backup completion, not per-chunk noise).
 //   - NOT audited: agent heartbeats, control-channel traffic (Hello/JobProgress/…),
-//     automatic job state transitions, inventory reports. They have no admin actor
-//     and would drown the audit log in noise.
+//     automatic job state transitions, inventory reports, per-chunk PutContents /
+//     CheckContents (would drown the log).
 //   - Deferred: job.run_manual and job.cancel begin when jobs become human-triggerable
 //     on the web surface (later stage). The job engine already stores `initiator` in
 //     params_json so those events can name the actor without a schema change.
@@ -39,6 +40,9 @@
 // Placeholder Unary/Stream interceptors remain pass-through; method-level audit for
 // human REST/gRPC will attach there when the web API lands. Do not log agent Channel
 // messages as audit rows.
+//
+// Decision (M2-S3): CommitSnapshot emits snapshot.commit with actor=machine id,
+// target=snapshot id. No per-chunk audit.
 package audit
 
 import (
@@ -64,8 +68,9 @@ const (
 
 // Action names used by the server (subset of PLAN audit taxonomy).
 const (
-	ActionMachineEnroll = "machine.enroll"
-	ActionAuthFail      = "auth.fail"
+	ActionMachineEnroll  = "machine.enroll"
+	ActionAuthFail       = "auth.fail"
+	ActionSnapshotCommit = "snapshot.commit" // M2-S3: agent CommitSnapshot (not per-chunk)
 )
 
 // Event is an audit event to append.

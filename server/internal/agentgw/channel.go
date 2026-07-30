@@ -214,6 +214,11 @@ func (c *controlServer) handleAgentMsg(ctx context.Context, machineID string, ms
 				log.Error("heartbeat set online", "machine_id", machineID, "err", err)
 			}
 		}
+		// Pending-job retrigger (M2-S3): queue-full / lease-blocked jobs retry
+		// without waiting for reconnect.
+		if c.gw.Engine != nil {
+			c.gw.Engine.DeliverPending(ctx, machineID)
+		}
 		hb := &breakwaterv1.ServerToAgent{
 			Msg: &breakwaterv1.ServerToAgent_HeartbeatAck{
 				HeartbeatAck: &breakwaterv1.HeartbeatAck{

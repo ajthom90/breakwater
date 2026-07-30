@@ -50,8 +50,12 @@ type Gateway struct {
 	// ServerVersion is returned in HelloAck (defaults to 0.0.1-dev).
 	ServerVersion string
 
-	// TestDataService, when non-nil, registers DataService for post-enroll pin
-	// tests only. Production main never sets this.
+	// DataService is the production append-only data plane (M2 stage 3).
+	// When nil, TestDataService may still be registered for pin tests.
+	DataService breakwaterv1.DataServiceServer
+
+	// TestDataService, when non-nil and DataService is nil, registers DataService
+	// for post-enroll pin tests only. Production main never sets this.
 	TestDataService breakwaterv1.DataServiceServer
 
 	mu       sync.RWMutex
@@ -113,10 +117,15 @@ func (g *Gateway) Start(addr string) (string, error) {
 	// PLAN: 30s keepalive on the agent control plane. Enforcement MinTime is
 	// slightly under 30s so compliant clients are not punished for jitter.
 	kaTime, kaTimeout := KeepaliveServerParameters()
+	// Max message size: DYNAMIC-4M max segment is 8 MiB + framing; default 4 MiB
+	// would reject legitimate PutContents payloads (M2-S3).
+	const maxMsg = 16 << 20
 	g.gs = grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
 		grpc.ChainUnaryInterceptor(unary...),
 		grpc.ChainStreamInterceptor(stream...),
+		grpc.MaxRecvMsgSize(maxMsg),
+		grpc.MaxSendMsgSize(maxMsg),
 		grpc.KeepaliveParams(keepalive.ServerParameters{
 			Time:    kaTime,
 			Timeout: kaTimeout,
@@ -133,7 +142,10 @@ func (g *Gateway) Start(addr string) (string, error) {
 		g.ServerVersion = serverVersionDefault
 	}
 	breakwaterv1.RegisterControlServiceServer(g.gs, &controlServer{gw: g})
-	if g.TestDataService != nil {
+	switch {
+	case g.DataService != nil:
+		breakwaterv1.RegisterDataServiceServer(g.gs, g.DataService)
+	case g.TestDataService != nil:
 		breakwaterv1.RegisterDataServiceServer(g.gs, g.TestDataService)
 	}
 

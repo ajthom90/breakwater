@@ -1,12 +1,12 @@
 // Package format defines Breakwater-native snapshot and tree object formats.
 // Shared by agent, server, restore, and bwctl. Authoritative storage is the
-// vault (kopia manifests + objects); catalog mirrors for query.
+// vault (manifests + objects); catalog mirrors for query.
 package format
 
 import "time"
 
 // FormatVersion is the on-disk/object schema version for Breakwater-native
-// structures. Repo format (kopia) is separate; this versions our JSON trees
+// structures. Underlying repo format is separate; this versions our JSON trees
 // and image manifests so fixed-block image objects can be added later.
 const FormatVersion = 1
 

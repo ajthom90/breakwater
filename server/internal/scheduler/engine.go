@@ -152,9 +152,13 @@ func (e *Engine) tryDispatch(ctx context.Context, jobID string) error {
 
 	repoID := j.MachineID
 	if mode, ok := LockModeForJobType(j.Type); ok {
-		lease, err := e.Locks.Acquire(ctx, repoID, mode, jobID)
+		// Non-blocking / short-timeout (M2-S3): if prune holds exclusive, leave
+		// the job pending and do not stall DeliverPending for other jobs.
+		lease, err := e.tryAcquireLease(ctx, repoID, mode, jobID)
 		if err != nil {
-			return fmt.Errorf("acquire repo lock: %w", err)
+			e.Log.Info("dispatch deferred: repo lease unavailable",
+				"job_id", jobID, "repo_id", repoID, "mode", mode.String(), "err", err)
+			return nil // stays pending; heartbeat/retrigger will retry
 		}
 		e.mu.Lock()
 		e.leases[jobID] = lease
@@ -228,7 +232,7 @@ func (e *Engine) DeliverPending(ctx context.Context, machineID string) {
 	}
 }
 
-// OnAgentDisconnect fails all running jobs for the machine and releases leases.
+// OnAgentDisconnect fails all running/cancelling jobs for the machine and releases leases.
 // Pending jobs stay queued for reconnect delivery.
 func (e *Engine) OnAgentDisconnect(ctx context.Context, machineID string) {
 	e.mu.Lock()
@@ -263,25 +267,27 @@ func (e *Engine) RevertUndeliveredJobStarts(ctx context.Context, jobIDs []string
 	}
 }
 
-// RecoverOnStartup fails all orphaned running rows left by a previous process.
+// RecoverOnStartup fails all orphaned running/cancelling rows left by a previous process.
 // Channels and in-memory leases cannot survive a restart (S2-F5).
 func (e *Engine) RecoverOnStartup(ctx context.Context) error {
-	jobs, err := e.DB.ListJobsByState(ctx, catalog.JobStateRunning)
-	if err != nil {
-		return err
-	}
 	msg := "server restarted"
-	for _, j := range jobs {
-		applied, err := e.DB.TransitionJob(ctx, j.ID,
-			[]string{catalog.JobStateRunning},
-			catalog.JobStateFailed,
-			catalog.JobTransition{SetFinished: true, ErrorMessage: &msg},
-		)
+	for _, state := range []string{catalog.JobStateRunning, catalog.JobStateCancelling} {
+		jobs, err := e.DB.ListJobsByState(ctx, state)
 		if err != nil {
 			return err
 		}
-		if applied {
-			e.Log.Info("recovered orphaned running job", "job_id", j.ID, "machine_id", j.MachineID)
+		for _, j := range jobs {
+			applied, err := e.DB.TransitionJob(ctx, j.ID,
+				[]string{state},
+				catalog.JobStateFailed,
+				catalog.JobTransition{SetFinished: true, ErrorMessage: &msg},
+			)
+			if err != nil {
+				return err
+			}
+			if applied {
+				e.Log.Info("recovered orphaned job", "job_id", j.ID, "machine_id", j.MachineID, "was", state)
+			}
 		}
 	}
 	return nil
@@ -308,8 +314,8 @@ func (e *Engine) HandleProgress(ctx context.Context, machineID, jobID string, by
 }
 
 // HandleResult applies a JobResult. Duplicate results for terminal jobs are no-ops.
-// Results apply only to running jobs — never terminal-ize a pending job the agent
-// was never sent (S2-F4).
+// Results apply only to running or cancelling jobs — never terminal-ize a pending
+// job the agent was never sent (S2-F4). Cancelling + any result releases the lease.
 func (e *Engine) HandleResult(ctx context.Context, machineID string, result Result) error {
 	j, err := e.DB.JobByID(ctx, result.JobID)
 	if err != nil {
@@ -325,6 +331,19 @@ func (e *Engine) HandleResult(ctx context.Context, machineID string, result Resu
 	if isTerminal(j.State) {
 		e.Log.Debug("duplicate JobResult for terminal job (no-op)", "job_id", result.JobID, "state", j.State)
 		return nil
+	}
+	// Cancelling: agent confirmed stop (or finished despite cancel) → terminal + release lease.
+	if j.State == catalog.JobStateCancelling {
+		msg := result.ErrorMessage
+		if msg == "" {
+			msg = "cancelled"
+		}
+		if result.Success {
+			// Agent finished successfully despite cancel request — accept success.
+			return e.completeJobFrom(ctx, result.JobID, catalog.JobStateCancelling, result.BytesRead, result.BytesStored)
+		}
+		// Treat as cancelled (not failed) when agent acknowledges cancel.
+		return e.finishCancelled(ctx, result.JobID, msg)
 	}
 	if j.State != catalog.JobStateRunning {
 		// Pending or other: ignore (S2-F4). Job may still be delivered later.
@@ -361,15 +380,14 @@ func (e *Engine) HandleInventory(ctx context.Context, machineID string, items []
 	return e.DB.ReplaceMachineInventory(ctx, machineID, items)
 }
 
-// Cancel moves a job to cancelled if not already terminal, notifies the agent
-// via JobCancel when running, and releases the vault lease.
+// Cancel notifies the agent (when running) and cancels the job.
 //
-// Stage-3 contract (S2-F6): for vault-touching job types (backup/restore/…),
-// lease release on Cancel must move to agent-confirmation (JobResult cancelled)
-// or channel teardown — releasing the lease while the agent may still write
-// allows prune to race an in-flight backup. Stage 2 releases immediately
-// (inventory/noop do not hold vault leases). Documented here so stage 3 does
-// not inherit unsafe semantics by accident.
+// Lease discipline (S2-F6 / M2-S3): for vault-touching job types that are
+// already running, transition to cancelling, send JobCancel, and keep the
+// shared lease until agent confirmation (JobResult) or channel teardown.
+// Releasing the lease while the agent may still write allows prune to race
+// an in-flight backup. Non-vault jobs (inventory/noop) cancel immediately.
+// Pending jobs (never dispatched) cancel immediately with no lease.
 func (e *Engine) Cancel(ctx context.Context, jobID, reason string) error {
 	if reason == "" {
 		reason = "cancelled"
@@ -384,8 +402,33 @@ func (e *Engine) Cancel(ctx context.Context, jobID, reason string) error {
 	if isTerminal(j.State) {
 		return nil
 	}
+	if j.State == catalog.JobStateCancelling {
+		// Already waiting for agent confirmation.
+		return nil
+	}
 
-	// Notify agent before flipping state when the job was dispatched (S2-F6).
+	// Running vault-writing job: soft-cancel (lease held until result/teardown).
+	if j.State == catalog.JobStateRunning && HoldsVaultLease(j.Type) {
+		if e.Dispatch != nil && j.MachineID != "" {
+			if _, err := e.Dispatch.SendJobCancel(j.MachineID, jobID, reason); err != nil {
+				e.Log.Warn("JobCancel send failed", "job_id", jobID, "err", err)
+			}
+		}
+		applied, err := e.DB.TransitionJob(ctx, jobID,
+			[]string{catalog.JobStateRunning},
+			catalog.JobStateCancelling,
+			catalog.JobTransition{ErrorMessage: &reason},
+		)
+		if err != nil {
+			return err
+		}
+		if applied {
+			e.Log.Info("job cancelling (lease held until agent confirms)", "job_id", jobID, "reason", reason)
+		}
+		return nil
+	}
+
+	// Notify agent when running (non-vault).
 	if j.State == catalog.JobStateRunning && e.Dispatch != nil && j.MachineID != "" {
 		if _, err := e.Dispatch.SendJobCancel(j.MachineID, jobID, reason); err != nil {
 			e.Log.Warn("JobCancel send failed", "job_id", jobID, "err", err)
@@ -405,11 +448,56 @@ func (e *Engine) Cancel(ctx context.Context, jobID, reason string) error {
 	}
 	if applied {
 		e.untrackRunning(j.MachineID, jobID)
-		// Stage 2: immediate lease release. Stage 3 vault-touching jobs: see method doc.
 		e.releaseLease(jobID)
 		e.Log.Info("job cancelled", "job_id", jobID, "reason", reason)
 	}
 	return nil
+}
+
+// HoldsVaultLease reports whether a job type acquires a repo lease at dispatch.
+func HoldsVaultLease(jobType string) bool {
+	_, ok := LockModeForJobType(jobType)
+	return ok
+}
+
+// DispatchLeaseTimeout is the max wait for a shared/exclusive lease at dispatch.
+// On timeout the job stays pending (non-blocking DeliverPending).
+const DispatchLeaseTimeout = 50 * time.Millisecond
+
+func (e *Engine) tryAcquireLease(ctx context.Context, repoID string, mode LockMode, jobID string) (Lease, error) {
+	// Prefer TryAcquire when available (zero wait).
+	if l, ok := e.Locks.TryAcquire(repoID, mode, jobID); ok {
+		return l, nil
+	}
+	// Short timeout so exclusive holders (prune) do not stall the dispatch loop.
+	cctx, cancel := context.WithTimeout(ctx, DispatchLeaseTimeout)
+	defer cancel()
+	return e.Locks.Acquire(cctx, repoID, mode, jobID)
+}
+
+// VaultForJob returns a vault handle only when this engine holds a lease for
+// jobID (structural lease discipline for DataService). The opener is provided
+// by the data plane (keystore password + Manager.Open); this method only
+// gates access on the lease table.
+//
+// Manager.Open must not be called from the data plane for job RPCs without
+// going through this check first.
+func (e *Engine) VaultForJob(jobID string) (leaseOK bool, repoID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	l, ok := e.leases[jobID]
+	if !ok || l == nil {
+		return false, ""
+	}
+	return true, l.RepoID()
+}
+
+// HasLease reports whether the engine currently holds a lease for jobID (tests).
+func (e *Engine) HasLease(jobID string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.leases[jobID]
+	return ok
 }
 
 // Job returns the catalog row (for tests/API).
@@ -418,6 +506,10 @@ func (e *Engine) Job(ctx context.Context, jobID string) (*catalog.Job, error) {
 }
 
 func (e *Engine) completeJob(ctx context.Context, jobID string, bytesRead, bytesStored int64) error {
+	return e.completeJobFrom(ctx, jobID, catalog.JobStateRunning, bytesRead, bytesStored)
+}
+
+func (e *Engine) completeJobFrom(ctx context.Context, jobID, fromState string, bytesRead, bytesStored int64) error {
 	j, err := e.DB.JobByID(ctx, jobID)
 	if err != nil {
 		return err
@@ -425,9 +517,9 @@ func (e *Engine) completeJob(ctx context.Context, jobID string, bytesRead, bytes
 	if j == nil {
 		return fmt.Errorf("job not found")
 	}
-	// Only running → success (S2-F4: never from pending via result path).
+	// Only running/cancelling → success (S2-F4: never from pending via result path).
 	applied, err := e.DB.TransitionJob(ctx, jobID,
-		[]string{catalog.JobStateRunning},
+		[]string{fromState},
 		catalog.JobStateSuccess,
 		catalog.JobTransition{
 			SetFinished: true,
@@ -446,9 +538,33 @@ func (e *Engine) completeJob(ctx context.Context, jobID string, bytesRead, bytes
 	return nil
 }
 
-// failJob transitions running or pending → failed (server-initiated paths:
-// disconnect, RecoverOnStartup). Agent JobResult failures go through HandleResult
-// which only allows running.
+func (e *Engine) finishCancelled(ctx context.Context, jobID, msg string) error {
+	j, err := e.DB.JobByID(ctx, jobID)
+	if err != nil {
+		return err
+	}
+	if j == nil {
+		return fmt.Errorf("job not found")
+	}
+	applied, err := e.DB.TransitionJob(ctx, jobID,
+		[]string{catalog.JobStateCancelling},
+		catalog.JobStateCancelled,
+		catalog.JobTransition{SetFinished: true, ErrorMessage: &msg},
+	)
+	if err != nil {
+		return err
+	}
+	if applied {
+		e.untrackRunning(j.MachineID, jobID)
+		e.releaseLease(jobID)
+		e.Log.Info("job cancelled (agent confirmed)", "job_id", jobID)
+	}
+	return nil
+}
+
+// failJob transitions running, cancelling, or pending → failed (server-initiated
+// paths: disconnect, RecoverOnStartup). Agent JobResult failures go through
+// HandleResult which only allows running/cancelling.
 func (e *Engine) failJob(ctx context.Context, jobID, msg string) (bool, error) {
 	j, err := e.DB.JobByID(ctx, jobID)
 	if err != nil {
@@ -458,7 +574,7 @@ func (e *Engine) failJob(ctx context.Context, jobID, msg string) (bool, error) {
 		return false, fmt.Errorf("job not found")
 	}
 	applied, err := e.DB.TransitionJob(ctx, jobID,
-		[]string{catalog.JobStateRunning, catalog.JobStatePending},
+		[]string{catalog.JobStateRunning, catalog.JobStateCancelling, catalog.JobStatePending},
 		catalog.JobStateFailed,
 		catalog.JobTransition{
 			SetFinished:  true,

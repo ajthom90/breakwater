@@ -21,8 +21,11 @@ import (
 	"github.com/ajthom90/breakwater/pkg/format"
 )
 
-// MaxPutContentBytes is the maximum payload for PutContent (one FIXED-4M block).
-const MaxPutContentBytes = 4 << 20 // 4 MiB
+// MaxPutContentBytes is the maximum payload for PutContent.
+// Aligned with DYNAMIC-4M-BUZHASH MaxSegmentSize (8 MiB) so agent-side CDC chunks
+// can be uploaded via PutContents. Image fixed blocks remain 4 MiB (FIXED-4M).
+// M2 stage 3: raised from 4 MiB (FIXED-4M single-block) to accept CDC segments.
+const MaxPutContentBytes = 8 << 20 // 8 MiB
 
 // MaxMarkObjectBytes caps how much of a tree/image root the mark phase reads into
 // memory (R3-2). Real TreeObject / ImageManifest JSON is far smaller; a root
@@ -230,10 +233,11 @@ func (v *kopiaVault) PutContent(ctx context.Context, data []byte) (ContentID, er
 	var contentID ContentID
 	err := repo.WriteSession(ctx, v.rep, repo.WriteSessionOptions{Purpose: "put-content"},
 		func(ctx context.Context, w repo.RepositoryWriter) error {
-			// Single-block object via FIXED-4M: for data ≤4MiB this yields one content.
+			// Single-content object via FIXED-8M: payload ≤ MaxPutContentBytes yields one content.
 			// (kopia's WriteContent takes internal gather.Bytes; object path is the public API.)
+			// No object-layer compressor: content ID must match agent plaintext keyed hash.
 			ow := w.NewObjectWriter(ctx, object.WriterOptions{
-				Splitter: SplitterFixed4M,
+				Splitter: "FIXED-8M",
 			})
 			if _, err := ow.Write(data); err != nil {
 				_ = ow.Close()
@@ -261,6 +265,66 @@ func (v *kopiaVault) PutContent(ctx context.Context, data []byte) (ContentID, er
 			return nil
 		})
 	return contentID, err
+}
+
+// ObjectFromContents builds a readable object from content IDs already stored
+// via PutContent. One ID → that content as a direct object; multiple → kopia
+// ConcatenateObjects (indirect object). Used by the agent after have/want
+// PutContents so multi-chunk files get an OpenObject-able ObjectID without
+// re-uploading payload (M2 stage 3).
+func (v *kopiaVault) ObjectFromContents(ctx context.Context, ids []ContentID) (ObjectID, error) {
+	if len(ids) == 0 {
+		return "", fmt.Errorf("ObjectFromContents: no content IDs")
+	}
+	if len(ids) == 1 {
+		// Direct object ID == content ID string.
+		if _, err := object.ParseID(string(ids[0])); err != nil {
+			return "", fmt.Errorf("ObjectFromContents: invalid content id %q: %w", ids[0], err)
+		}
+		// Verify present.
+		present, err := v.HasContents(ctx, ids)
+		if err != nil {
+			return "", err
+		}
+		if len(present) != 1 || !present[0] {
+			return "", fmt.Errorf("ObjectFromContents: content %s not present", ids[0])
+		}
+		return ObjectID(ids[0]), nil
+	}
+
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if err := v.requireOpen(); err != nil {
+		return "", err
+	}
+
+	oids := make([]object.ID, len(ids))
+	for i, id := range ids {
+		oid, err := object.ParseID(string(id))
+		if err != nil {
+			return "", fmt.Errorf("ObjectFromContents: parse %q: %w", id, err)
+		}
+		oids[i] = oid
+	}
+
+	var result ObjectID
+	err := repo.WriteSession(ctx, v.rep, repo.WriteSessionOptions{Purpose: "object-from-contents"},
+		func(ctx context.Context, w repo.RepositoryWriter) error {
+			type concatenator interface {
+				ConcatenateObjects(ctx context.Context, objectIDs []object.ID, opt repo.ConcatenateOptions) (object.ID, error)
+			}
+			cw, ok := w.(concatenator)
+			if !ok {
+				return fmt.Errorf("ObjectFromContents: repository writer does not support ConcatenateObjects")
+			}
+			oid, err := cw.ConcatenateObjects(ctx, oids, repo.ConcatenateOptions{})
+			if err != nil {
+				return err
+			}
+			result = ObjectID(oid.String())
+			return nil
+		})
+	return result, err
 }
 
 func (v *kopiaVault) HasContents(ctx context.Context, ids []ContentID) ([]bool, error) {

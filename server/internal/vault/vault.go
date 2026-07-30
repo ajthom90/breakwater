@@ -1,9 +1,11 @@
-// Package vault is the ONLY package allowed to import kopia.
-// It exposes a narrow Breakwater-facing interface over kopia's repo layers
-// (repo, repo/content, repo/object, repo/manifest, repo/maintenance).
+// Package vault is the only package allowed to import kopia's repo/content/
+// object/manifest/maintenance layers.
 //
-// See PLAN.md → Storage engine. All kopia imports stay confined here.
-// Importing pkg/format into this package is allowed (Breakwater shared module).
+// M2 stage-3 carve-out (PLAN): pkg/contentid may import pure-Go repo/hashing +
+// repo/splitter so agents compute bit-identical content IDs. Nothing else in
+// pkg/agent/cli may import kopia.
+//
+// See PLAN.md → Storage engine. Importing pkg/format is allowed (shared module).
 package vault
 
 import (
@@ -150,9 +152,15 @@ type Vault interface {
 	// (e.g. BLAKE2B-256-128). Never returns encryption keys or the master key.
 	HashingKey(ctx context.Context) (secret []byte, algorithm string, err error)
 
-	// PutContent stores raw bytes as a single content-addressed blob (max 4MiB)
-	// and returns its content ID. Larger data must use WriteObject.
+	// PutContent stores raw bytes as a single content-addressed blob (max
+	// MaxPutContentBytes = 8 MiB, DYNAMIC-4M max segment) and returns its
+	// content ID. Larger data must use WriteObject.
 	PutContent(ctx context.Context, data []byte) (ContentID, error)
+
+	// ObjectFromContents builds an OpenObject-able ObjectID from content IDs
+	// already stored via PutContent. One ID → direct object; multiple →
+	// concatenated indirect object (no payload re-upload).
+	ObjectFromContents(ctx context.Context, ids []ContentID) (ObjectID, error)
 
 	// HasContents reports which of the given content IDs already exist (have/want).
 	// The returned slice is parallel to ids: true if present.
