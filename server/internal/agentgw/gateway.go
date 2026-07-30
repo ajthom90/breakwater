@@ -18,23 +18,28 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
+	breakwaterv1 "github.com/ajthom90/breakwater/pkg/proto/breakwater/v1"
+	"github.com/ajthom90/breakwater/server/internal/audit"
 	"github.com/ajthom90/breakwater/server/internal/enroll"
 	"github.com/ajthom90/breakwater/server/internal/mtls"
 )
 
 // Full method names allowed without prior enrollment (pre-pin).
 var enrollMethods = map[string]bool{
-	"/breakwater.v1.EnrollmentService/Enroll": true,
-	"/breakwater.enroll.Enrollment/Enroll":    true,
+	breakwaterv1.EnrollmentService_Enroll_FullMethodName: true,
 }
 
 // Gateway serves the agent gRPC port with mTLS fingerprint pinning.
 type Gateway struct {
 	Enroll *enroll.Service
 	Log    *slog.Logger
+	// Auditor, when non-nil, receives hash-chained audit events from interceptors
+	// and the enrollment handler (machine.enroll and interceptor denials).
+	Auditor *audit.Writer
 
-	// TestEcho, when non-nil, registers a post-enroll Echo RPC (tests only).
-	TestEcho EchoServer
+	// TestDataService, when non-nil, registers DataService for post-enroll pin
+	// tests only. Production main never sets this.
+	TestDataService breakwaterv1.DataServiceServer
 
 	mu       sync.RWMutex
 	serverID *mtls.Identity
@@ -69,15 +74,21 @@ func (g *Gateway) Start(addr string) (string, error) {
 		return nil
 	})
 
+	unary := []grpc.UnaryServerInterceptor{g.unaryInterceptor}
+	stream := []grpc.StreamServerInterceptor{g.streamInterceptor}
+	if g.Auditor != nil {
+		unary = append(unary, g.Auditor.UnaryServerInterceptor())
+		stream = append(stream, g.Auditor.StreamServerInterceptor())
+	}
+
 	g.gs = grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
-		grpc.ForceServerCodec(jsonCodec{}),
-		grpc.UnaryInterceptor(g.unaryInterceptor),
-		grpc.StreamInterceptor(g.streamInterceptor),
+		grpc.ChainUnaryInterceptor(unary...),
+		grpc.ChainStreamInterceptor(stream...),
 	)
-	RegisterEnrollmentServer(g.gs, &enrollmentServer{svc: g.Enroll})
-	if g.TestEcho != nil {
-		RegisterEchoServer(g.gs, g.TestEcho)
+	breakwaterv1.RegisterEnrollmentServiceServer(g.gs, &enrollmentServer{gw: g, svc: g.Enroll})
+	if g.TestDataService != nil {
+		breakwaterv1.RegisterDataServiceServer(g.gs, g.TestDataService)
 	}
 
 	lis, err := net.Listen("tcp", addr)
@@ -145,6 +156,20 @@ func (g *Gateway) unaryInterceptor(ctx context.Context, req any, info *grpc.Unar
 	}
 	if !enrollMethods[info.FullMethod] && pi.MachineID == "" {
 		g.Log.Warn("rejected unknown client cert", "method", info.FullMethod, "fp", pi.CertFP[:16]+"…")
+		// Audit pin rejection (security boundary for non-enroll RPCs).
+		if g.Auditor != nil {
+			_ = g.Auditor.Append(ctx, audit.Event{
+				Actor:     pi.CertFP,
+				ActorType: audit.ActorAgent,
+				Action:    audit.ActionAuthFail,
+				Target:    info.FullMethod,
+				Detail: map[string]any{
+					"outcome": "rejected",
+					"reason":  "unknown_client_certificate",
+					"method":  info.FullMethod,
+				},
+			})
+		}
 		return nil, status.Error(codes.PermissionDenied, "unknown client certificate fingerprint")
 	}
 	ctx = context.WithValue(ctx, peerKey, pi)
@@ -157,6 +182,19 @@ func (g *Gateway) streamInterceptor(srv any, ss grpc.ServerStream, info *grpc.St
 		return err
 	}
 	if !enrollMethods[info.FullMethod] && pi.MachineID == "" {
+		if g.Auditor != nil {
+			_ = g.Auditor.Append(ss.Context(), audit.Event{
+				Actor:     pi.CertFP,
+				ActorType: audit.ActorAgent,
+				Action:    audit.ActionAuthFail,
+				Target:    info.FullMethod,
+				Detail: map[string]any{
+					"outcome": "rejected",
+					"reason":  "unknown_client_certificate",
+					"method":  info.FullMethod,
+				},
+			})
+		}
 		return status.Error(codes.PermissionDenied, "unknown client certificate fingerprint")
 	}
 	wrapped := &ctxStream{ServerStream: ss, ctx: context.WithValue(ss.Context(), peerKey, pi)}
@@ -170,62 +208,81 @@ type ctxStream struct {
 
 func (s *ctxStream) Context() context.Context { return s.ctx }
 
-// --- Hand-written enrollment service (proto-compatible until codegen in CI) ---
-
-// EnrollmentServer is the service interface.
-type EnrollmentServer interface {
-	Enroll(context.Context, *EnrollRequest) (*EnrollResponse, error)
-}
-
-// EnrollRequest mirrors breakwater.v1.EnrollRequest for M1 without codegen.
-type EnrollRequest struct {
-	Token         string
-	Hostname      string
-	OS            string
-	OSVersion     string
-	AgentVersion  string
-	Arch          string
-	ClientCertPEM []byte
-}
-
-// EnrollResponse mirrors breakwater.v1.EnrollResponse.
-type EnrollResponse struct {
-	MachineID             string
-	HashingKey            []byte
-	HashingAlgorithm      string // R2-5: algorithm paired with hashing key
-	ServerCertFingerprint string
-	PolicyID              string
-}
-
+// enrollmentServer implements breakwater.v1.EnrollmentService.
 type enrollmentServer struct {
+	breakwaterv1.UnimplementedEnrollmentServiceServer
+	gw  *Gateway
 	svc *enroll.Service
 }
 
-func (e *enrollmentServer) Enroll(ctx context.Context, req *EnrollRequest) (*EnrollResponse, error) {
+func (e *enrollmentServer) Enroll(ctx context.Context, req *breakwaterv1.EnrollRequest) (*breakwaterv1.EnrollResponse, error) {
 	pi, ok := PeerFromContext(ctx)
 	if !ok || pi.CertFP == "" {
 		return nil, status.Error(codes.Unauthenticated, "missing peer certificate")
 	}
+
+	var hostname, osName, osVersion, agentVersion, arch string
+	if ai := req.GetAgentInfo(); ai != nil {
+		hostname = ai.GetHostname()
+		osName = ai.GetOs()
+		osVersion = ai.GetOsVersion()
+		agentVersion = ai.GetAgentVersion()
+		arch = ai.GetArch()
+	}
+
 	resp, err := e.svc.Enroll(ctx, enroll.EnrollRequest{
-		Token:            req.Token,
-		Hostname:         req.Hostname,
-		OS:               req.OS,
-		OSVersion:        req.OSVersion,
-		AgentVersion:     req.AgentVersion,
-		Arch:             req.Arch,
-		ClientCertPEM:    req.ClientCertPEM,
+		Token:            req.GetToken(),
+		Hostname:         hostname,
+		OS:               osName,
+		OSVersion:        osVersion,
+		AgentVersion:     agentVersion,
+		Arch:             arch,
+		ClientCertPEM:    req.GetClientCertPem(),
 		ConnectionCertFP: pi.CertFP, // B2: bind TLS peer, not body alone
 	})
+
+	// Audit success and rejected enrollment attempts (security boundary).
+	e.auditEnroll(ctx, pi.CertFP, hostname, osName, resp, err)
+
 	if err != nil {
 		return nil, e.mapEnrollError(err)
 	}
-	return &EnrollResponse{
-		MachineID:             resp.MachineID,
+	return &breakwaterv1.EnrollResponse{
+		MachineId:             resp.MachineID,
 		HashingKey:            resp.HashingKey,
 		HashingAlgorithm:      resp.HashingAlgorithm,
 		ServerCertFingerprint: resp.ServerCertFingerprint,
-		PolicyID:              resp.PolicyID,
+		PolicyId:              resp.PolicyID,
 	}, nil
+}
+
+func (e *enrollmentServer) auditEnroll(ctx context.Context, certFP, hostname, osName string, resp *enroll.EnrollResponse, err error) {
+	if e.gw == nil || e.gw.Auditor == nil {
+		return
+	}
+	detail := map[string]any{
+		"hostname": hostname,
+		"os":       osName,
+	}
+	target := ""
+	if err != nil {
+		detail["outcome"] = "rejected"
+		detail["reason"] = err.Error()
+	} else {
+		detail["outcome"] = "success"
+		if resp != nil {
+			target = resp.MachineID
+		}
+	}
+	if aerr := e.gw.Auditor.Append(ctx, audit.Event{
+		Actor:     certFP,
+		ActorType: audit.ActorAgent,
+		Action:    audit.ActionMachineEnroll,
+		Target:    target,
+		Detail:    detail,
+	}); aerr != nil && e.svc != nil && e.svc.Log != nil {
+		e.svc.Log.Error("audit append failed", "action", audit.ActionMachineEnroll, "err", aerr)
+	}
 }
 
 // mapEnrollError maps typed enroll errors to gRPC codes (R2-11).
@@ -251,131 +308,23 @@ func (e *enrollmentServer) mapEnrollError(err error) error {
 	}
 }
 
-// RegisterEnrollmentServer registers the hand-rolled enrollment service.
-func RegisterEnrollmentServer(s *grpc.Server, srv EnrollmentServer) {
-	s.RegisterService(&Enrollment_ServiceDesc, srv)
-}
-
-// Enrollment_ServiceDesc is the gRPC service descriptor for enrollment.
-var Enrollment_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "breakwater.enroll.Enrollment",
-	HandlerType: (*EnrollmentServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "Enroll",
-			Handler:    _Enrollment_Enroll_Handler,
-		},
-	},
-	Streams: []grpc.StreamDesc{},
-}
-
-func _Enrollment_Enroll_Handler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(EnrollRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(EnrollmentServer).Enroll(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/breakwater.enroll.Enrollment/Enroll",
-	}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(EnrollmentServer).Enroll(ctx, req.(*EnrollRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-// EnrollmentClient is a client for tests / fake agent.
-type EnrollmentClient struct {
-	cc grpc.ClientConnInterface
-}
-
-// NewEnrollmentClient constructs a client.
-func NewEnrollmentClient(cc grpc.ClientConnInterface) *EnrollmentClient {
-	return &EnrollmentClient{cc: cc}
-}
-
-// Enroll calls the enrollment RPC.
-func (c *EnrollmentClient) Enroll(ctx context.Context, in *EnrollRequest, opts ...grpc.CallOption) (*EnrollResponse, error) {
-	out := new(EnrollResponse)
-	opts = append([]grpc.CallOption{grpc.ForceCodec(jsonCodec{})}, opts...)
-	err := c.cc.Invoke(ctx, "/breakwater.enroll.Enrollment/Enroll", in, out, opts...)
-	return out, err
-}
-
-// Echo is a post-enroll test RPC used only in tests to prove pin enforcement.
-// Registered only when EnableTestRPCs is called.
-type EchoServer interface {
-	Echo(context.Context, *EchoRequest) (*EchoResponse, error)
-}
-
-// EchoRequest is a test payload.
-type EchoRequest struct {
-	Message string
-}
-
-// EchoResponse is a test payload.
-type EchoResponse struct {
-	Message   string
-	MachineID string
-}
-
-// RegisterEchoServer registers the test Echo RPC (not used in production).
-func RegisterEchoServer(s *grpc.Server, srv EchoServer) {
-	s.RegisterService(&Echo_ServiceDesc, srv)
-}
-
-// Echo_ServiceDesc is the test echo service descriptor.
-var Echo_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "breakwater.enroll.Echo",
-	HandlerType: (*EchoServer)(nil),
-	Methods: []grpc.MethodDesc{
-		{
-			MethodName: "Echo",
-			Handler:    _Echo_Echo_Handler,
-		},
-	},
-}
-
-func _Echo_Echo_Handler(srv any, ctx context.Context, dec func(any) error, interceptor grpc.UnaryServerInterceptor) (any, error) {
-	in := new(EchoRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(EchoServer).Echo(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: "/breakwater.enroll.Echo/Echo",
-	}
-	handler := func(ctx context.Context, req any) (any, error) {
-		return srv.(EchoServer).Echo(ctx, req.(*EchoRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-// EchoClient calls the test Echo RPC.
-type EchoClient struct {
-	cc grpc.ClientConnInterface
-}
-
-// NewEchoClient constructs an echo client.
-func NewEchoClient(cc grpc.ClientConnInterface) *EchoClient {
-	return &EchoClient{cc: cc}
-}
-
-// Echo invokes the test method.
-func (c *EchoClient) Echo(ctx context.Context, in *EchoRequest, opts ...grpc.CallOption) (*EchoResponse, error) {
-	out := new(EchoResponse)
-	opts = append([]grpc.CallOption{grpc.ForceCodec(jsonCodec{})}, opts...)
-	err := c.cc.Invoke(ctx, "/breakwater.enroll.Echo/Echo", in, out, opts...)
-	return out, err
-}
-
 // GRPCServer returns the underlying server for test registration.
 func (g *Gateway) GRPCServer() *grpc.Server {
 	return g.gs
+}
+
+// PostEnrollProbe is a minimal DataService used only in tests to prove that
+// fingerprint pinning admits enrolled certs and rejects unknown ones.
+type PostEnrollProbe struct {
+	breakwaterv1.UnimplementedDataServiceServer
+}
+
+// CheckContents succeeds for any enrolled peer (interceptor already gated).
+// Clients observe success vs PermissionDenied; machine_id is verified via catalog.
+func (p *PostEnrollProbe) CheckContents(ctx context.Context, _ *breakwaterv1.CheckContentsRequest) (*breakwaterv1.CheckContentsResponse, error) {
+	// Peer is required; empty MachineID should have been rejected by the interceptor.
+	if pi, ok := PeerFromContext(ctx); !ok || pi.MachineID == "" {
+		return nil, status.Error(codes.PermissionDenied, "not enrolled")
+	}
+	return &breakwaterv1.CheckContentsResponse{}, nil
 }

@@ -33,7 +33,7 @@ A single-container server (`breakwaterd`) plus a Windows agent (`breakwater-agen
 Windows agent  ──mTLS gRPC (:9443)──►  breakwaterd  ──►  /repos/<machine>/  (kopia CAS)
                      dial-out only          │
                                             ├── SQLite catalog (/data)
-                                            └── Web UI + REST (:8443)
+                                            └── Web UI + REST HTTPS (:8443)
 ```
 
 See [PLAN.md](PLAN.md) for the complete design, research findings, and phased roadmap.

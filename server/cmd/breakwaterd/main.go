@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ajthom90/breakwater/server/internal/agentgw"
+	"github.com/ajthom90/breakwater/server/internal/audit"
 	"github.com/ajthom90/breakwater/server/internal/catalog"
 	"github.com/ajthom90/breakwater/server/internal/enroll"
 	"github.com/ajthom90/breakwater/server/internal/keystore"
@@ -25,10 +27,10 @@ var version = "0.0.1-dev"
 
 func main() {
 	var (
-		dataDir   = flag.String("data", "/data", "data directory (catalog + keys)")
-		reposDir  = flag.String("repos", "/repos", "repositories root")
+		dataDir   = flag.String("data", "/data", "data directory (catalog + keys + kopia config/cache)")
+		reposDir  = flag.String("repos", "/repos", "repositories root (blob storage)")
 		agentAddr = flag.String("agent-addr", ":9443", "agent gRPC listen address (mTLS)")
-		webAddr   = flag.String("web-addr", ":8443", "web/REST listen address")
+		webAddr   = flag.String("web-addr", ":8443", "web/REST listen address (HTTPS)")
 		hostname  = flag.String("hostname", "breakwater", "server certificate CN / hostname")
 		showVer   = flag.Bool("version", false, "print version and exit")
 	)
@@ -79,8 +81,10 @@ func main() {
 	serverFP := serverID.Fingerprint()
 	log.Info("server identity ready", "fp", serverFP[:16]+"…", "version", version)
 
-	vm := vault.NewManager(*reposDir)
+	vm := vault.NewManager(*reposDir, *dataDir)
 	defer vm.CloseAll(context.Background())
+
+	auditor := audit.NewWriter(db)
 
 	enrollSvc := &enroll.Service{
 		DB:       db,
@@ -91,13 +95,14 @@ func main() {
 	}
 
 	gw := agentgw.New(serverID, enrollSvc, log)
+	gw.Auditor = auditor
 	if _, err := gw.Start(*agentAddr); err != nil {
 		log.Error("agent gateway", "err", err)
 		os.Exit(1)
 	}
 	defer gw.GracefulStop()
 
-	// Minimal web surface for M1: healthz only (UI arrives M2+).
+	// Minimal web surface: healthz over HTTPS (M11). UI arrives later in M2.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		if err := db.Ping(r.Context()); err != nil {
@@ -112,13 +117,18 @@ func main() {
 	})
 
 	webSrv := &http.Server{
-		Addr:              *webAddr,
-		Handler:           mux,
+		Addr:    *webAddr,
+		Handler: mux,
+		TLSConfig: &tls.Config{
+			Certificates: []tls.Certificate{serverID.TLSCert},
+			MinVersion:   tls.VersionTLS13,
+		},
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
-		log.Info("web listening", "addr", *webAddr)
-		if err := webSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Info("web listening (HTTPS)", "addr", *webAddr)
+		// Empty cert/key paths: use TLSConfig.Certificates (server identity leaf).
+		if err := webSrv.ListenAndServeTLS("", ""); err != nil && err != http.ErrServerClosed {
 			log.Error("web serve", "err", err)
 			stop()
 		}

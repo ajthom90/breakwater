@@ -14,7 +14,7 @@ import (
 func TestPruneReclaimsForgottenContent(t *testing.T) {
 	ctx := context.Background()
 	reposDir := t.TempDir()
-	mgr := vault.NewManager(reposDir)
+	mgr := vault.NewManager(reposDir, reposDir)
 	defer mgr.CloseAll(ctx)
 	v, err := mgr.Create(ctx, "d1", "pw")
 	if err != nil {

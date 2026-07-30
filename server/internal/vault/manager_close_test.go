@@ -11,7 +11,7 @@ import (
 // must not permanently poison the Manager cache.
 func TestManager_ReopenAfterClose(t *testing.T) {
 	ctx := context.Background()
-	mgr := vault.NewManager(t.TempDir())
+	mgr := vault.NewManager(t.TempDir(), t.TempDir())
 	defer mgr.CloseAll(ctx)
 
 	v1, err := mgr.Create(ctx, "reopen-1", "pw")

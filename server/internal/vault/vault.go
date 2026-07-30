@@ -210,6 +210,13 @@ type VaultStats struct {
 
 // Manager owns per-machine vaults under a repos root directory.
 //
+// Config and cache live under dataDir (M4):
+//
+//	<dataDir>/kopia-config/<repoID>.config
+//	<dataDir>/cache/<repoID>/
+//
+// Repository blob storage remains under reposDir/<repoID>/.
+//
 // Invariant (R3-6): at most one live handle per repoID. Close(repoID) must not
 // race Open/Create for the same ID — Close releases the manager lock before
 // waiting on the vault exclusive lock, so a concurrent Open can create a second
@@ -217,14 +224,22 @@ type VaultStats struct {
 // serialize per-repo Close vs Open (same work item as backup-vs-prune).
 type Manager struct {
 	reposDir string
+	dataDir  string
 	mu       sync.Mutex
 	open     map[string]*kopiaVault // keyed by machine ULID / repo ID
 }
 
-// NewManager creates a vault manager. reposDir is typically /repos.
-func NewManager(reposDir string) *Manager {
+// NewManager creates a vault manager.
+// reposDir is typically /repos (blob storage); dataDir is typically /data
+// (kopia config + cache). When dataDir is empty, it defaults to reposDir
+// (tests may pass the same temp root for both).
+func NewManager(reposDir, dataDir string) *Manager {
+	if dataDir == "" {
+		dataDir = reposDir
+	}
 	return &Manager{
 		reposDir: reposDir,
+		dataDir:  dataDir,
 		open:     make(map[string]*kopiaVault),
 	}
 }
@@ -247,7 +262,7 @@ func (m *Manager) Open(ctx context.Context, repoID, password string) (Vault, err
 		}
 		delete(m.open, repoID)
 	}
-	v, err := openKopiaVault(ctx, m.reposDir, repoID, password)
+	v, err := openKopiaVault(ctx, m.reposDir, m.dataDir, repoID, password)
 	if err != nil {
 		return nil, err
 	}
@@ -266,7 +281,7 @@ func (m *Manager) Create(ctx context.Context, repoID, password string) (Vault, e
 		}
 		delete(m.open, repoID)
 	}
-	v, err := createKopiaVault(ctx, m.reposDir, repoID, password)
+	v, err := createKopiaVault(ctx, m.reposDir, m.dataDir, repoID, password)
 	if err != nil {
 		return nil, err
 	}

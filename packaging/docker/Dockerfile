@@ -31,5 +31,7 @@ USER nonroot:nonroot
 COPY --from=build /out/breakwaterd /breakwaterd
 EXPOSE 8443 9443
 VOLUME ["/data", "/repos"]
+# /healthz is HTTPS (M11); use a TLS-capable probe or disable HEALTHCHECK
+# when the probe cannot skip cert verification of the self-signed server leaf.
 ENTRYPOINT ["/breakwaterd"]
 CMD ["-data", "/data", "-repos", "/repos"]

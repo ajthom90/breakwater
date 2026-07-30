@@ -13,6 +13,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
 
+	breakwaterv1 "github.com/ajthom90/breakwater/pkg/proto/breakwater/v1"
 	"github.com/ajthom90/breakwater/server/internal/agentgw"
 	"github.com/ajthom90/breakwater/server/internal/catalog"
 	"github.com/ajthom90/breakwater/server/internal/enroll"
@@ -68,14 +69,16 @@ func TestEnroll_gRPCStatusCodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	ec := agentgw.NewEnrollmentClient(conn)
+	ec := breakwaterv1.NewEnrollmentServiceClient(conn)
 
 	// Bad token → InvalidArgument (not Internal, no path leak).
-	_, err = ec.Enroll(ctx, &agentgw.EnrollRequest{
-		Token:         "BW1:x:y:not-a-real-token",
-		Hostname:      "h",
-		OS:            "linux",
-		ClientCertPEM: agentID.CertPEM,
+	_, err = ec.Enroll(ctx, &breakwaterv1.EnrollRequest{
+		Token: "BW1:x:y:not-a-real-token",
+		AgentInfo: &breakwaterv1.AgentInfo{
+			Hostname: "h",
+			Os:       "linux",
+		},
+		ClientCertPem: agentID.CertPEM,
 	})
 	if err == nil {
 		t.Fatal("expected bad token error")
@@ -100,11 +103,13 @@ func TestEnroll_gRPCStatusCodes(t *testing.T) {
 	if err := db.InsertEnrollToken(ctx, "tok-status", secret, "t", time.Now().UTC().Add(time.Hour)); err != nil {
 		t.Fatal(err)
 	}
-	_, err = ec.Enroll(ctx, &agentgw.EnrollRequest{
-		Token:         rawTok,
-		Hostname:      "h",
-		OS:            "linux",
-		ClientCertPEM: agentID.CertPEM,
+	_, err = ec.Enroll(ctx, &breakwaterv1.EnrollRequest{
+		Token: rawTok,
+		AgentInfo: &breakwaterv1.AgentInfo{
+			Hostname: "h",
+			Os:       "linux",
+		},
+		ClientCertPem: agentID.CertPEM,
 	})
 	if err == nil {
 		t.Fatal("expected internal enroll failure")

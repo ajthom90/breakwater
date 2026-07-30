@@ -90,7 +90,7 @@ func writeJSONObject(t *testing.T, ctx context.Context, v vault.Vault, val any) 
 func TestPruneSurvivesIndirectTreeReferences(t *testing.T) {
 	ctx := context.Background()
 	reposDir := t.TempDir()
-	mgr := vault.NewManager(reposDir)
+	mgr := vault.NewManager(reposDir, reposDir)
 	defer mgr.CloseAll(ctx)
 
 	v, err := mgr.Create(ctx, "tree-live", "pw-tree")
@@ -238,7 +238,7 @@ func TestPruneSurvivesIndirectTreeReferences(t *testing.T) {
 // Against 755f417 this MUST FAIL — only the manifest JSON blob is marked.
 func TestPruneSurvivesImageManifestBlocks(t *testing.T) {
 	ctx := context.Background()
-	mgr := vault.NewManager(t.TempDir())
+	mgr := vault.NewManager(t.TempDir(), t.TempDir())
 	defer mgr.CloseAll(ctx)
 
 	v, err := mgr.Create(ctx, "img-live", "pw-img")
@@ -320,7 +320,7 @@ func TestPruneSurvivesImageManifestBlocks(t *testing.T) {
 // min-age guard (≥24h).
 func TestPruneMinAgeProtectsInFlightBackup(t *testing.T) {
 	ctx := context.Background()
-	mgr := vault.NewManager(t.TempDir())
+	mgr := vault.NewManager(t.TempDir(), t.TempDir())
 	defer mgr.CloseAll(ctx)
 
 	v, err := mgr.Create(ctx, "inflight", "pw-inflight")

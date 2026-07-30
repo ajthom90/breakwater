@@ -4,7 +4,9 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
-**Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; round-2 + round-3 review fixes)
+**Phase 1 — M2 (weeks 3–4)** — 🔄 **IN PROGRESS** (stage 1 complete; see [M2 progress](#m2-progress) below)
+
+**Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; closed at `161fb18`)
 
 Addressed [REVIEW-M1.md](REVIEW-M1.md), [REVIEW-M1-ROUND2.md](REVIEW-M1-ROUND2.md), and [REVIEW-M1-ROUND3.md](REVIEW-M1-ROUND3.md) against `f92837f` → `755f417` → `eea1a46` → this fix set. Round-3 closed remaining fail-open mark heuristic, canceled-ctx compensation, empty-algorithm upgrade hole, and related mediums.
 
@@ -70,11 +72,11 @@ go test ./internal/agentgw/ -run 'TestM1_EnrollmentAndWrongCertRejection|TestEnr
 
 | Deviation | Rationale |
 |-----------|-----------|
-| Enrollment JSON codec + hand-written service | M1 demo; swap to generated `breakwater.v1` first in M2 (**M13**) |
+| Enrollment JSON codec + hand-written service | ✅ Closed M2 stage 1 (M13) — generated `breakwater.v1` |
 | kopia not vendored | Pinned in go.mod; vendor before v0.1.0 |
 | kopia v0.19.0 not v0.23.x | Go 1.23 toolchain; see decision #7 |
-| `breakwater.config`/`.cache` under repo path | M4 deferred to M2 (move under `/data`) |
-| Web port plain HTTP | M1 healthz only; HTTPS required before auth UI (M11) |
+| `breakwater.config`/`.cache` under repo path | ✅ Closed M2 stage 1 (M4) — under `<dataDir>/kopia-config` + `cache` |
+| Web port plain HTTP | ✅ Closed M2 stage 1 (M11) — HTTPS via server identity leaf |
 
 ---
 
@@ -97,9 +99,9 @@ go test ./internal/agentgw/ -run 'TestM1_EnrollmentAndWrongCertRejection|TestEnr
 | M12 drop pkg/errors direct dep | ✅ Fixed | |
 | M1 kopia version pin | ⏳ Deferred | Documented; upgrade with Go 1.25+ |
 | M2 OpenObject vs prune | ⏳ Deferred M2 | Documented on Vault interface (+ backup-vs-prune serialization R2-2) |
-| M4 config/cache under /data | ⏳ Deferred M2 | |
-| M11 web HTTPS | ⏳ Deferred M2 | |
-| **M13 ForceServerCodec JSON** | ⏳ **Must fix first in M2** | Proto clients will fail until removed |
+| M4 config/cache under /data | ✅ Fixed M2 stage 1 | `<dataDir>/kopia-config/<id>.config` + `cache/<id>`; legacy migrate |
+| M11 web HTTPS | ✅ Fixed M2 stage 1 | `ListenAndServeTLS` with server identity leaf |
+| **M13 ForceServerCodec JSON** | ✅ Fixed M2 stage 1 | Generated `EnrollmentService`; codec deleted |
 
 ---
 
@@ -141,11 +143,59 @@ go test ./internal/agentgw/ -run 'TestM1_EnrollmentAndWrongCertRejection|TestEnr
 
 ---
 
-## Next: M2 (weeks 3–4)
+## M2 progress
 
-**Do first (protocol debt):** swap enrollment to generated `breakwater.v1.EnrollmentService`, remove `grpc.ForceServerCodec(jsonCodec{})` and hand-written JSON service/codec (**M13**).
+### Stage 1 — protocol swap, audit, HTTPS, vault housekeeping (2026-07-30)
 
-Then:
+Server-side foundations buildable/testable on Linux/macOS. Wire contract uses real protobuf.
+
+| Deliverable | Status | Evidence |
+|-------------|--------|----------|
+| **M13** retire JSON codec; serve generated `EnrollmentService` | ✅ | `jsoncodec.go` deleted; no `ForceServerCodec`; tests use `breakwaterv1` stubs |
+| Audit middleware (`server/internal/audit`) | ✅ | Hash-chained writer; `VerifyChain` + tamper + concurrency tests; `machine.enroll` + `auth.fail` |
+| HTTPS on :8443 (M11) | ✅ | `ListenAndServeTLS` with server leaf; plain HTTP gone |
+| Config/cache under `/data` (M4) | ✅ | `kopia-config/<repoID>.config` + `cache/<repoID>`; legacy migrate test |
+| Strict root validation (R3 note 1) | ✅ | `DisallowUnknownFields` at write boundary **and** mark phase; cross-kind test |
+
+#### Red-first (strict root — loose decode must accept cross-kind)
+
+Against temporary `json.Unmarshal` (pre-strict) the new test fails as required:
+
+```
+=== RUN   TestPutSnapshotRecord_RejectsCrossKindRoot
+    root_strict_test.go:56: PutSnapshotRecord must reject TreeObject root under bw-image-snapshot (cross-kind)
+--- FAIL: TestPutSnapshotRecord_RejectsCrossKindRoot (0.39s)
+```
+
+After `strictJSONDecode` (`DisallowUnknownFields`):
+
+```
+--- PASS: TestPutSnapshotRecord_RejectsCrossKindRoot
+    cross-kind TreeObject-as-image rejected: … unknown field "entries"
+    cross-kind ImageManifest-as-file rejected: … unknown field "block_size"
+```
+
+Mark-phase decoders use the same `strictJSONDecode` (same write-boundary contract).
+
+#### Verification (stage 1)
+
+```
+gofmt -l server pkg agent cli restore   # empty
+go vet ./...                            # clean
+go test ./... -short -race              # all ok (incl. audit, agentgw)
+go test ./internal/agentgw/ -run 'TestM1_|TestEnroll_' -v  # PASS (protobuf)
+go test ./internal/audit/ -v            # PASS (tamper + concurrent chain)
+go test ./internal/vault/ -run 'Prune|Reclaim|Root|Config|Migrate' -v  # PASS
+BW_GATE_BYTES=268435456 … TestEngineGate_Kopia  # PASS (~4s)
+full 10 GiB TestEngineGate_Kopia                # PASS (124s)
+grep ForceServerCodec\|jsonCodec server/        # OK (gone)
+```
+
+---
+
+## Next: M2 remaining (weeks 3–4)
+
+Stage 1 done (M13, audit start, M11, M4, strict roots). Remaining:
 
 - Windows agent service (SYSTEM) + WiX MSI  
 - Persistent dial-out + keepalives  
@@ -153,13 +203,9 @@ Then:
 - Plain-directory backup (chunk → have/want → append-only upload → manifest)  
 - UI shell against fake API  
 - Golden-dataset generator + comparer  
-- Audit middleware (start with `machine.enroll`)  
-- HTTPS on web port before authenticated surface  
 - Per-repo job serialization covering open restore streams, **backup-vs-prune**, and **Manager Close vs Open** (R2-2 / R3-6)  
 - Vendor kopia; consider v0.23 when on Go 1.25+  
-- Move `breakwater.config`/`.cache` under `/data` (M4)  
 - Optional: backfill `hashing_algorithm` from vault for pre-eea1a46 keystore rows (R3-4)  
-- Strict root validation: `DisallowUnknownFields` in `validateSnapshotRoot` when `PutTreeObject`/`PutImageManifest` land, so a mislabeled kind cannot pass loose JSON decode (round-3 addendum note 1)  
 - Directory sharding vs `MaxMarkObjectBytes` (16 MiB ≈ max entries per single TreeObject): shard huge dirs across child trees or revisit the cap (round-3 addendum note 2)  
 
 *Demo: MSI install → appears in UI in 10s → backup → second run shows dedup ratio.*

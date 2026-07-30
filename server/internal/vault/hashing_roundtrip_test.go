@@ -59,7 +59,7 @@ func agentSideContentID(t *testing.T, algo string, secret, payload []byte) strin
 // that PutContent returns for a known payload (have/want contract).
 func TestHashingKeyReproducesContentIDs(t *testing.T) {
 	ctx := context.Background()
-	mgr := vault.NewManager(t.TempDir())
+	mgr := vault.NewManager(t.TempDir(), t.TempDir())
 	defer mgr.CloseAll(ctx)
 
 	v, err := mgr.Create(ctx, "hash-rt", "pw-hash-rt")

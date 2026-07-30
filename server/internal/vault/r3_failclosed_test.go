@@ -17,7 +17,7 @@ import (
 // with inverted assertion); after R3-1 Put rejects.
 func TestPutSnapshotRecord_RejectsFlatFileRoot(t *testing.T) {
 	ctx := context.Background()
-	mgr := vault.NewManager(t.TempDir())
+	mgr := vault.NewManager(t.TempDir(), t.TempDir())
 	defer mgr.CloseAll(ctx)
 
 	v, err := mgr.Create(ctx, "flat-root", "pw")

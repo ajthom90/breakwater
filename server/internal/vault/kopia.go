@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -44,17 +45,50 @@ type kopiaVault struct {
 	rep repo.Repository
 }
 
-func repoPaths(reposDir, repoID string) (repoPath, cfgPath, cacheDir string) {
+// repoPaths returns blob storage, config, and cache locations (M4).
+// Config: <dataDir>/kopia-config/<repoID>.config
+// Cache:  <dataDir>/cache/<repoID>
+// Blobs:  <reposDir>/<repoID>
+func repoPaths(reposDir, dataDir, repoID string) (repoPath, cfgPath, cacheDir string) {
 	repoPath = filepath.Join(reposDir, repoID)
-	cfgPath = filepath.Join(repoPath, "breakwater.config")
-	cacheDir = filepath.Join(repoPath, ".cache")
+	cfgPath = filepath.Join(dataDir, "kopia-config", repoID+".config")
+	cacheDir = filepath.Join(dataDir, "cache", repoID)
 	return repoPath, cfgPath, cacheDir
 }
 
-func createKopiaVault(ctx context.Context, reposDir, repoID, password string) (*kopiaVault, error) {
-	repoPath, cfgPath, cacheDir := repoPaths(reposDir, repoID)
+// legacyRepoPaths is the M1 layout (config/cache inside the repo directory).
+func legacyRepoPaths(repoPath string) (cfgPath, cacheDir string) {
+	return filepath.Join(repoPath, "breakwater.config"), filepath.Join(repoPath, ".cache")
+}
+
+// migrateLegacyLayout re-Connects an M1-era repo (config/cache under the repo path)
+// into the M4 layout under dataDir. Re-Connect is used (not a blind rename) so the
+// new config records the new cache directory path correctly.
+// Returns true if a legacy layout was migrated.
+func migrateLegacyLayout(ctx context.Context, repoPath, cfgPath, cacheDir, password, repoID string) (bool, error) {
+	if _, err := os.Stat(cfgPath); err == nil {
+		return false, nil // already on new layout
+	}
+	legacyCfg, legacyCache := legacyRepoPaths(repoPath)
+	if _, err := os.Stat(legacyCfg); err != nil {
+		return false, nil // no legacy config either
+	}
+	if err := ensureConnected(ctx, repoPath, cfgPath, cacheDir, password, repoID); err != nil {
+		return false, fmt.Errorf("migrate legacy layout: %w", err)
+	}
+	_ = os.Remove(legacyCfg)
+	// Drop stale M1 cache directory; new cache lives under dataDir.
+	_ = os.RemoveAll(legacyCache)
+	return true, nil
+}
+
+func createKopiaVault(ctx context.Context, reposDir, dataDir, repoID, password string) (*kopiaVault, error) {
+	repoPath, cfgPath, cacheDir := repoPaths(reposDir, dataDir, repoID)
 	if err := os.MkdirAll(repoPath, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir repo: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(cfgPath), 0o700); err != nil {
+		return nil, fmt.Errorf("mkdir kopia-config: %w", err)
 	}
 	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
 		return nil, fmt.Errorf("mkdir cache: %w", err)
@@ -90,11 +124,14 @@ func createKopiaVault(ctx context.Context, reposDir, repoID, password string) (*
 		return nil, fmt.Errorf("repo.Connect: %w", err)
 	}
 
-	return openKopiaVault(ctx, reposDir, repoID, password)
+	return openKopiaVault(ctx, reposDir, dataDir, repoID, password)
 }
 
-func openKopiaVault(ctx context.Context, reposDir, repoID, password string) (*kopiaVault, error) {
-	repoPath, cfgPath, cacheDir := repoPaths(reposDir, repoID)
+func openKopiaVault(ctx context.Context, reposDir, dataDir, repoID, password string) (*kopiaVault, error) {
+	repoPath, cfgPath, cacheDir := repoPaths(reposDir, dataDir, repoID)
+	if _, err := migrateLegacyLayout(ctx, repoPath, cfgPath, cacheDir, password, repoID); err != nil {
+		return nil, err
+	}
 	if _, err := os.Stat(cfgPath); err != nil {
 		// Config missing: try connect from existing initialized storage.
 		if err := ensureConnected(ctx, repoPath, cfgPath, cacheDir, password, repoID); err != nil {
@@ -394,6 +431,8 @@ func (v *kopiaVault) PutSnapshotRecord(ctx context.Context, rec SnapshotRecord) 
 }
 
 // validateSnapshotRoot ensures the root object decodes as the kind requires (R3-1).
+// Uses strict JSON (DisallowUnknownFields) so a mislabeled kind — e.g. TreeObject
+// stored under bw-image-snapshot — is rejected at the write boundary (M2 / R3 note 1).
 func validateSnapshotRoot(ctx context.Context, rep repo.Repository, kind SnapshotKind, root ObjectID) error {
 	raw, err := readObjectBytes(ctx, rep, root)
 	if err != nil {
@@ -402,16 +441,24 @@ func validateSnapshotRoot(ctx context.Context, rep repo.Repository, kind Snapsho
 	switch kind {
 	case KindFileSnapshot:
 		var tree format.TreeObject
-		if err := json.Unmarshal(raw, &tree); err != nil {
+		if err := strictJSONDecode(raw, &tree); err != nil {
 			return fmt.Errorf("file snapshot root %s must be a TreeObject JSON: %w", root, err)
 		}
 	case KindImageSnapshot:
 		var img format.ImageManifest
-		if err := json.Unmarshal(raw, &img); err != nil {
+		if err := strictJSONDecode(raw, &img); err != nil {
 			return fmt.Errorf("image snapshot root %s must be an ImageManifest JSON: %w", root, err)
 		}
 	}
 	return nil
+}
+
+// strictJSONDecode decodes with DisallowUnknownFields so cross-kind roots fail.
+// Shared by write-boundary validation and the mark phase (same contract).
+func strictJSONDecode(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
 }
 
 func (v *kopiaVault) GetSnapshotRecord(ctx context.Context, id SnapshotRecordID) (*SnapshotRecord, error) {
@@ -698,7 +745,9 @@ func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.I
 		return fmt.Errorf("prune: read tree object %s (manifest %s): %w", oid, manifestID, err)
 	}
 	var tree format.TreeObject
-	if err := json.Unmarshal(raw, &tree); err != nil {
+	// Same strictness as validateSnapshotRoot (write boundary) — fail closed on
+	// unknown fields so a mislabeled kind cannot partial-decode and under-mark.
+	if err := strictJSONDecode(raw, &tree); err != nil {
 		return fmt.Errorf("prune: decode TreeObject %s (manifest %s): %w", oid, manifestID, err)
 	}
 
@@ -740,7 +789,8 @@ func markImageManifest(ctx context.Context, rep repo.Repository, live map[conten
 		return fmt.Errorf("prune: read image manifest object %s (manifest %s): %w", oid, manifestID, err)
 	}
 	var img format.ImageManifest
-	if err := json.Unmarshal(raw, &img); err != nil {
+	// Same strictness as validateSnapshotRoot (write boundary).
+	if err := strictJSONDecode(raw, &img); err != nil {
 		return fmt.Errorf("prune: decode ImageManifest %s (manifest %s): %w", oid, manifestID, err)
 	}
 	for i, blk := range img.Blocks {

@@ -40,7 +40,7 @@ func TestEngineGate_Kopia(t *testing.T) {
 
 	t.Logf("engine gate: writing %d bytes (%.2f GiB) into kopia vault", totalBytes, float64(totalBytes)/(1<<30))
 
-	mgr := vault.NewManager(reposDir)
+	mgr := vault.NewManager(reposDir, reposDir)
 	defer mgr.CloseAll(ctx)
 
 	v, err := mgr.Create(ctx, repoID, password)
@@ -314,10 +314,14 @@ func TestEngineGate_Kopia(t *testing.T) {
 		t.Fatalf("checksum mismatch after re-open")
 	}
 
-	// Config file should exist under repo
-	cfg := filepath.Join(reposDir, repoID, "breakwater.config")
+	// Config file should exist under dataDir (M4), not inside the repo path.
+	cfg := filepath.Join(reposDir, "kopia-config", repoID+".config")
 	if _, err := os.Stat(cfg); err != nil {
 		t.Fatalf("missing config %s: %v", cfg, err)
+	}
+	legacyCfg := filepath.Join(reposDir, repoID, "breakwater.config")
+	if _, err := os.Stat(legacyCfg); err == nil {
+		t.Fatalf("legacy config must not remain under repo path: %s", legacyCfg)
 	}
 
 	// M3: methods after Close return error, not panic
@@ -334,7 +338,7 @@ func TestEngineGate_Kopia(t *testing.T) {
 // TestVault_SmallRoundTrip is a fast unit test always run in CI.
 func TestVault_SmallRoundTrip(t *testing.T) {
 	ctx := context.Background()
-	mgr := vault.NewManager(t.TempDir())
+	mgr := vault.NewManager(t.TempDir(), t.TempDir())
 	defer mgr.CloseAll(ctx)
 
 	v, err := mgr.Create(ctx, "m1", "pw-test-small")
@@ -381,7 +385,7 @@ func TestVault_SmallRoundTrip(t *testing.T) {
 // TestPutContent_RejectsOversize is H2: payloads >4MiB must error.
 func TestPutContent_RejectsOversize(t *testing.T) {
 	ctx := context.Background()
-	mgr := vault.NewManager(t.TempDir())
+	mgr := vault.NewManager(t.TempDir(), t.TempDir())
 	defer mgr.CloseAll(ctx)
 
 	v, err := mgr.Create(ctx, "oversize", "pw")

@@ -2,6 +2,7 @@ package agentgw_test
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -9,10 +10,14 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 
+	breakwaterv1 "github.com/ajthom90/breakwater/pkg/proto/breakwater/v1"
 	"github.com/ajthom90/breakwater/server/internal/agentgw"
+	"github.com/ajthom90/breakwater/server/internal/audit"
 	"github.com/ajthom90/breakwater/server/internal/catalog"
 	"github.com/ajthom90/breakwater/server/internal/enroll"
 	"github.com/ajthom90/breakwater/server/internal/keystore"
@@ -21,7 +26,7 @@ import (
 )
 
 // TestM1_EnrollmentAndWrongCertRejection is the M1 demo gate:
-// fake Linux client enrolls; wrong-cert client is rejected.
+// fake Linux client enrolls over real protobuf; wrong-cert client is rejected.
 func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
@@ -43,9 +48,10 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 	}
 	serverFP := serverID.Fingerprint()
 
-	vm := vault.NewManager(filepath.Join(tmp, "repos"))
+	vm := vault.NewManager(filepath.Join(tmp, "repos"), filepath.Join(tmp, "data"))
 	defer vm.CloseAll(ctx)
 
+	auditor := audit.NewWriter(db)
 	enrollSvc := &enroll.Service{
 		DB:            db,
 		Keystore:      ks,
@@ -56,7 +62,8 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 	}
 
 	gw := agentgw.New(serverID, enrollSvc, enrollSvc.Log)
-	gw.TestEcho = echoImpl{}
+	gw.Auditor = auditor
+	gw.TestDataService = &agentgw.PostEnrollProbe{}
 	addr, err := gw.Start("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("start gateway: %v", err)
@@ -72,7 +79,7 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 		t.Fatalf("insert token: %v", err)
 	}
 
-	// --- Fake Linux client: correct enrollment ---
+	// --- Fake Linux client: correct enrollment over generated protobuf stubs ---
 	agentID, err := mtls.GenerateAgentIdentity("fake-linux-client", 365*24*time.Hour)
 	if err != nil {
 		t.Fatalf("agent identity: %v", err)
@@ -87,29 +94,56 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 	}
 	defer conn.Close()
 
-	ec := agentgw.NewEnrollmentClient(conn)
-	resp, err := ec.Enroll(ctx, &agentgw.EnrollRequest{
-		Token:         rawTok,
-		Hostname:      "fake-linux-01",
-		OS:            "linux",
-		OSVersion:     "test",
-		AgentVersion:  "0.0.1-dev",
-		Arch:          "amd64",
-		ClientCertPEM: agentID.CertPEM, // matches connection
+	ec := breakwaterv1.NewEnrollmentServiceClient(conn)
+	resp, err := ec.Enroll(ctx, &breakwaterv1.EnrollRequest{
+		Token: rawTok,
+		AgentInfo: &breakwaterv1.AgentInfo{
+			Hostname:     "fake-linux-01",
+			Os:           "linux",
+			OsVersion:    "test",
+			AgentVersion: "0.0.1-dev",
+			Arch:         "amd64",
+		},
+		ClientCertPem: agentID.CertPEM, // matches connection
 	})
 	if err != nil {
 		t.Fatalf("enroll: %v", err)
 	}
-	if resp.MachineID == "" || len(resp.HashingKey) == 0 {
+	if resp.MachineId == "" || len(resp.HashingKey) == 0 {
 		t.Fatalf("bad enroll response: %+v", resp)
 	}
 	if resp.ServerCertFingerprint != serverFP {
 		t.Fatalf("server fp mismatch")
 	}
-	t.Logf("enrolled machine_id=%s hashingKeyLen=%d", resp.MachineID, len(resp.HashingKey))
+	t.Logf("enrolled machine_id=%s hashingKeyLen=%d", resp.MachineId, len(resp.HashingKey))
+
+	// Audit: successful enroll produces a verifiable machine.enroll row.
+	enrollRows, err := auditor.ListByAction(ctx, audit.ActionMachineEnroll)
+	if err != nil {
+		t.Fatalf("list enroll audits: %v", err)
+	}
+	if len(enrollRows) < 1 {
+		t.Fatal("expected machine.enroll audit row after success")
+	}
+	foundSuccess := false
+	for _, r := range enrollRows {
+		if r.Target == resp.MachineId && r.Actor == agentID.Fingerprint() {
+			var d map[string]any
+			_ = json.Unmarshal([]byte(r.Detail), &d)
+			if d["outcome"] == "success" {
+				foundSuccess = true
+			}
+		}
+	}
+	if !foundSuccess {
+		t.Fatalf("no success audit for machine %s; rows=%+v", resp.MachineId, enrollRows)
+	}
+	if err := auditor.VerifyChain(ctx); err != nil {
+		t.Fatalf("audit chain after enroll: %v", err)
+	}
 
 	// Machine appears in catalog with connection cert FP.
-	m, err := db.MachineByID(ctx, resp.MachineID)
+	m, err := db.MachineByID(ctx, resp.MachineId)
 	if err != nil || m == nil {
 		t.Fatalf("machine missing from catalog: %v", err)
 	}
@@ -121,7 +155,7 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 	}
 
 	// Stored hashing key + algorithm match vault format / enroll response (R2-5).
-	storedHK, storedAlgo, err := ks.GetHashingKey(ctx, resp.MachineID)
+	storedHK, storedAlgo, err := ks.GetHashingKey(ctx, resp.MachineId)
 	if err != nil {
 		t.Fatalf("GetHashingKey: %v", err)
 	}
@@ -135,16 +169,13 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 		t.Fatalf("stored algo %q != response %q", storedAlgo, resp.HashingAlgorithm)
 	}
 
-	// Post-enroll: known cert can call Echo.
-	echo := agentgw.NewEchoClient(conn)
-	er, err := echo.Echo(ctx, &agentgw.EchoRequest{Message: "ping"})
+	// Post-enroll: known cert can call DataService.CheckContents (pin probe).
+	dc := breakwaterv1.NewDataServiceClient(conn)
+	_, err = dc.CheckContents(ctx, &breakwaterv1.CheckContentsRequest{JobId: "probe"})
 	if err != nil {
-		t.Fatalf("echo with enrolled cert: %v", err)
+		t.Fatalf("CheckContents with enrolled cert: %v", err)
 	}
-	if er.MachineID != resp.MachineID {
-		t.Fatalf("echo machine id: %s want %s", er.MachineID, resp.MachineID)
-	}
-	t.Logf("echo ok machine=%s", er.MachineID)
+	t.Logf("post-enroll probe ok machine=%s", resp.MachineId)
 
 	// --- Wrong-cert client rejected ---
 	wrongID, err := mtls.GenerateAgentIdentity("attacker", 24*time.Hour)
@@ -160,12 +191,27 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 	}
 	defer wrongConn.Close()
 
-	wrongEcho := agentgw.NewEchoClient(wrongConn)
-	_, err = wrongEcho.Echo(ctx, &agentgw.EchoRequest{Message: "should-fail"})
+	_, err = breakwaterv1.NewDataServiceClient(wrongConn).CheckContents(ctx, &breakwaterv1.CheckContentsRequest{JobId: "should-fail"})
 	if err == nil {
 		t.Fatal("expected wrong-cert client to be rejected")
 	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.PermissionDenied {
+		t.Fatalf("wrong-cert want PermissionDenied, got %v", err)
+	}
 	t.Logf("wrong-cert rejected as expected: %v", err)
+
+	// Wrong-cert rejection is audited (auth.fail).
+	authFails, err := auditor.ListByAction(ctx, audit.ActionAuthFail)
+	if err != nil {
+		t.Fatalf("list auth.fail: %v", err)
+	}
+	if len(authFails) < 1 {
+		t.Fatal("expected auth.fail audit row for wrong-cert rejection")
+	}
+	if err := auditor.VerifyChain(ctx); err != nil {
+		t.Fatalf("audit chain after wrong-cert: %v", err)
+	}
+	t.Logf("wrong-cert audit rows=%d chain OK", len(authFails))
 
 	// Wrong server fingerprint on client side rejected.
 	badPinTLS := mtls.ClientTLSConfig(agentID, "0000000000000000000000000000000000000000000000000000000000000000")
@@ -174,7 +220,7 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 		t.Fatalf("bad pin dial setup: %v", err)
 	}
 	defer badConn.Close()
-	_, err = agentgw.NewEchoClient(badConn).Echo(ctx, &agentgw.EchoRequest{Message: "x"})
+	_, err = breakwaterv1.NewDataServiceClient(badConn).CheckContents(ctx, &breakwaterv1.CheckContentsRequest{JobId: "x"})
 	if err == nil {
 		t.Fatal("expected server cert pin mismatch to fail")
 	}
@@ -186,25 +232,27 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 		t.Fatalf("plain dial: %v", err)
 	}
 	defer plain.Close()
-	_, err = agentgw.NewEnrollmentClient(plain).Enroll(ctx, &agentgw.EnrollRequest{Token: "x"})
+	_, err = breakwaterv1.NewEnrollmentServiceClient(plain).Enroll(ctx, &breakwaterv1.EnrollRequest{Token: "x"})
 	if err == nil {
 		t.Fatal("expected plaintext to fail")
 	}
 	t.Logf("plaintext rejected as expected: %v", err)
 
 	// Token reuse fails (same connection cert already enrolled).
-	_, err = ec.Enroll(ctx, &agentgw.EnrollRequest{
-		Token:         rawTok,
-		Hostname:      "reuse",
-		OS:            "linux",
-		ClientCertPEM: agentID.CertPEM,
+	_, err = ec.Enroll(ctx, &breakwaterv1.EnrollRequest{
+		Token: rawTok,
+		AgentInfo: &breakwaterv1.AgentInfo{
+			Hostname: "reuse",
+			Os:       "linux",
+		},
+		ClientCertPem: agentID.CertPEM,
 	})
 	if err == nil {
 		t.Fatal("expected token reuse to fail")
 	}
 	t.Logf("token reuse rejected: %v", err)
 
-	t.Log("M1 DEMO PASSED: fake client enrolls; wrong-cert client rejected")
+	t.Log("M1 DEMO PASSED: fake client enrolls over protobuf; wrong-cert client rejected; audit chain OK")
 }
 
 // TestEnroll_BodyCertMismatch rejects when request-body PEM ≠ TLS peer (B2).
@@ -226,14 +274,16 @@ func TestEnroll_BodyCertMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	serverFP := serverID.Fingerprint()
-	vm := vault.NewManager(filepath.Join(tmp, "repos"))
+	vm := vault.NewManager(filepath.Join(tmp, "repos"), filepath.Join(tmp, "data"))
 	defer vm.CloseAll(ctx)
 
+	auditor := audit.NewWriter(db)
 	svc := &enroll.Service{
 		DB: db, Keystore: ks, Vaults: &realVault{m: vm}, ServerFP: serverFP,
 		Log: slog.Default(),
 	}
 	gw := agentgw.New(serverID, svc, slog.Default())
+	gw.Auditor = auditor
 	addr, err := gw.Start("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -266,45 +316,55 @@ func TestEnroll_BodyCertMismatch(t *testing.T) {
 	}
 	defer conn.Close()
 
-	_, err = agentgw.NewEnrollmentClient(conn).Enroll(ctx, &agentgw.EnrollRequest{
-		Token:         rawTok,
-		Hostname:      "mismatch-host",
-		OS:            "linux",
-		ClientCertPEM: bodyID.CertPEM, // deliberately different from TLS peer
+	ec := breakwaterv1.NewEnrollmentServiceClient(conn)
+	_, err = ec.Enroll(ctx, &breakwaterv1.EnrollRequest{
+		Token: rawTok,
+		AgentInfo: &breakwaterv1.AgentInfo{
+			Hostname: "mismatch-host",
+			Os:       "linux",
+		},
+		ClientCertPem: bodyID.CertPEM, // deliberately different from TLS peer
 	})
 	if err == nil {
 		t.Fatal("expected body≠connection cert rejection")
 	}
 	t.Logf("body-cert mismatch rejected: %v", err)
 
-	// Token must still be usable with matching cert (not burned on mismatch...
-	// Current order: mismatch check is before token consume — good).
-	// If token was burned, this would fail for wrong reason.
-	_, secret2, err := enroll.Mint(addr, serverFP)
+	// Rejected enroll is audited with outcome=rejected.
+	rows, err := auditor.ListByAction(ctx, audit.ActionMachineEnroll)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Re-parse: if first token still valid, use it; else use fresh.
-	// Mismatch fails before ConsumeEnrollToken, so original token still good.
-	rawTok2, secret2b, err := enroll.Mint(addr, serverFP)
-	_ = secret2
-	_ = secret2b
-	_ = rawTok2
+	if len(rows) < 1 {
+		t.Fatal("expected machine.enroll audit for rejected attempt")
+	}
+	var d map[string]any
+	if err := json.Unmarshal([]byte(rows[0].Detail), &d); err != nil {
+		t.Fatal(err)
+	}
+	if d["outcome"] != "rejected" {
+		t.Fatalf("detail outcome=%v want rejected", d["outcome"])
+	}
+	if err := auditor.VerifyChain(ctx); err != nil {
+		t.Fatalf("audit chain: %v", err)
+	}
 
-	// Original token still works with matching PEM.
-	resp, err := agentgw.NewEnrollmentClient(conn).Enroll(ctx, &agentgw.EnrollRequest{
-		Token:         rawTok,
-		Hostname:      "ok-host",
-		OS:            "linux",
-		ClientCertPEM: connID.CertPEM,
+	// Original token still works with matching PEM (mismatch fails before consume).
+	resp, err := ec.Enroll(ctx, &breakwaterv1.EnrollRequest{
+		Token: rawTok,
+		AgentInfo: &breakwaterv1.AgentInfo{
+			Hostname: "ok-host",
+			Os:       "linux",
+		},
+		ClientCertPem: connID.CertPEM,
 	})
 	if err != nil {
 		t.Fatalf("matching enroll after mismatch should succeed: %v", err)
 	}
-	if resp.MachineID == "" {
+	if resp.MachineId == "" {
 		t.Fatal("empty machine id")
 	}
-	t.Logf("matching enroll after mismatch OK: %s", resp.MachineID)
+	t.Logf("matching enroll after mismatch OK: %s", resp.MachineId)
 }
 
 type realVault struct {
@@ -317,11 +377,4 @@ func (r *realVault) Create(ctx context.Context, repoID, password string) ([]byte
 		return nil, "", err
 	}
 	return v.HashingKey(ctx)
-}
-
-type echoImpl struct{}
-
-func (echoImpl) Echo(ctx context.Context, req *agentgw.EchoRequest) (*agentgw.EchoResponse, error) {
-	pi, _ := agentgw.PeerFromContext(ctx)
-	return &agentgw.EchoResponse{Message: req.Message, MachineID: pi.MachineID}, nil
 }

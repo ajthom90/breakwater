@@ -15,7 +15,7 @@ import (
 // Also plants an unchecked snapshot record so Prune itself fails closed.
 func TestMarkTreeObject_UndecodableRootFailsClosed(t *testing.T) {
 	ctx := context.Background()
-	mgr := NewManager(t.TempDir())
+	mgr := NewManager(t.TempDir(), t.TempDir())
 	defer mgr.CloseAll(ctx)
 
 	viface, err := mgr.Create(ctx, "mark-fc", "pw")
