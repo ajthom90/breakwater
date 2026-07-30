@@ -177,3 +177,35 @@ Red-first captures and after-fix evidence: see `PROGRESS.md` stage-3 fix round.
 4. **Correctness/policy:** S3-F5 (+ explicit per-file error policy), S3-F4.
 5. **Test/infra hardening:** S3-F6, S3-F7, S3-F8, the minors.
 6. PROGRESS.md: red-first captures, decisions (error policy, H2/8 MiB amendment, confinement scope).
+
+---
+
+## Reviewer verification (fix round, 2026-07-30)
+
+Independently verified `2241698`. Both blockers re-tested with the reviewer's own
+probes (the ones that originally caught them):
+
+- **S3-F1:** a file literally named `.bw-object-from-contents` now backs up and
+  **restores byte-identical** (`restored paths: [userdir/.bw-object-from-contents]`).
+  The sentinel path is deleted; the wire uses the additive `content_ids` field; CI
+  greps non-test code to keep the magic name from returning.
+- **S3-F9:** the leak probe that failed 20/20 on `24300b1` now passes **25/25 under
+  `-race`**, asserting exactly one tracked lease while running and `Held == (0,0)`
+  plus a successful `Exclusive` acquire after terminal.
+
+Mutation battery — four for four killed: CAS-before-lease reverted → leak probe +
+2 S3 tests fail; per-message lease revalidation reverted to bind-once →
+`TestS3F2_CancelMidPutContents…` fails; compute-then-write reverted →
+`TestS3F3_MismatchLeavesRepoUnchanged` fails; symlink handling dropped →
+`TestBackup_SymlinksStored` + `TestS3F5_SymlinksPresentInSnapshot` fail.
+
+Also verified: multi-chunk round-trip now uses a 10 MiB payload and asserts
+`len(ids)>1`; confinement walks pkg/agent/cli with a CI job; policy decisions
+(fail-loud I/O, visible `Skipped`, H2→8 MiB with image blocks pinned at 4 MiB) are
+recorded in PROGRESS.md. Full suite green under `-race`; reduced gate green; **full
+10 GiB engine gate green (122.8 s)**.
+
+**Stage 3 closed.** Carried into stage 4: `pkg/backup` and `pkg/contentid` are the
+only pipeline/content-ID implementations (no forks); agent must send a terminal
+JobResult on cancel (the server now bounds cancel confirmation); reconnect
+idempotency is contract, not best-effort.
