@@ -110,3 +110,51 @@ Both sides resolve the same `"DYNAMIC-4M-BUZHASH"` factory from the same pinned 
 
 ### Noted, not scored
 The pipeline aborts the whole job on the first per-file error rather than skip-and-record. PLAN doesn't state a policy; fail-loud is defensible and consistent with this project's aversion to silent omissions. **Decide it explicitly in the fix round** and document it — with S3-F5 fixed, "skipped" must always be visible in the job result either way.
+
+---
+
+## Subreview B — scheduler / job engine (stage-3 changes)
+
+Independent adversarial pass over `server/internal/scheduler/` + `catalog/jobs.go`.
+
+### S3-F9 · BLOCKER — concurrent dispatch of the same job leaks a Shared lease: prune permanently wedged AND the job cannot write
+`server/internal/scheduler/engine.go:138-202` (state check at :146, lease acquire + map write at :153-166, CAS at :168-180), `:595-605` (`releaseLease`)
+`tryDispatch` has no per-job serialization, so two goroutines can both observe a job as `pending` and both acquire a lease before either commits its CAS. Reachable routinely: `Submit`'s inline dispatch races heartbeat-triggered `DeliverPending` (new in this stage), and an old session's in-flight `DeliverPending` races the new session's connect-time call during supersede (`TryAcquire` takes no context, so stream cancellation never short-circuits it).
+
+Trace: A acquires (shared 0→1), stores leaseA; B acquires (shared 1→2), **overwrites the map entry** with leaseB — leaseA is now unreferenced; A's CAS wins (job→running); B's CAS fails, so B calls `releaseLease`, which releases whatever is in the map (leaseB, shared 2→1) **and deletes the entry**; on terminal, A's `releaseLease` finds nothing and no-ops. `shared` is stuck at 1 forever → `Exclusive` can never be acquired → **prune/verify wedged on that repo permanently, with no operator-visible symptom.**
+
+**Empirically confirmed on `24300b1`** (probe test, since removed; reproduced 20/20 runs):
+```
+after concurrent dispatch: shared=1 exclusive=0 leases=0
+after job success:         shared=1 exclusive=0 leases=0
+LEASE LEAK CONFIRMED: shared=1 after terminal job — prune permanently blocked
+```
+Note `leases=0` while the job is still *running* — so the second symptom is immediate: the dispatched job holds no tracked lease, and every DataService call for it is rejected by `vaultForJobRPCFull`'s lease check (`FailedPrecondition: no vault lease held for job`). The race therefore both **breaks the backup** and **wedges retention**. This is the R2-2/S2-F3 failure class reintroduced through lease accounting rather than job-state accounting (the state CAS is correct; the lease map is not).
+**Fix:** make the claim atomic — perform the `pending → running` (or an intermediate `dispatching`) CAS **before** acquiring the lease, and acquire only if the CAS was applied; or serialize `tryDispatch` per jobID (singleflight / per-job mutex). Whichever: exactly one goroutine may reach lease acquisition per job, and every acquired lease must be reachable from the map for release.
+**Test first:** the probe above — concurrent `DeliverPending` for one pending job, then complete it, assert `Held(repoID) == (0,0)` and that `Exclusive` acquires. Must FAIL on `24300b1`. Add a stress variant (N goroutines × M jobs) asserting locks return to zero — no existing test checks lock accounting after concurrency; all current scheduler tests are single-goroutine.
+
+### S3-F10 · High — `cancelling` holds the vault lease with no timeout: a hung agent on a live channel wedges prune forever
+`server/internal/scheduler/engine.go:391-429`
+The documented release conditions for a cancelling vault-writing job are "agent JobResult or channel teardown" — both verified correct — but they are **not exhaustive**. If the channel stays healthy (heartbeats flowing, so `OnAgentDisconnect` never fires) and the agent never sends a `JobResult` (bug, deadlock, or an agent deliberately ignoring `JobCancel`), the job stays `cancelling` and holds its Shared lease indefinitely → prune/verify blocked forever on that repo. No timeout, watchdog, or deadline exists anywhere in the server (the M5 watchdog in PLAN is the *missed-backup* notifier, unrelated).
+**Fix:** bound it — start a deadline on entering `cancelling`; on expiry force-fail the job, release the lease, and log loudly (data may still be in flight to the vault, so the min-age guard matters here). If you'd rather defer, that must be an explicit documented decision, not silence in a doc comment that reads as exhaustive.
+
+### Verified clean (subreview B)
+- Non-blocking dispatch lease acquisition: `TryAcquire` then a hard-bounded 50 ms `Acquire`; failure leaves the job `pending` (never failed, never stuck running), and lease-free types (inventory/noop/update) still dispatch in the same loop.
+- Writer preference respected by the non-blocking path (`TryAcquire` checks `exclusiveWaiters`) — no S2-F3 regression.
+- `cancelling` exists in the catalog state machine with conditional CAS transitions; JobResult (success or failure) and agent disconnect both release the lease; non-vault jobs still cancel immediately.
+- `RecoverOnStartup` covers both `running` and `cancelling`.
+- `TestS2F4`'s new failure-result assertion is real (the guard fires before the success/failure branch, so both are uniformly ignored for pending jobs).
+- No regression to the S2 undelivered-JobStart revert ordering.
+
+### Minor (noted, not gating)
+- `schema.sql:69` state comment not updated to include `cancelling` (no CHECK constraint; cosmetic).
+- `Engine.Cancel` ignores `SendJobCancel`'s `sent` bool; `Registry.send` never returns a non-nil error, so a queue-full channel silently drops the JobCancel while the job still enters `cancelling` — unlike JobStart, there is no redelivery. Worth a follow-up given S3-F10.
+
+## Consolidated fix order (supersedes the earlier section)
+
+1. **Red-first tests:** S3-F1 (sentinel-named dir → restore must work), S3-F9 (concurrent dispatch → locks return to zero), S3-F5 (symlinks visible), S3-F2 (cancel mid-stream), S3-F3 (mismatch leaves repo unchanged).
+2. **Blockers:** S3-F1 (additive proto field/RPC, delete sentinel, client-side reserved-name rejection), S3-F9 (atomic claim before lease acquisition).
+3. **Data-path structure:** S3-F2, S3-F3, S3-F10.
+4. **Correctness/policy:** S3-F5 (+ explicit per-file error policy), S3-F4.
+5. **Test/infra hardening:** S3-F6, S3-F7, S3-F8, the minors.
+6. PROGRESS.md: red-first captures, decisions (error policy, H2/8 MiB amendment, confinement scope).
