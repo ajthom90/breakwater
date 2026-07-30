@@ -61,3 +61,13 @@ cd ../pkg && go test ./... -count=1
 | S1-F3 | ✅ Fixed | `strictJSONDecode` requires second `Decode` → `io.EOF`. Trailing-garbage Put test red on `bc65f8a`, green after. |
 
 Verification re-run locally after fixes: gofmt/vet clean, short+race green, audit/agentgw/vault Root\|Trailing green, reduced gate green, pkg green.
+
+---
+
+## Reviewer verification (fix round, 2026-07-30)
+
+Independently verified `1e58de5`: full verification suite green (gofmt/vet, short+race,
+audit, enroll e2e, vault Root/Strict/Trailing, reduced gate, pkg). Diffs match the
+prescriptions exactly. Mutation battery — all three killed: WithoutCancel reverted →
+both cancel-audit tests fail; EOF requirement dropped → trailing-garbage test fails;
+newline encoding restored → surface + ambiguity tests fail. **Stage 1 closed.**
