@@ -38,6 +38,9 @@ message EnrollResponse {
   string server_cert_fingerprint = 3; // confirmed pin
   // Default policy summary applied at enrollment (informational).
   string policy_id = 4;
+  // Hashing algorithm name (e.g. BLAKE2B-256-128) paired with hashing_key (R2-5).
+  // Additive field — allowed under the M1 proto freeze.
+  string hashing_algorithm = 5;
 }
 
 message AgentInfo {

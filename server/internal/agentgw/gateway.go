@@ -6,6 +6,7 @@ package agentgw
 import (
 	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -191,6 +192,7 @@ type EnrollRequest struct {
 type EnrollResponse struct {
 	MachineID             string
 	HashingKey            []byte
+	HashingAlgorithm      string // R2-5: algorithm paired with hashing key
 	ServerCertFingerprint string
 	PolicyID              string
 }
@@ -215,15 +217,38 @@ func (e *enrollmentServer) Enroll(ctx context.Context, req *EnrollRequest) (*Enr
 		ConnectionCertFP: pi.CertFP, // B2: bind TLS peer, not body alone
 	})
 	if err != nil {
-		// Map known client errors; do not leak raw DB internals (REVIEW-M1 M6 partial).
-		return nil, status.Errorf(codes.InvalidArgument, "enroll: %v", err)
+		return nil, e.mapEnrollError(err)
 	}
 	return &EnrollResponse{
 		MachineID:             resp.MachineID,
 		HashingKey:            resp.HashingKey,
+		HashingAlgorithm:      resp.HashingAlgorithm,
 		ServerCertFingerprint: resp.ServerCertFingerprint,
 		PolicyID:              resp.PolicyID,
 	}, nil
+}
+
+// mapEnrollError maps typed enroll errors to gRPC codes (R2-11).
+// Client-fault cases → InvalidArgument/PermissionDenied with safe messages.
+// Everything else → Internal with a generic message; details stay in server logs.
+func (e *enrollmentServer) mapEnrollError(err error) error {
+	switch {
+	case errors.Is(err, enroll.ErrInvalidToken),
+		errors.Is(err, enroll.ErrTokenExpired),
+		errors.Is(err, enroll.ErrMissingConnection),
+		errors.Is(err, enroll.ErrServerFPMismatch),
+		errors.Is(err, enroll.ErrCertMismatch):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, enroll.ErrTokenUsed),
+		errors.Is(err, enroll.ErrAlreadyEnrolled):
+		return status.Error(codes.PermissionDenied, err.Error())
+	default:
+		// Log-worthy internal path — do not echo DB/vault paths to the client.
+		if e.svc != nil && e.svc.Log != nil {
+			e.svc.Log.Error("enrollment internal failure", "err", err)
+		}
+		return status.Error(codes.Internal, "enrollment failed")
+	}
 }
 
 // RegisterEnrollmentServer registers the hand-rolled enrollment service.

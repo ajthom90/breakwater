@@ -16,6 +16,8 @@ import (
 	"github.com/kopia/kopia/repo/maintenance"
 	"github.com/kopia/kopia/repo/manifest"
 	"github.com/kopia/kopia/repo/object"
+
+	"github.com/ajthom90/breakwater/pkg/format"
 )
 
 // MaxPutContentBytes is the maximum payload for PutContent (one FIXED-4M block).
@@ -347,6 +349,16 @@ func (v *kopiaVault) PutSnapshotRecord(ctx context.Context, rec SnapshotRecord) 
 	if rec.Kind == "" {
 		return "", fmt.Errorf("snapshot kind required")
 	}
+	// R2-3: reject unknown kinds at the write boundary.
+	if !ValidSnapshotKind(rec.Kind) {
+		return "", fmt.Errorf("unknown snapshot kind %q (want %s or %s)", rec.Kind, KindFileSnapshot, KindImageSnapshot)
+	}
+	// R2-4: validate RootObjectID at write time so a garbage OID cannot wedge Prune.
+	if rec.RootObjectID != "" {
+		if _, err := object.ParseID(string(rec.RootObjectID)); err != nil {
+			return "", fmt.Errorf("invalid root object id %q: %w", rec.RootObjectID, err)
+		}
+	}
 	if rec.Timestamp.IsZero() {
 		rec.Timestamp = time.Now().UTC()
 	}
@@ -411,9 +423,13 @@ func (v *kopiaVault) ListSnapshotRecords(ctx context.Context, kind SnapshotKind)
 			continue
 		}
 		// Load payload for snapshot Timestamp (labels only have ModTime).
+		// R2-12: propagate GetManifest errors — never silently substitute ModTime.
 		var rec SnapshotRecord
+		if _, err := v.rep.GetManifest(ctx, e.ID, &rec); err != nil {
+			return nil, fmt.Errorf("get manifest %s for list: %w", e.ID, err)
+		}
 		ts := e.ModTime
-		if _, err := v.rep.GetManifest(ctx, e.ID, &rec); err == nil && !rec.Timestamp.IsZero() {
+		if !rec.Timestamp.IsZero() {
 			ts = rec.Timestamp
 		}
 		out = append(out, SnapshotMeta{
@@ -440,17 +456,24 @@ func (v *kopiaVault) DeleteSnapshotRecord(ctx context.Context, id SnapshotRecord
 		})
 }
 
-// Prune implements PLAN mark-and-sweep:
+// Prune implements PLAN mark-and-sweep with recursive tree/image walk (R2-1)
+// and a configurable minimum content age (R2-2, default 24h).
 //
-//	mark  = walk live snapshot records → VerifyObject(root) → live content-ID set
-//	sweep = IterateContents → DeleteContent(unmarked unprefixed) → DropDeletedContents → maintenance.Run
+//	mark  = walk live snapshot records → trees/manifests → VerifyObject → live set
+//	sweep = IterateContents → DeleteContent(unmarked, aged) → DropDeletedContents → maintenance.Run
 //
 // Prefixed contents (e.g. manifest "m") are left for kopia maintenance; only
 // unprefixed user content is subject to our mark set.
 //
 // Two write sessions are required: delete markers must be committed before
 // DropDeletedContents / RunExclusive refresh indexes from storage.
-func (v *kopiaVault) Prune(ctx context.Context) error {
+//
+// Serialization: must not run concurrently with an open backup session on this
+// repo (see Vault interface). MinContentAge is a safety net for races the
+// scheduler fails to prevent.
+func (v *kopiaVault) Prune(ctx context.Context, opts ...PruneOption) error {
+	cfg := resolvePruneOptions(opts)
+
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if err := v.requireOpen(); err != nil {
@@ -462,7 +485,7 @@ func (v *kopiaVault) Prune(ctx context.Context) error {
 		return fmt.Errorf("prune requires direct repository access")
 	}
 
-	// Session 1: mark live roots and DeleteContent unmarked user contents.
+	// Session 1: mark live roots and DeleteContent unmarked aged user contents.
 	err := repo.DirectWriteSession(ctx, dr, repo.WriteSessionOptions{Purpose: "prune-mark-sweep"},
 		func(ctx context.Context, dw repo.DirectRepositoryWriter) error {
 			live, err := markLiveContents(ctx, dw)
@@ -471,6 +494,11 @@ func (v *kopiaVault) Prune(ctx context.Context) error {
 			}
 
 			cm := dw.ContentManager()
+			cutoff := time.Time{}
+			if cfg.minContentAge > 0 {
+				cutoff = dw.Time().Add(-cfg.minContentAge)
+			}
+
 			var toDelete []content.ID
 			err = cm.IterateContents(ctx, content.IterateOptions{}, func(info content.Info) error {
 				if info.Deleted {
@@ -482,6 +510,10 @@ func (v *kopiaVault) Prune(ctx context.Context) error {
 					return nil
 				}
 				if _, ok := live[id]; ok {
+					return nil
+				}
+				// R2-2: never delete contents younger than the min-age window.
+				if !cutoff.IsZero() && info.Timestamp().After(cutoff) {
 					return nil
 				}
 				toDelete = append(toDelete, id)
@@ -503,7 +535,7 @@ func (v *kopiaVault) Prune(ctx context.Context) error {
 	}
 
 	// Session 2: drop deleted contents from indexes and run pack GC.
-	// SafetyNone: server is sole writer (PLAN: per-repo RW lock).
+	// SafetyNone: server is sole writer (PLAN: per-repo RW lock); min-age is our safety window.
 	return repo.DirectWriteSession(ctx, dr, repo.WriteSessionOptions{Purpose: "prune-gc"},
 		func(ctx context.Context, dw repo.DirectRepositoryWriter) error {
 			p, err := maintenance.GetParams(ctx, dw)
@@ -528,37 +560,207 @@ func (v *kopiaVault) Prune(ctx context.Context) error {
 		})
 }
 
-// markLiveContents walks live bw-* snapshot manifests and collects content IDs
-// reachable via VerifyObject on each root object.
+// markLiveContents walks every live Breakwater snapshot and collects content IDs
+// reachable via recursive tree/image walk (R2-1). Unknown kinds fail closed (R2-3).
 func markLiveContents(ctx context.Context, rep repo.Repository) (map[content.ID]struct{}, error) {
 	live := make(map[content.ID]struct{})
-	for _, kind := range []string{string(KindFileSnapshot), string(KindImageSnapshot)} {
-		entries, err := rep.FindManifests(ctx, map[string]string{"type": kind})
-		if err != nil {
-			return nil, err
+
+	// Enumerate all manifests; filter to those with a RootObjectID.
+	// FindManifests with empty labels returns everything.
+	entries, err := rep.FindManifests(ctx, map[string]string{})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, e := range entries {
+		t := e.Labels["type"]
+		// Skip non-snapshot manifests (kopia internal, etc.).
+		if t == "" {
+			continue
 		}
-		for _, e := range entries {
-			var rec SnapshotRecord
-			if _, err := rep.GetManifest(ctx, e.ID, &rec); err != nil {
-				return nil, fmt.Errorf("get manifest %s: %w", e.ID, err)
+		// Only consider Breakwater snapshot label namespace (bw-*).
+		if len(t) < 3 || t[:3] != "bw-" {
+			continue
+		}
+
+		var rec SnapshotRecord
+		if _, err := rep.GetManifest(ctx, e.ID, &rec); err != nil {
+			return nil, fmt.Errorf("get manifest %s: %w", e.ID, err)
+		}
+		if rec.RootObjectID == "" {
+			continue
+		}
+
+		// R2-3: fail closed on kinds we cannot walk.
+		if !ValidSnapshotKind(SnapshotKind(t)) && !ValidSnapshotKind(rec.Kind) {
+			kind := t
+			if rec.Kind != "" {
+				kind = string(rec.Kind)
 			}
-			if rec.RootObjectID == "" {
-				continue
-			}
-			oid, err := object.ParseID(string(rec.RootObjectID))
-			if err != nil {
-				return nil, fmt.Errorf("parse root object %s: %w", rec.RootObjectID, err)
-			}
-			ids, err := rep.VerifyObject(ctx, oid)
-			if err != nil {
-				return nil, fmt.Errorf("VerifyObject %s: %w", rec.RootObjectID, err)
-			}
-			for _, id := range ids {
-				live[id] = struct{}{}
-			}
+			return nil, fmt.Errorf("prune: unknown snapshot kind %q on manifest %s (fail closed)", kind, e.ID)
+		}
+		kind := rec.Kind
+		if kind == "" {
+			kind = SnapshotKind(t)
+		}
+
+		if err := markSnapshotContents(ctx, rep, live, kind, rec.RootObjectID, e.ID); err != nil {
+			return nil, err
 		}
 	}
 	return live, nil
+}
+
+// markSnapshotContents marks all content IDs reachable from a snapshot root,
+// keyed by kind (R2-1 recursive mark).
+func markSnapshotContents(ctx context.Context, rep repo.Repository, live map[content.ID]struct{}, kind SnapshotKind, root ObjectID, manifestID manifest.ID) error {
+	switch kind {
+	case KindFileSnapshot:
+		return markTreeObject(ctx, rep, live, root, string(manifestID), 0)
+	case KindImageSnapshot:
+		return markImageManifest(ctx, rep, live, root, string(manifestID))
+	default:
+		return fmt.Errorf("prune: cannot walk snapshot kind %q (manifest %s)", kind, manifestID)
+	}
+}
+
+const maxTreeDepth = 256
+
+// markTreeObject recursively marks a TreeObject and all referenced file/dir/ADS objects.
+func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.ID]struct{}, oid ObjectID, manifestID string, depth int) error {
+	if depth > maxTreeDepth {
+		return fmt.Errorf("prune: tree depth exceeds %d (manifest %s, oid %s)", maxTreeDepth, manifestID, oid)
+	}
+	if err := markObjectContents(ctx, rep, live, oid, manifestID); err != nil {
+		return err
+	}
+
+	raw, err := readObjectBytes(ctx, rep, oid)
+	if err != nil {
+		return fmt.Errorf("prune: read tree object %s (manifest %s): %w", oid, manifestID, err)
+	}
+	var tree format.TreeObject
+	if err := json.Unmarshal(raw, &tree); err != nil {
+		// Fail closed: a root that is not a TreeObject (e.g. flat engine-gate
+		// payload) is still marked via markObjectContents above; only fail if
+		// we expected structure. Flat snapshots store raw file bytes as root —
+		// treat decode failure as "leaf object, already marked".
+		// However PLAN says trees are JSON; for true tree roots decode must work.
+		// Heuristic: if payload looks like JSON object with "entries", fail; else leaf.
+		if looksLikeTreeJSON(raw) {
+			return fmt.Errorf("prune: decode TreeObject %s (manifest %s): %w", oid, manifestID, err)
+		}
+		return nil
+	}
+
+	for _, ent := range tree.Entries {
+		if ent.ObjectID == "" {
+			continue
+		}
+		child := ObjectID(ent.ObjectID)
+		switch ent.Type {
+		case format.EntryDir:
+			if err := markTreeObject(ctx, rep, live, child, manifestID, depth+1); err != nil {
+				return err
+			}
+		default:
+			// file, symlink, reparse, or empty type: mark object contents.
+			if err := markObjectContents(ctx, rep, live, child, manifestID); err != nil {
+				return err
+			}
+		}
+		for _, ads := range ent.ADS {
+			if ads.ObjectID == "" {
+				continue
+			}
+			if err := markObjectContents(ctx, rep, live, ObjectID(ads.ObjectID), manifestID); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func looksLikeTreeJSON(raw []byte) bool {
+	// Cheap check: starts with '{' and contains "entries" key marker.
+	if len(raw) == 0 || raw[0] != '{' {
+		return false
+	}
+	return bytesContains(raw, []byte(`"entries"`)) || bytesContains(raw, []byte(`"v"`))
+}
+
+func bytesContains(b, sub []byte) bool {
+	return len(sub) == 0 || (len(b) >= len(sub) && indexBytes(b, sub) >= 0)
+}
+
+func indexBytes(b, sub []byte) int {
+	for i := 0; i+len(sub) <= len(b); i++ {
+		ok := true
+		for j := range sub {
+			if b[i+j] != sub[j] {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// markImageManifest marks the image manifest object and every block content ID.
+func markImageManifest(ctx context.Context, rep repo.Repository, live map[content.ID]struct{}, oid ObjectID, manifestID string) error {
+	if err := markObjectContents(ctx, rep, live, oid, manifestID); err != nil {
+		return err
+	}
+	raw, err := readObjectBytes(ctx, rep, oid)
+	if err != nil {
+		return fmt.Errorf("prune: read image manifest object %s (manifest %s): %w", oid, manifestID, err)
+	}
+	var img format.ImageManifest
+	if err := json.Unmarshal(raw, &img); err != nil {
+		return fmt.Errorf("prune: decode ImageManifest %s (manifest %s): %w", oid, manifestID, err)
+	}
+	for i, blk := range img.Blocks {
+		if blk.ContentID == "" {
+			continue
+		}
+		cid, err := content.ParseID(blk.ContentID)
+		if err != nil {
+			return fmt.Errorf("prune: image block %d content id %q (manifest %s): %w", i, blk.ContentID, manifestID, err)
+		}
+		live[cid] = struct{}{}
+	}
+	return nil
+}
+
+func markObjectContents(ctx context.Context, rep repo.Repository, live map[content.ID]struct{}, oid ObjectID, manifestID string) error {
+	parsed, err := object.ParseID(string(oid))
+	if err != nil {
+		return fmt.Errorf("prune: parse object id %q (manifest %s): %w", oid, manifestID, err)
+	}
+	ids, err := rep.VerifyObject(ctx, parsed)
+	if err != nil {
+		return fmt.Errorf("prune: VerifyObject %s (manifest %s): %w", oid, manifestID, err)
+	}
+	for _, id := range ids {
+		live[id] = struct{}{}
+	}
+	return nil
+}
+
+func readObjectBytes(ctx context.Context, rep repo.Repository, oid ObjectID) ([]byte, error) {
+	parsed, err := object.ParseID(string(oid))
+	if err != nil {
+		return nil, err
+	}
+	r, err := rep.OpenObject(ctx, parsed)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	return io.ReadAll(r)
 }
 
 func (v *kopiaVault) Stats(ctx context.Context) (VaultStats, error) {

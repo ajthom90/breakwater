@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -16,6 +17,10 @@ import (
 
 	"github.com/ajthom90/breakwater/server/internal/catalog"
 )
+
+// ErrHashingKeyNotSet is returned when GetHashingKey finds an empty placeholder
+// (CreateRepoPassword seals empty until SetHashingKey runs) (R2-6).
+var ErrHashingKeyNotSet = errors.New("hashing key not set")
 
 // Store encrypts per-repo passwords and hashing keys with a master key.
 type Store struct {
@@ -75,8 +80,8 @@ func (s *Store) CreateRepoPassword(ctx context.Context, repoID string) (repoPass
 
 	err = s.db.WithTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
-			INSERT INTO keystore (repo_id, repo_password_enc, hashing_key_enc)
-			VALUES (?, ?, ?)`, repoID, pwEnc, hkEnc)
+			INSERT INTO keystore (repo_id, repo_password_enc, hashing_key_enc, hashing_algorithm)
+			VALUES (?, ?, ?, ?)`, repoID, pwEnc, hkEnc, "")
 		return err
 	})
 	if err != nil {
@@ -85,10 +90,13 @@ func (s *Store) CreateRepoPassword(ctx context.Context, repoID string) (repoPass
 	return repoPassword, nil
 }
 
-// SetHashingKey stores the vault-sourced content-ID HMAC secret for a repo.
-func (s *Store) SetHashingKey(ctx context.Context, repoID string, hashingKey []byte) error {
+// SetHashingKey stores the vault-sourced content-ID HMAC secret and algorithm name (R2-5).
+func (s *Store) SetHashingKey(ctx context.Context, repoID string, hashingKey []byte, algorithm string) error {
 	if len(hashingKey) == 0 {
 		return fmt.Errorf("hashing key must not be empty")
+	}
+	if algorithm == "" {
+		return fmt.Errorf("hashing algorithm must not be empty")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -99,7 +107,8 @@ func (s *Store) SetHashingKey(ctx context.Context, repoID string, hashingKey []b
 	}
 	return s.db.WithTx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx, `
-			UPDATE keystore SET hashing_key_enc = ? WHERE repo_id = ?`, hkEnc, repoID)
+			UPDATE keystore SET hashing_key_enc = ?, hashing_algorithm = ? WHERE repo_id = ?`,
+			hkEnc, algorithm, repoID)
 		if err != nil {
 			return err
 		}
@@ -108,6 +117,16 @@ func (s *Store) SetHashingKey(ctx context.Context, repoID string, hashingKey []b
 			return fmt.Errorf("keystore row not found for repo %s", repoID)
 		}
 		return nil
+	})
+}
+
+// DeleteRepo removes a keystore row (enrollment compensation, R2-9).
+func (s *Store) DeleteRepo(ctx context.Context, repoID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM keystore WHERE repo_id = ?`, repoID)
+		return err
 	})
 }
 
@@ -126,15 +145,25 @@ func (s *Store) GetRepoPassword(ctx context.Context, repoID string) (string, err
 	return string(pt), nil
 }
 
-// GetHashingKey decrypts the hashing key.
-func (s *Store) GetHashingKey(ctx context.Context, repoID string) ([]byte, error) {
+// GetHashingKey decrypts the hashing key and returns the algorithm name.
+// Returns ErrHashingKeyNotSet if the key was never set (empty placeholder) (R2-6).
+func (s *Store) GetHashingKey(ctx context.Context, repoID string) (key []byte, algorithm string, err error) {
 	var enc []byte
-	err := s.db.SQL().QueryRowContext(ctx,
-		`SELECT hashing_key_enc FROM keystore WHERE repo_id = ?`, repoID).Scan(&enc)
+	var algo sql.NullString
+	err = s.db.SQL().QueryRowContext(ctx,
+		`SELECT hashing_key_enc, hashing_algorithm FROM keystore WHERE repo_id = ?`, repoID).
+		Scan(&enc, &algo)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return s.open(enc)
+	pt, err := s.open(enc)
+	if err != nil {
+		return nil, "", err
+	}
+	if len(pt) == 0 {
+		return nil, "", ErrHashingKeyNotSet
+	}
+	return pt, algo.String, nil
 }
 
 func (s *Store) seal(plain []byte) ([]byte, error) {

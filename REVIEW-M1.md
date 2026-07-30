@@ -10,41 +10,37 @@
 
 ## Blockers (must fix before calling M1 done)
 
-- [ ] **B1 — Prune is a space-reclamation no-op; the engine gate claim "forget + prune ✅ PASSED" is not real.**
-  `server/internal/vault/kopia.go:375-409` runs `maintenance.RunExclusive(ModeFull, SafetyNone)` but nothing ever marks contents deleted — there is no mark phase and no `DeleteContent` call in the codebase. Kopia's `repo/maintenance` only drops *already-deleted* contents and orphaned blobs, so forgotten snapshots leak storage forever.
-  **Evidence:** `BW_GATE_BYTES=268435456 go test ./internal/vault/ -run TestEngineGate_Kopia -v` → `stats before prune: contents=58 size=237927192` / `stats after prune: contents=59 size=237927510`. The gate test (`kopia_test.go:192-230`) never asserts reclamation, which is how this passed.
-  **Fix (proven feasible via public API in pinned v0.19.0):** `DirectRepositoryWriter.ContentManager().DeleteContent(ctx, id)` is public. Implement PLAN's design: mark = walk all live snapshot records → `VerifyObject` each root → live content-ID set; sweep = `IterateContents` → `DeleteContent` every unmarked ID → then `maintenance.Run`. Add gate assertions: the forgotten object's contents are absent after prune, `Stats` shrinks, and the live 10GiB object still checksum-verifies (the existing check at `kopia_test.go:213-224` — keep it).
-  **Note:** live data provably survives the current prune (checksum re-verify is real), so this is a missing feature, not data loss.
+- [x] **B1 — Prune is a space-reclamation no-op; the engine gate claim "forget + prune ✅ PASSED" is not real.**
+  Fixed in round 1 (mark-sweep + DeleteContent) and **completed in round 2 (R2-1/R2-2/R2-15)**: recursive tree/image mark, min-age guard, survival tests, on-disk reclamation. Full 10 GiB gate PASSED with R2-13/R2-15 assertions.
+  See [REVIEW-M1-ROUND2.md](REVIEW-M1-ROUND2.md) and PROGRESS.md verification evidence.
 
-- [ ] **B2 — Enrollment binds the certificate from the request body, never checking it against the TLS connection.**
-  `server/internal/enroll/service.go:67-71` fingerprints `req.ClientCertPEM`; the gateway already extracts the connection peer's FP (`server/internal/agentgw/gateway.go:120-138`) but Enroll never uses it. An enrollee therefore never proves possession of the key being registered — a token holder can bind a third party's public cert to a machine row (identity confusion). PLAN.md says the server binds the *presented* agent cert.
-  **Fix:** in the Enroll path, take the fingerprint from `agentgw.PeerFromContext` (or require body cert == connection cert and reject mismatch). Add a test enrolling with body cert ≠ connection cert and assert rejection (the current demo test passes the same identity for both, so it cannot catch this).
+- [x] **B2 — Enrollment binds the certificate from the request body, never checking it against the TLS connection.**
+  Fixed: identity from `PeerFromContext`; body PEM must match; `TestEnroll_BodyCertMismatch`.
 
 ## High priority
 
-- [ ] **H1 — The enrollment `HashingKey` is 32 random bytes with no relationship to the repo's content-ID keying.**
-  `server/internal/keystore/keystore.go:63-66` generates it independently, but kopia computes content IDs with an HMAC secret derived from repo format — an M2 agent using this key with kopia's hashing package will produce IDs the server never matches, breaking the have/want design (PLAN: "IDs are bit-identical").
-  **Fix path (public API):** `WriteManager.ContentFormat()` → `format.Provider` embeds `hashing.Parameters` (algorithm name + HMAC secret) — return *that* to the agent at enrollment. It is a hashing-only secret, consistent with PLAN's "hashing key only, never encryption keys". Fix the sourcing before M2 builds on the wrong key.
-- [ ] **H2 — `PutContent` returns a wrong/ambiguous ID for payloads > 4MiB and silently falls back to object-ID form.**
-  `server/internal/vault/kopia.go:139-173`: with `FIXED-4M`, >4MiB data yields multiple contents but `ids[0]` is returned as "the" content ID; when `VerifyObject` errors, the code silently returns the object-ID string instead, so the have/want ID space is mixed (`HasContents`/`GetContent` currently paper over this with dual parsing). **Fix:** hard size guard (error on >4MiB) and propagate the `VerifyObject` error. Add a >4MiB test.
-- [ ] **H3 — CI gaps undermine the "CI gates" deliverable.**
-  `.github/workflows/ci.yml`: never runs `pkg` module tests (Makefile `test-short` does; CI doesn't), never runs `-race` (PLAN verification requires it), no gofmt/lint step — while **five files are currently unformatted** (`gofmt -l`: `server/cmd/breakwaterd/main.go`, `server/internal/enroll/service.go`, `server/internal/enroll/token.go`, `server/internal/keystore/keystore.go`, `pkg/format/snapshot.go`). Also the full 10GB gate runs on every push on `ubuntu-latest` (~14GB disk — borderline, slow). **Fix:** gofmt everything; add pkg tests + `-race` + a gofmt check to CI; run a `BW_GATE_BYTES`-reduced gate on PRs and the full 10GB gate nightly/on-demand.
+- [x] **H1 — The enrollment `HashingKey` is 32 random bytes with no relationship to the repo's content-ID keying.**
+  Fixed: vault `ContentFormat` secret + algorithm; round 2 (R2-5) puts `hashing_algorithm` on the wire and in keystore; R2-14 ID round-trip test green.
+- [x] **H2 — `PutContent` returns a wrong/ambiguous ID for payloads > 4MiB and silently falls back to object-ID form.**
+  Fixed: hard 4MiB guard + VerifyObject error propagated + test.
+- [x] **H3 — CI gaps undermine the "CI gates" deliverable.**
+  Fixed: gofmt + pkg + race + reduced gate on PR; full gate on schedule/workflow_dispatch (R2-7).
 
 ## Medium / nits
 
-- [ ] M1 — kopia pinned at **v0.19.0** but PLAN verified the API against **v0.23.x** (~18 months of upstream fixes behind); PROGRESS.md doesn't justify the pin. Upgrade, or record the reason in PROGRESS.md.
-- [ ] M2 — `OpenObject` (`kopia.go:253-267`) releases the read lock at return while the reader stays outstanding — once prune actually deletes data, a restore stream can overlap prune's exclusive section. Document the invariant on the Vault interface at minimum; the scheduler's per-repo job serialization must cover it in M2+.
-- [ ] M3 — `kopiaVault.Close` nils `rep` (`kopia.go:128-137`); any later call panics on nil deref. Guard with an error.
-- [ ] M4 — `breakwater.config` and `.cache` are created inside `repoPath` itself (`kopia.go:35-40`) — foreign files inside kopia's blob storage root, and cache travels with any `zfs send`/sneakernet copy of `/repos`. Move both under `/data`.
-- [ ] M5 — Server identity cert sets `IsCA: true` + `KeyUsageCertSign` (`server/internal/mtls/certs.go:64-67`) — unnecessary for a pinned leaf; drop both (and `KeyEncipherment`, meaningless for ed25519).
-- [ ] M6 — All enroll failures map to `codes.InvalidArgument` and echo internal error text (`gateway.go:213`) — split validation vs internal errors; stop leaking DB errors to clients.
-- [ ] M7 — Enroll ordering burns the token before machine insert (`service.go:85-113`); failure in keystore/vault/insert leaves a consumed token and possibly an orphan repo. Acceptable for M1 — reorder or clean up in M2.
-- [ ] M8 — `SnapshotMeta.Timestamp` never populated in `ListSnapshotRecords` (`kopia.go:355-360`) — only `ModTime`.
-- [ ] M9 — `enroll_tokens.secret_hash` has no UNIQUE/index (`server/internal/catalog/schema.sql:128-136`).
-- [ ] M10 — Doc inconsistencies: README status table says "M1 in progress" while PROGRESS.md says complete; PROGRESS decision #5 claims module path `github.com/breakwater-backup/...` but every go.mod uses `github.com/ajthom90/...`; `audit_events` lacks PLAN's `actor_type` column.
-- [ ] M11 — Web port is plain HTTP (`server/cmd/breakwaterd/main.go:114-118`) — fine for `/healthz` in M1, but must be HTTPS before any authenticated surface exists (M2 UI shell).
-- [ ] M12 — `github.com/pkg/errors` is archived and the repo's own dominant idiom is `fmt.Errorf("%w")` — drop the dep.
-- [ ] M13 — `grpc.ForceServerCodec(jsonCodec{})` (`gateway.go:73`) forces JSON for *all* services on the gateway. This is the deviation-#1 protocol debt: the M2 swap to generated `breakwater.v1` protobuf must remove it or proto clients will fail. Track explicitly in PROGRESS.md's M2 list.
+- [ ] M1 — kopia pinned at **v0.19.0** but PLAN verified the API against **v0.23.x** (~18 months of upstream fixes behind); PROGRESS.md doesn't justify the pin. Upgrade, or record the reason in PROGRESS.md. **Documented (Go 1.23); upgrade deferred.**
+- [ ] M2 — `OpenObject` releases the read lock at return while the reader stays outstanding — once prune actually deletes data, a restore stream can overlap prune's exclusive section. Document the invariant on the Vault interface at minimum; the scheduler's per-repo job serialization must cover it in M2+. **Documented (+ backup-vs-prune R2-2); enforce in M2 scheduler.**
+- [x] M3 — `kopiaVault.Close` nils `rep`; any later call panics on nil deref. Guard with an error. **+ R2-10 Manager eviction on close.**
+- [ ] M4 — `breakwater.config` and `.cache` under repo path — move under `/data` (M2).
+- [x] M5 — Server identity cert leaf (not CA).
+- [x] M6 — Enroll error codes (R2-11 typed errors).
+- [x] M7 — Enroll compensation on failure (R2-9).
+- [x] M8 — `SnapshotMeta.Timestamp` populated (+ R2-12 GetManifest errors).
+- [x] M9 — `enroll_tokens.secret_hash` UNIQUE (+ R2-8 migration index).
+- [x] M10 — Docs/actor_type.
+- [ ] M11 — Web port plain HTTP — HTTPS before auth UI (M2).
+- [x] M12 — drop pkg/errors direct dep.
+- [ ] M13 — `grpc.ForceServerCodec(jsonCodec{})` — **Must fix first in M2.**
 
 ## PLAN.md / standing-rule compliance
 

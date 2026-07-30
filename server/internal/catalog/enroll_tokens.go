@@ -78,6 +78,18 @@ func (db *DB) ConsumeEnrollToken(ctx context.Context, secret, machineID string) 
 	return tokenID, err
 }
 
+// ReleaseEnrollToken un-consumes a token after a failed enrollment (R2-9).
+// Clears used_at and machine_id so the token can be retried.
+func (db *DB) ReleaseEnrollToken(ctx context.Context, tokenID string) error {
+	return db.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE enroll_tokens
+			SET used_at = NULL, machine_id = NULL
+			WHERE id = ?`, tokenID)
+		return err
+	})
+}
+
 // HashSecret is exported for tests.
 func HashSecret(secret string) string {
 	sum := sha256.Sum256([]byte(secret))

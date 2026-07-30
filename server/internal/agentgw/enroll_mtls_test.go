@@ -120,13 +120,19 @@ func TestM1_EnrollmentAndWrongCertRejection(t *testing.T) {
 		t.Fatalf("hostname: %s", m.Hostname)
 	}
 
-	// Stored hashing key matches vault format key.
-	storedHK, err := ks.GetHashingKey(ctx, resp.MachineID)
+	// Stored hashing key + algorithm match vault format / enroll response (R2-5).
+	storedHK, storedAlgo, err := ks.GetHashingKey(ctx, resp.MachineID)
 	if err != nil {
 		t.Fatalf("GetHashingKey: %v", err)
 	}
 	if string(storedHK) != string(resp.HashingKey) {
 		t.Fatal("stored hashing key != enroll response")
+	}
+	if resp.HashingAlgorithm == "" {
+		t.Fatal("enroll response missing hashing_algorithm")
+	}
+	if storedAlgo != resp.HashingAlgorithm {
+		t.Fatalf("stored algo %q != response %q", storedAlgo, resp.HashingAlgorithm)
 	}
 
 	// Post-enroll: known cert can call Echo.

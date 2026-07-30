@@ -3,6 +3,7 @@
 // (repo, repo/content, repo/object, repo/manifest, repo/maintenance).
 //
 // See PLAN.md → Storage engine. All kopia imports stay confined here.
+// Importing pkg/format into this package is allowed (Breakwater shared module).
 package vault
 
 import (
@@ -31,6 +32,16 @@ const (
 	// KindImageSnapshot is a fixed-block volume/VHDX snapshot (FIDX-analog; later phases).
 	KindImageSnapshot SnapshotKind = "bw-image-snapshot"
 )
+
+// ValidSnapshotKind reports whether kind is a known Breakwater snapshot kind.
+func ValidSnapshotKind(kind SnapshotKind) bool {
+	switch kind {
+	case KindFileSnapshot, KindImageSnapshot:
+		return true
+	default:
+		return false
+	}
+}
 
 // SnapshotRecord is Breakwater-native snapshot metadata stored via kopia manifests.
 // Authoritative copy lives in the repo; catalog mirrors it as a rebuildable index.
@@ -68,12 +79,61 @@ const (
 	SplitterFixed4M = "FIXED-4M"
 )
 
+// DefaultPruneMinContentAge is the default sweep safety window: contents younger
+// than this are never deleted. Protects in-flight multi-RPC backups whose
+// contents are not yet referenced by a committed snapshot record (R2-2).
+// Matches kopia's safety philosophy that SafetyNone otherwise opts out of.
+const DefaultPruneMinContentAge = 24 * time.Hour
+
+// pruneOptions holds resolved Prune settings.
+type pruneOptions struct {
+	minContentAge time.Duration
+	// minAgeSet is true when the caller explicitly set min age (including zero).
+	minAgeSet bool
+}
+
+// PruneOption configures Prune.
+type PruneOption func(*pruneOptions)
+
+// WithMinContentAge sets the minimum age of content eligible for deletion.
+// Contents younger than this are retained (in-flight backup protection).
+// Pass 0 to disable the age guard — required by reclamation tests and the
+// engine gate so young test data can be observed reclaiming. Production and
+// the zero-option Prune(ctx) default to DefaultPruneMinContentAge (24h).
+func WithMinContentAge(d time.Duration) PruneOption {
+	return func(o *pruneOptions) {
+		o.minContentAge = d
+		o.minAgeSet = true
+	}
+}
+
+func resolvePruneOptions(opts []PruneOption) pruneOptions {
+	o := pruneOptions{}
+	for _, fn := range opts {
+		if fn != nil {
+			fn(&o)
+		}
+	}
+	if !o.minAgeSet {
+		o.minContentAge = DefaultPruneMinContentAge
+	}
+	return o
+}
+
 // Vault is the per-machine content-addressed repository interface.
 // Implementations MUST confine all kopia usage behind this boundary.
 //
 // Concurrency: backup/replication share a read lock; prune/verify take exclusive.
-// OpenObject readers must complete before Prune on the same vault (scheduler
-// serializes jobs per-repo in M2+; see REVIEW-M1 M2).
+//
+// Serialization contract (R2-2 / M2):
+//   - Prune must never run concurrently with an open backup session on the same repo.
+//     An in-flight backup uploads contents across many PutContent/WriteObject calls
+//     and only later commits a snapshot record; without structural serialization those
+//     unreferenced young contents would be sweep candidates. DefaultPruneMinContentAge
+//     is a safety net; M2's scheduler must enforce per-repo backup-vs-prune
+//     serialization so the age guard is defense-in-depth, not the only line.
+//   - OpenObject readers must complete before Prune on the same vault (scheduler
+//     serializes jobs per-repo in M2+; see REVIEW-M1 M2).
 type Vault interface {
 	// Close releases repository resources. Subsequent method calls return an error.
 	Close(ctx context.Context) error
@@ -104,6 +164,7 @@ type Vault interface {
 	VerifyObject(ctx context.Context, id ObjectID) ([]ContentID, error)
 
 	// PutSnapshotRecord stores a Breakwater snapshot manifest (labels + JSON payload).
+	// Rejects unknown kinds and unparseable RootObjectID at the write boundary (R2-3/R2-4).
 	PutSnapshotRecord(ctx context.Context, rec SnapshotRecord) (SnapshotRecordID, error)
 
 	// GetSnapshotRecord loads a snapshot record by ID.
@@ -116,9 +177,10 @@ type Vault interface {
 	// call Prune to reclaim unreferenced content.
 	DeleteSnapshotRecord(ctx context.Context, id SnapshotRecordID) error
 
-	// Prune runs retention-aware GC: after forgets, delete unreferenced packs via
-	// kopia maintenance. Server-only; never exposed on the agent port.
-	Prune(ctx context.Context) error
+	// Prune runs mark-and-sweep GC. Default min-content-age is 24h; pass
+	// WithMinContentAge(0) only in tests that must observe reclamation of young data.
+	// Must not run concurrently with an open backup session (see interface comment).
+	Prune(ctx context.Context, opts ...PruneOption) error
 
 	// Stats returns rough repository size information.
 	Stats(ctx context.Context) (VaultStats, error)
@@ -152,12 +214,23 @@ func NewManager(reposDir string) *Manager {
 	}
 }
 
+// isClosed reports whether the vault has been closed (rep nilled).
+func (v *kopiaVault) isClosed() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.rep == nil
+}
+
 // Open returns an existing open vault or opens the repo at reposDir/<repoID>.
+// If a cached instance was closed, it is evicted and re-opened (R2-10).
 func (m *Manager) Open(ctx context.Context, repoID, password string) (Vault, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if v, ok := m.open[repoID]; ok {
-		return v, nil
+		if !v.isClosed() {
+			return v, nil
+		}
+		delete(m.open, repoID)
 	}
 	v, err := openKopiaVault(ctx, m.reposDir, repoID, password)
 	if err != nil {
@@ -168,11 +241,15 @@ func (m *Manager) Open(ctx context.Context, repoID, password string) (Vault, err
 }
 
 // Create initializes a new per-machine repository and opens it.
+// If a cached instance was closed, it is evicted (R2-10).
 func (m *Manager) Create(ctx context.Context, repoID, password string) (Vault, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if v, ok := m.open[repoID]; ok {
-		return v, nil
+		if !v.isClosed() {
+			return v, nil
+		}
+		delete(m.open, repoID)
 	}
 	v, err := createKopiaVault(ctx, m.reposDir, repoID, password)
 	if err != nil {
@@ -180,6 +257,20 @@ func (m *Manager) Create(ctx context.Context, repoID, password string) (Vault, e
 	}
 	m.open[repoID] = v
 	return v, nil
+}
+
+// Close removes a vault from the cache and closes it (R2-10).
+func (m *Manager) Close(ctx context.Context, repoID string) error {
+	m.mu.Lock()
+	v, ok := m.open[repoID]
+	if ok {
+		delete(m.open, repoID)
+	}
+	m.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	return v.Close(ctx)
 }
 
 // CloseAll closes every open vault.

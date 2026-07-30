@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,7 +13,8 @@ import (
 
 func TestPruneReclaimsForgottenContent(t *testing.T) {
 	ctx := context.Background()
-	mgr := vault.NewManager(t.TempDir())
+	reposDir := t.TempDir()
+	mgr := vault.NewManager(reposDir)
 	defer mgr.CloseAll(ctx)
 	v, err := mgr.Create(ctx, "d1", "pw")
 	if err != nil {
@@ -31,7 +33,10 @@ func TestPruneReclaimsForgottenContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadPayload := bytes.Repeat([]byte("DEAD-DATA-BBBB"), 200)
+	// Large incompressible dead payload so on-disk pack reclamation is measurable (R2-13).
+	// Repeating strings compress to nearly nothing under zstd and hide real GC.
+	deadPayload := make([]byte, 1<<20) // 1 MiB
+	fillDeterministic(deadPayload, 0xdead)
 	deadOID, err := v.WriteObject(ctx, vault.SplitterFixed4M, bytes.NewReader(deadPayload))
 	if err != nil {
 		t.Fatal(err)
@@ -47,18 +52,23 @@ func TestPruneReclaimsForgottenContent(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	repoPath := filepath.Join(reposDir, "d1")
+	beforeDisk := diskBytes(t, repoPath)
 	before, _ := v.Stats(ctx)
 	if err := v.DeleteSnapshotRecord(ctx, deadSnap); err != nil {
 		t.Fatal(err)
 	}
-	if err := v.Prune(ctx); err != nil {
+	// Reclamation tests opt into zero min-age so young test data is eligible.
+	if err := pruneForTest(ctx, v); err != nil {
 		t.Fatal(err)
 	}
 	after, _ := v.Stats(ctx)
-	t.Logf("user contents %d/%d -> %d/%d (all contents %d -> %d)",
+	afterDisk := diskBytes(t, repoPath)
+	t.Logf("user contents %d/%d -> %d/%d (all contents %d -> %d); disk %d -> %d",
 		before.UserContentCount, before.UserSizeBytes,
 		after.UserContentCount, after.UserSizeBytes,
-		before.ContentCount, after.ContentCount)
+		before.ContentCount, after.ContentCount,
+		beforeDisk, afterDisk)
 
 	has, err := v.HasContents(ctx, deadCIDs)
 	if err != nil {
@@ -88,5 +98,14 @@ func TestPruneReclaimsForgottenContent(t *testing.T) {
 	}
 	if after.UserSizeBytes >= before.UserSizeBytes {
 		t.Fatalf("user size did not shrink: %d -> %d", before.UserSizeBytes, after.UserSizeBytes)
+	}
+	// R2-13: assert actual on-disk bytes shrink, not only index stats.
+	if afterDisk >= beforeDisk {
+		t.Fatalf("on-disk bytes did not shrink after prune: %d -> %d", beforeDisk, afterDisk)
+	}
+	// Material shrinkage: at least half the dead payload should leave disk
+	// (packs/indexes have overhead; require a meaningful decrease).
+	if saved := beforeDisk - afterDisk; saved < int64(len(deadPayload))/4 {
+		t.Fatalf("on-disk reclamation too small: saved %d bytes, dead payload %d", saved, len(deadPayload))
 	}
 }

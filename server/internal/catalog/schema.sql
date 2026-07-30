@@ -176,5 +176,6 @@ CREATE TABLE IF NOT EXISTS keystore (
     repo_id             TEXT PRIMARY KEY,      -- machine repo id
     repo_password_enc   BLOB NOT NULL,
     hashing_key_enc     BLOB NOT NULL,
+    hashing_algorithm   TEXT NOT NULL DEFAULT '', -- e.g. BLAKE2B-256-128 (R2-5)
     created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );

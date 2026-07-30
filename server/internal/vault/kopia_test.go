@@ -108,8 +108,9 @@ func TestEngineGate_Kopia(t *testing.T) {
 	t.Logf("snapshot record: %s", recID)
 
 	// Second smaller snapshot that we will forget (retention exercise).
-	// Unique payload so content is not shared with the live object.
-	small := bytes.Repeat([]byte("orphan-payload-for-gc-UNIQUE-"), 64<<10)
+	// Incompressible unique payload so on-disk reclamation is measurable (R2-13).
+	small := make([]byte, 4<<20) // 4 MiB
+	fillDeterministic(small, 0x0f0f0f0f0f0f0f0f)
 	smallOID, err := v.WriteObject(ctx, vault.SplitterFixed4M, bytes.NewReader(small))
 	if err != nil {
 		t.Fatalf("WriteObject small: %v", err)
@@ -219,7 +220,11 @@ func TestEngineGate_Kopia(t *testing.T) {
 	t.Logf("stats before prune: user_contents=%d user_size=%d all=%d",
 		before.UserContentCount, before.UserSizeBytes, before.ContentCount)
 
-	if err := v.Prune(ctx); err != nil {
+	repoPath := filepath.Join(reposDir, repoID)
+	beforeDisk := diskBytes(t, repoPath)
+
+	// Engine gate opts into zero min-age to observe reclamation of young test data (R2-2).
+	if err := v.Prune(ctx, vault.WithMinContentAge(0)); err != nil {
 		t.Fatalf("Prune/GC: %v", err)
 	}
 	t.Logf("Prune completed")
@@ -275,8 +280,15 @@ func TestEngineGate_Kopia(t *testing.T) {
 		t.Fatalf("reclamation failed: user size did not shrink (%d → %d)",
 			before.UserSizeBytes, after.UserSizeBytes)
 	}
-	t.Logf("reclamation OK: user contents %d→%d user size %d→%d",
-		before.UserContentCount, after.UserContentCount, before.UserSizeBytes, after.UserSizeBytes)
+	// R2-13: on-disk bytes must shrink (not only index stats).
+	afterDisk := diskBytes(t, repoPath)
+	t.Logf("disk bytes before=%d after=%d", beforeDisk, afterDisk)
+	if afterDisk >= beforeDisk {
+		t.Fatalf("on-disk bytes did not shrink after prune: %d → %d", beforeDisk, afterDisk)
+	}
+	t.Logf("reclamation OK: user contents %d→%d user size %d→%d disk %d→%d",
+		before.UserContentCount, after.UserContentCount, before.UserSizeBytes, after.UserSizeBytes,
+		beforeDisk, afterDisk)
 
 	// Re-open from disk (crash recovery path)
 	if err := mgr.CloseAll(ctx); err != nil {
@@ -357,7 +369,7 @@ func TestVault_SmallRoundTrip(t *testing.T) {
 	if err := v.DeleteSnapshotRecord(ctx, sid); err != nil {
 		t.Fatalf("DeleteSnapshotRecord: %v", err)
 	}
-	if err := v.Prune(ctx); err != nil {
+	if err := v.Prune(ctx, vault.WithMinContentAge(0)); err != nil {
 		t.Fatalf("Prune: %v", err)
 	}
 }
