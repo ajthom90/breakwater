@@ -809,13 +809,17 @@ The untested-on-Windows list (stage 4) remains the gating checklist for that cla
 | Vendor kopia; v0.23 on Go 1.25+ | M1 decision #7 |
 | Optional keystore `hashing_algorithm` backfill | R3-4 pre-eea1a46 rows |
 | Directory sharding vs `MaxMarkObjectBytes` | Scale note for huge trees |
-| First `windows-latest` green run | Closes untested-on-Windows list |
+| Windows **runtime** validation (VM required) | `windows-latest` CI is green (run `30581280420`) and closed the *build/test* items only. A build runner cannot prove `msiexec` install, SCM lifecycle, real-box ACLs, or volume inventory — those need a Windows VM with an actual install. **A green Windows CI run is not a proven MSI install.** |
 | VSS / SeBackupPrivilege | Not stage 4/5 scope; later Phase 1 |
 
 ### Next after M2
 
-- M3+ Phase 1: restore path, schedules/retention UI, alerts, scrub
-- First Windows CI/VM validation of the stage-4 untested list
+- **M3 (PLAN wk5-6): VSS wired in** — full C: from shadow device, exclusion
+  defaults, guaranteed snapshot cleanup on every exit path, `vsscheck.exe`
+  diagnostics. Note this milestone is almost entirely Windows-runtime work, so it
+  is gated on a Windows VM being available — CI alone cannot validate it.
+- Windows **VM** validation of the remaining untested-runtime items (8 open;
+  see "Windows CI vs still-unproven runtime")
 - M6: real web auth replacing the dev token middleware
 
 ---
