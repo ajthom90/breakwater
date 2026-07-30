@@ -18,14 +18,22 @@ import (
 	"github.com/kopia/kopia/repo/manifest"
 	"github.com/kopia/kopia/repo/object"
 
+	"github.com/ajthom90/breakwater/pkg/contentid"
 	"github.com/ajthom90/breakwater/pkg/format"
 )
 
 // MaxPutContentBytes is the maximum payload for PutContent.
 // Aligned with DYNAMIC-4M-BUZHASH MaxSegmentSize (8 MiB) so agent-side CDC chunks
-// can be uploaded via PutContents. Image fixed blocks remain 4 MiB (FIXED-4M).
-// M2 stage 3: raised from 4 MiB (FIXED-4M single-block) to accept CDC segments.
+// can be uploaded via PutContents. Image fixed blocks remain 4 MiB (FIXED-4M /
+// ImageBlockSizeBytes on the data plane).
+//
+// H2 amendment (M2-S3 / S3-F4): originally 4 MiB (one FIXED-4M block). Raised to
+// 8 MiB so DYNAMIC-4M max segments fit; image path enforces 4 MiB separately.
 const MaxPutContentBytes = 8 << 20 // 8 MiB
+
+// SplitterFixed8M is a single-segment fixed splitter for PutContent payloads
+// up to MaxPutContentBytes (S3-F4: named constant, not a bare string).
+const SplitterFixed8M = "FIXED-8M"
 
 // MaxMarkObjectBytes caps how much of a tree/image root the mark phase reads into
 // memory (R3-2). Real TreeObject / ImageManifest JSON is far smaller; a root
@@ -237,7 +245,7 @@ func (v *kopiaVault) PutContent(ctx context.Context, data []byte) (ContentID, er
 			// (kopia's WriteContent takes internal gather.Bytes; object path is the public API.)
 			// No object-layer compressor: content ID must match agent plaintext keyed hash.
 			ow := w.NewObjectWriter(ctx, object.WriterOptions{
-				Splitter: "FIXED-8M",
+				Splitter: SplitterFixed8M,
 			})
 			if _, err := ow.Write(data); err != nil {
 				_ = ow.Close()
@@ -265,6 +273,53 @@ func (v *kopiaVault) PutContent(ctx context.Context, data []byte) (ContentID, er
 			return nil
 		})
 	return contentID, err
+}
+
+// ComputeContentID returns the content ID PutContent would produce without writing (S3-F3).
+func (v *kopiaVault) ComputeContentID(ctx context.Context, data []byte) (ContentID, error) {
+	if len(data) > MaxPutContentBytes {
+		return "", fmt.Errorf("ComputeContentID: payload %d bytes exceeds max %d", len(data), MaxPutContentBytes)
+	}
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if err := v.requireOpen(); err != nil {
+		return "", err
+	}
+	secret, algo, err := v.hashingParamsLocked()
+	if err != nil {
+		return "", err
+	}
+	id, err := computeContentIDString(algo, secret, data)
+	if err != nil {
+		return "", err
+	}
+	return ContentID(id), nil
+}
+
+// hashingParamsLocked returns hashing secret+algo; caller must hold v.mu.
+func (v *kopiaVault) hashingParamsLocked() (secret []byte, algorithm string, err error) {
+	if err := v.requireOpen(); err != nil {
+		return nil, "", err
+	}
+	dr, ok := v.rep.(repo.DirectRepository)
+	if !ok {
+		return nil, "", fmt.Errorf("hashing key requires direct repository")
+	}
+	cf := dr.ContentReader().ContentFormat()
+	sec := cf.GetHmacSecret()
+	out := make([]byte, len(sec))
+	copy(out, sec)
+	return out, cf.GetHashFunction(), nil
+}
+
+// computeContentIDString uses pkg/contentid so server re-computation matches
+// the agent have/want IDs bit-for-bit (S3-F3 / R2-14).
+func computeContentIDString(algo string, secret, payload []byte) (string, error) {
+	h, err := contentid.New(algo, secret)
+	if err != nil {
+		return "", err
+	}
+	return h.ContentID(payload)
 }
 
 // ObjectFromContents builds a readable object from content IDs already stored

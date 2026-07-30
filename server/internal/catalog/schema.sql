@@ -66,7 +66,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id              TEXT PRIMARY KEY,
     machine_id      TEXT REFERENCES machines(id),
     type            TEXT NOT NULL, -- file|image|hyperv|restore|prune|verify|replicate|update
-    state           TEXT NOT NULL DEFAULT 'pending', -- pending|running|success|failed|cancelled
+    state           TEXT NOT NULL DEFAULT 'pending', -- pending|running|cancelling|success|failed|cancelled
     started_at      TEXT,
     finished_at     TEXT,
     bytes_read      INTEGER NOT NULL DEFAULT 0,

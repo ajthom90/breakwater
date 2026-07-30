@@ -369,44 +369,71 @@ backup proven by fake agent. Windows agent (stage 4) reuses `pkg/backup` as a li
 | F4 failure-result hardening | ✅ | `TestS2F4_ResultIgnoredForPendingJob` covers Success+Failure |
 | **Demo** `TestM2S3_BackupDedupDemo` | ✅ | PASS under `-race` |
 
-#### Decisions (stage 3)
+#### Decisions (stage 3 + fix round)
 
-1. **kopia confinement amendment (PLAN-sanctioned):** `pkg/contentid` may import
-   `repo/hashing` + `repo/splitter` only (pure-Go). Enforced by
-   `TestKopiaConfinement_PkgOnlyContentID`. Vault still owns content/object/manifest/maintenance.
-2. **MaxPutContentBytes = 8 MiB** (DYNAMIC-4M max segment), up from 4 MiB FIXED-4M.
-   gRPC MaxRecv/SendMsgSize = 16 MiB on :9443. Image fixed blocks remain 4 MiB.
-3. **ObjectFromContents** via vault `ConcatenateObjects` for multi-chunk files after
-   have/want PutContents (no payload re-upload). Wire: ephemeral PutTreeObject
-   sentinel entry name `.bw-object-from-contents` (not stored as a tree) —
-   freezes no new proto field under the frozen contract.
-4. **Backup library in `pkg/backup`** (not `agent/internal` only) so server demo
-   tests share it; agent/internal/fileback re-exports for stage-4 discoverability.
-5. **Cancel for vault-writing jobs:** running → `cancelling`, JobCancel sent, lease
-   held until JobResult or disconnect (S2-F6 stage-3 contract).
+1. **kopia confinement (PLAN carve-out, S3-F7 expanded):** `pkg/contentid` may import
+   `repo/hashing` + `repo/splitter` only. Enforced across **pkg + agent + cli** by
+   `TestKopiaConfinement` (CI wired). Vault still owns content/object/manifest/maintenance.
+2. **H2 amendment — MaxPutContentBytes = 8 MiB** (DYNAMIC-4M max segment), up from
+   4 MiB FIXED-4M. Named `SplitterFixed8M`. gRPC MaxRecv/SendMsgSize = 16 MiB.
+   **Image blocks stay 4 MiB** — `PutImageManifest` rejects other `block_size` (S3-F4).
+3. **ObjectFromContents wire (S3-F1):** additive `PutTreeObjectRequest.content_ids = 3`
+   (mutually exclusive with `tree_json`). **Sentinel deleted** — no in-band magic names.
+4. **Backup library in `pkg/backup`**; agent/internal/fileback re-exports.
+5. **Cancel for vault-writing jobs:** running → `cancelling`, lease held until JobResult,
+   disconnect, or **CancelConfirmTimeout (2 min, S3-F10)** force-fail + lease release.
+6. **tryDispatch claim-before-lease (S3-F9):** pending→running CAS first; only the winner
+   acquires Shared. Concurrent DeliverPending cannot leak leases.
+7. **Per-file error policy (fail-loud):** I/O errors abort the job. Symlinks stored as
+   `EntrySymlink`+`ReparseData`. Unsupported types recorded in `Stats.Skipped` (visible).
+   A backup never reports success while silently omitting data (S3-F5).
 
-#### Red-first (security boundaries)
+#### Fix round S3-F1…F10 (post-24300b1 review)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| S3-F1 | ✅ Fixed | additive `content_ids`; sentinel deleted; `TestS3F1_*` |
+| S3-F2 | ✅ Fixed | per-message lease re-check in PutContents |
+| S3-F3 | ✅ Fixed | `ComputeContentID` then write; mismatch leaves Stats unchanged |
+| S3-F4 | ✅ Fixed | `SplitterFixed8M`; H2 amendment doc; image 4 MiB enforce |
+| S3-F5 | ✅ Fixed | symlink entries + Skipped; pkg/backup unit tests |
+| S3-F6 | ✅ Fixed | 10 MiB multi-chunk case asserts `len(ids)>1` |
+| S3-F7 | ✅ Fixed | confinement walks pkg/agent/cli; CI step |
+| S3-F8 | ✅ Fixed | `TestS3F8_SplitterBoundaryIdentityWithWriteObject` |
+| S3-F9 | ✅ Fixed | CAS before lease; concurrent + stress tests |
+| S3-F10 | ✅ Fixed | CancelConfirmTimeout force-fail |
+
+##### Red-first against unmodified `24300b1` (fix-round findings)
 
 ```
-=== RUN   TestM2S3_CrossMachineIsolation
-    … B with A's job → PermissionDenied; B CheckContents of A's content id → absent
---- PASS (after structural machine+lease checks)
+=== RUN   TestS3F1_SentinelNamedFileRestoresByteIdentical
+    … missing restored path / decode tree … invalid character 'r'
+--- FAIL (job success, restore broken)
 
-=== RUN   TestM2S3_IDMismatchRejected
-    … content id mismatch: client=0000… server=<real>
---- PASS
+=== RUN   TestS3F9_ConcurrentDispatchNoLeaseLeak
+    … LEASE LEAK: after terminal shared=1 exclusive=0  (or no lease tracked while running)
+--- FAIL
 
-=== RUN   TestM2S3_OversizedBatchAndContentRejected
-    … batch 4097 exceeds max 4096; payload 8388609 exceeds max 8388608
---- PASS
+=== RUN   TestS3F5_SymlinksPresentInSnapshot
+    … symlinks silently missing from tree
+--- FAIL
 
-=== RUN   TestM2S3_LeaseRequiredForVaultAccess
-    … no vault lease held for job (FailedPrecondition)
---- PASS
+=== RUN   TestS3F2_CancelMidPutContentsRejectsSubsequent
+    … PutContents accepted after job terminal
+--- FAIL
 
-=== RUN   TestS2F4 … failure path
-    ignoring JobResult for non-running job state=pending  (success then failure)
---- PASS
+=== RUN   TestS3F3_MismatchLeavesRepoUnchanged
+    … mismatch wrote to vault: user_contents before=N after=N+1
+--- FAIL
+```
+
+##### After fixes
+
+```
+TestS3F1… TestS3F2… TestS3F3… TestS3F5… TestS3F9… TestS3F10…  # PASS
+TestM2S3_BackupDedupDemo  # PASS
+gofmt / go vet / short+race / gate 256MB / pkg / agent  # green
+grep bw-object-from-contents server/ pkg/ agent/  # exit 1 (gone)
 ```
 
 #### Demo numbers
@@ -418,18 +445,17 @@ dedup ratio run2/run1 ≈ 0.0003%  (≪ 5% criterion)
 After forget snap1 + prune min-age 0: snap2 fully restorable
 ```
 
-#### Verification (stage 3)
+#### Verification (stage 3 + fix round)
 
 ```
 gofmt -l server pkg agent cli restore   # empty
 go vet ./...                            # clean
 go test ./... -short -race              # all ok
-go test ./internal/scheduler/ ./internal/agentgw/ -race  # PASS incl. M2S3_*
+go test ./internal/scheduler/ ./internal/agentgw/ -race  # PASS incl. S3F* + M2S3_*
 BW_GATE_BYTES=268435456 TestEngineGate_Kopia  # PASS
-full 10 GiB TestEngineGate_Kopia              # PASS (~130s)
 pkg + agent tests                             # PASS
+grep bw-object-from-contents …                # exit 1
 ```
-
 ---
 
 ## Next: M2 remaining (weeks 3–4)

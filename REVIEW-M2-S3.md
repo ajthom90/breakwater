@@ -150,6 +150,25 @@ The documented release conditions for a cancelling vault-writing job are "agent 
 - `schema.sql:69` state comment not updated to include `cancelling` (no CHECK constraint; cosmetic).
 - `Engine.Cancel` ignores `SendJobCancel`'s `sent` bool; `Registry.send` never returns a non-nil error, so a queue-full channel silently drops the JobCancel while the job still enters `cancelling` — unlike JobStart, there is no redelivery. Worth a follow-up given S3-F10.
 
+---
+
+## Fix dispositions (post-24300b1)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| S3-F1 | ✅ Fixed | Additive `content_ids=3` on PutTreeObjectRequest; sentinel path deleted; adversarial-filename restore test |
+| S3-F2 | ✅ Fixed | PutContents re-validates lease via vaultForJobRPC every message |
+| S3-F3 | ✅ Fixed | Vault.ComputeContentID before PutContent; Stats unchanged on mismatch |
+| S3-F4 | ✅ Fixed | SplitterFixed8M constant; H2 amendment in PROGRESS; PutImageManifest block_size=4MiB |
+| S3-F5 | ✅ Fixed | EntrySymlink + ReparseData; Stats.Skipped for unsupported; fail-loud I/O policy; unit tests |
+| S3-F6 | ✅ Fixed | 10 MiB case + assert len(ids)>1 |
+| S3-F7 | ✅ Fixed | Confinement walks pkg/agent/cli; CI step |
+| S3-F8 | ✅ Fixed | WriteObject(DYNAMIC) content-ID sequence identity test |
+| S3-F9 | ✅ Fixed | pending→running CAS before lease acquire; concurrent + stress lock accounting |
+| S3-F10 | ✅ Fixed | CancelConfirmTimeout (default 2m) force-fails cancelling jobs + releases lease |
+| schema cancelling comment | ✅ Fixed | schema.sql state comment includes cancelling |
+
+Red-first captures and after-fix evidence: see `PROGRESS.md` stage-3 fix round.
 ## Consolidated fix order (supersedes the earlier section)
 
 1. **Red-first tests:** S3-F1 (sentinel-named dir → restore must work), S3-F9 (concurrent dispatch → locks return to zero), S3-F5 (symlinks visible), S3-F2 (cancel mid-stream), S3-F3 (mismatch leaves repo unchanged).

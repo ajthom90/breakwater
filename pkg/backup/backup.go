@@ -6,8 +6,16 @@
 // Windows APIs here.
 //
 // Pipeline (PLAN M2): walk bottom-up → CDC split (pkg/contentid) → have/want
-// CheckContents → PutContents misses → ObjectFromContents (via PutTreeObject
-// sentinel for multi-chunk) → per-dir TreeObject → CommitSnapshot.
+// CheckContents → PutContents misses → PutObjectFromContents (content_ids) →
+// per-dir TreeObject → CommitSnapshot.
+//
+// Error policy (M2-S3 decision, fail-loud):
+//   - I/O errors reading a file/dir abort the whole job (no partial success).
+//   - Symlinks are stored as format.EntrySymlink with the target in ReparseData.
+//   - Unsupported types (devices, sockets, …) are recorded in Stats.Skipped and
+//     the job continues — skips are always visible, never silent (S3-F5).
+//
+// A backup never reports success while silently omitting data.
 package backup
 
 import (
@@ -18,7 +26,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/ajthom90/breakwater/pkg/contentid"
@@ -30,6 +37,12 @@ import (
 // ProgressFunc reports backup progress (bytes done/total, phase).
 type ProgressFunc func(bytesDone, bytesTotal int64, phase, message string)
 
+// SkipRecord describes an entry deliberately not backed up as file content.
+type SkipRecord struct {
+	Path   string
+	Reason string // e.g. "device", "socket", "named_pipe"
+}
+
 // Stats are returned after a successful backup.
 type Stats struct {
 	BytesRead     int64
@@ -37,6 +50,8 @@ type Stats struct {
 	BytesStored   int64 // same as uploaded for agent accounting
 	Files         int
 	Dirs          int
+	Symlinks      int
+	Skipped       []SkipRecord // always visible when non-empty (S3-F5)
 	SnapshotID    string
 	ManifestRef   string
 	RootObjectID  string
@@ -91,17 +106,19 @@ func Run(ctx context.Context, opts Options) (*Stats, error) {
 	}
 	defer sp.Close()
 
-	// Pre-scan total bytes for progress.
+	// Pre-scan total bytes for progress (regular files only; symlinks have no payload).
 	var totalBytes int64
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+		if err != nil {
 			return err
 		}
 		info, err := d.Info()
 		if err != nil {
 			return nil
 		}
-		totalBytes += info.Size()
+		if info.Mode().IsRegular() {
+			totalBytes += info.Size()
+		}
 		return nil
 	})
 
@@ -147,7 +164,7 @@ func backupDir(ctx context.Context, opts Options, sp *contentid.Splitter, root, 
 ) (objectID string, err error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return "", err
+		return "", err // fail-loud
 	}
 	// Stable order for deterministic trees.
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
@@ -156,45 +173,63 @@ func backupDir(ctx context.Context, opts Options, sp *contentid.Splitter, root, 
 	for _, ent := range entries {
 		name := ent.Name()
 		path := filepath.Join(dir, name)
-		if ent.IsDir() {
+		info, err := ent.Info() // Lstat — does not follow symlinks
+		if err != nil {
+			return "", fmt.Errorf("stat %s: %w", path, err)
+		}
+
+		// Symlinks first (ModeSymlink bit; IsDir/IsRegular false for links).
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return "", fmt.Errorf("readlink %s: %w", path, err)
+			}
+			treeEntries = append(treeEntries, format.TreeEntry{
+				Name:        name,
+				Type:        format.EntrySymlink,
+				MtimeNS:     info.ModTime().UnixNano(),
+				ReparseData: target,
+			})
+			stats.Symlinks++
+			report("symlink", path)
+			continue
+		}
+
+		if info.IsDir() {
 			childOID, err := backupDir(ctx, opts, sp, root, path, stats, bytesDone, totalBytes, report)
 			if err != nil {
 				return "", err
 			}
-			info, _ := ent.Info()
-			te := format.TreeEntry{Name: name, Type: format.EntryDir, ObjectID: childOID}
-			if info != nil {
-				te.MtimeNS = info.ModTime().UnixNano()
-			}
+			te := format.TreeEntry{Name: name, Type: format.EntryDir, ObjectID: childOID, MtimeNS: info.ModTime().UnixNano()}
 			treeEntries = append(treeEntries, te)
 			stats.Dirs++
 			continue
 		}
-		// Regular file (symlinks treated as files with content of target path — portable MVP).
-		info, err := ent.Info()
-		if err != nil {
-			return "", err
-		}
-		if !info.Mode().IsRegular() {
-			// Skip non-regular (devices, sockets) in portable MVP.
+
+		if info.Mode().IsRegular() {
+			fileOID, n, uploaded, err := backupFile(ctx, opts, sp, path)
+			if err != nil {
+				return "", fmt.Errorf("file %s: %w", path, err)
+			}
+			*bytesDone += n
+			stats.BytesRead += n
+			stats.BytesUploaded += uploaded
+			stats.Files++
+			report("file", path)
+			treeEntries = append(treeEntries, format.TreeEntry{
+				Name:     name,
+				Type:     format.EntryFile,
+				Size:     info.Size(),
+				MtimeNS:  info.ModTime().UnixNano(),
+				ObjectID: fileOID,
+			})
 			continue
 		}
-		fileOID, n, uploaded, err := backupFile(ctx, opts, sp, path)
-		if err != nil {
-			return "", fmt.Errorf("file %s: %w", path, err)
-		}
-		*bytesDone += n
-		stats.BytesRead += n
-		stats.BytesUploaded += uploaded
-		stats.Files++
-		report("file", path)
-		treeEntries = append(treeEntries, format.TreeEntry{
-			Name:     name,
-			Type:     format.EntryFile,
-			Size:     info.Size(),
-			MtimeNS:  info.ModTime().UnixNano(),
-			ObjectID: fileOID,
-		})
+
+		// Unsupported types: visible skip (S3-F5), never silent.
+		reason := skipReason(info.Mode())
+		stats.Skipped = append(stats.Skipped, SkipRecord{Path: path, Reason: reason})
+		report("skip", path+" ("+reason+")")
 	}
 
 	tree := format.TreeObject{Version: format.FormatVersion, Entries: treeEntries}
@@ -207,6 +242,21 @@ func backupDir(ctx context.Context, opts Options, sp *contentid.Splitter, root, 
 		return "", fmt.Errorf("PutTreeObject %s: %w", dir, err)
 	}
 	return oid, nil
+}
+
+func skipReason(m os.FileMode) string {
+	switch m & os.ModeType {
+	case os.ModeDevice:
+		return "device"
+	case os.ModeNamedPipe:
+		return "named_pipe"
+	case os.ModeSocket:
+		return "socket"
+	case os.ModeCharDevice:
+		return "char_device"
+	default:
+		return "unsupported"
+	}
 }
 
 func backupFile(ctx context.Context, opts Options, sp *contentid.Splitter, path string) (objectID string, bytesRead, uploaded int64, err error) {
@@ -310,21 +360,9 @@ func (c *GRPCClient) PutContent(ctx context.Context, jobID, contentID string, da
 }
 
 func (c *GRPCClient) PutObjectFromContents(ctx context.Context, jobID string, contentIDs []string) (string, error) {
-	// Ephemeral sentinel tree (not stored) — server ObjectFromContents.
-	tree := format.TreeObject{
-		Version: format.FormatVersion,
-		Entries: []format.TreeEntry{{
-			Name:     ".bw-object-from-contents",
-			Type:     format.EntryFile,
-			ObjectID: strings.Join(contentIDs, ","),
-		}},
-	}
-	raw, err := json.Marshal(tree)
-	if err != nil {
-		return "", err
-	}
+	// S3-F1: first-class content_ids field — no sentinel tree hack.
 	resp, err := c.DS.PutTreeObject(ctx, &breakwaterv1.PutTreeObjectRequest{
-		JobId: jobID, TreeJson: raw,
+		JobId: jobID, ContentIds: contentIDs,
 	})
 	if err != nil {
 		return "", err

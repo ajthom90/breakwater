@@ -71,7 +71,7 @@ func TestM2S3_CrossMachineIsolation(t *testing.T) {
 	}
 	t.Logf("B with A's job rejected: %v", err)
 
-	// B tries PutContents with A's job → PermissionDenied.
+	// B tries PutContents with A's job → rejected (ack accepted=false and/or stream error).
 	stream, err := dataB.PutContents(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -79,19 +79,18 @@ func TestM2S3_CrossMachineIsolation(t *testing.T) {
 	_ = stream.Send(&breakwaterv1.PutContentsRequest{
 		JobId: jobA, ContentId: "x", Data: []byte("stolen"),
 	})
-	_, err = stream.Recv()
-	if err == nil {
-		// May get error on Recv after server rejects.
-		t.Fatal("B PutContents with A's job must fail")
+	ack, err := stream.Recv()
+	if err == nil && ack != nil && ack.GetAccepted() {
+		t.Fatal("B PutContents with A's job must not be accepted")
 	}
-	if status.Code(err) != codes.PermissionDenied && status.Code(err) != codes.Unknown {
-		// stream may wrap as Unknown; check message
-		t.Logf("B PutContents err code=%v: %v", status.Code(err), err)
+	if err != nil {
+		if status.Code(err) != codes.PermissionDenied && status.Code(err) != codes.Unknown {
+			t.Logf("B PutContents err code=%v: %v", status.Code(err), err)
+		}
+		t.Logf("B PutContents with A's job rejected: %v", err)
+	} else {
+		t.Logf("B PutContents with A's job rejected: accepted=false msg=%s", ack.GetErrorMessage())
 	}
-	if status.Code(err) == codes.OK {
-		t.Fatal("expected rejection")
-	}
-	t.Logf("B PutContents with A's job rejected: %v", err)
 
 	// B with its own pending (no lease) job cannot use CheckContents either.
 	// Give B a running file job of its own for content-id oracle test: B must
@@ -122,11 +121,11 @@ func TestM2S3_CrossMachineIsolation(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = streamA.CloseSend()
-	ack, err := streamA.Recv()
-	if err != nil || !ack.GetAccepted() {
-		t.Fatalf("A PutContents: err=%v ack=%v", err, ack)
+	ackA, err := streamA.Recv()
+	if err != nil || !ackA.GetAccepted() {
+		t.Fatalf("A PutContents: err=%v ack=%v", err, ackA)
 	}
-	secretID := ack.GetContentId()
+	secretID := ackA.GetContentId()
 	t.Logf("A stored secret content id=%s", secretID)
 
 	// B CheckContents for A's content id must report absent (own empty repo).

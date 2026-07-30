@@ -41,12 +41,17 @@ type Engine struct {
 
 	// MaxPending is the offline queue bound; defaults to MaxPendingJobsPerMachine.
 	MaxPending int
+	// CancelTimeout bounds how long cancelling vault jobs hold a lease (S3-F10).
+	// Zero means CancelConfirmTimeout.
+	CancelTimeout time.Duration
 
 	mu sync.Mutex
 	// leases held by in-flight jobs (jobID → Lease). Released on terminal or disconnect.
 	leases map[string]Lease
 	// runningByMachine tracks agent job IDs currently running per machine (for disconnect).
 	runningByMachine map[string]map[string]struct{}
+	// cancelTimers force-fail cancelling jobs after CancelTimeout (S3-F10).
+	cancelTimers map[string]*time.Timer
 }
 
 // NewEngine constructs a job engine. locks may be shared with vault Close/Open callers.
@@ -64,6 +69,7 @@ func NewEngine(db *catalog.DB, locks *RepoLocks, log *slog.Logger) *Engine {
 		MaxPending:       MaxPendingJobsPerMachine,
 		leases:           make(map[string]Lease),
 		runningByMachine: make(map[string]map[string]struct{}),
+		cancelTimers:     make(map[string]*time.Timer),
 	}
 }
 
@@ -135,6 +141,10 @@ func (e *Engine) Submit(ctx context.Context, req SubmitRequest) (jobID string, e
 // running or terminal, no-op. Does NOT re-send JobStart for running jobs that were
 // actually delivered (reconnect idempotency). Undelivered JobStarts are reverted
 // to pending by RevertUndeliveredJobStarts (S2-F2).
+//
+// S3-F9: claim the job with pending→running CAS **before** acquiring the lease.
+// Concurrent DeliverPending/Submit cannot both acquire Shared for the same job
+// (which would overwrite the lease map and leak a lock forever).
 func (e *Engine) tryDispatch(ctx context.Context, jobID string) error {
 	j, err := e.DB.JobByID(ctx, jobID)
 	if err != nil {
@@ -150,33 +160,39 @@ func (e *Engine) tryDispatch(ctx context.Context, jobID string) error {
 		return fmt.Errorf("job type %q is not agent-dispatchable", j.Type)
 	}
 
-	repoID := j.MachineID
-	if mode, ok := LockModeForJobType(j.Type); ok {
-		// Non-blocking / short-timeout (M2-S3): if prune holds exclusive, leave
-		// the job pending and do not stall DeliverPending for other jobs.
-		lease, err := e.tryAcquireLease(ctx, repoID, mode, jobID)
-		if err != nil {
-			e.Log.Info("dispatch deferred: repo lease unavailable",
-				"job_id", jobID, "repo_id", repoID, "mode", mode.String(), "err", err)
-			return nil // stays pending; heartbeat/retrigger will retry
-		}
-		e.mu.Lock()
-		e.leases[jobID] = lease
-		e.mu.Unlock()
-	}
-
+	// Atomic claim first (S3-F9): only one goroutine may proceed to lease acquisition.
 	applied, err := e.DB.TransitionJob(ctx, jobID,
 		[]string{catalog.JobStatePending},
 		catalog.JobStateRunning,
 		catalog.JobTransition{SetStarted: true},
 	)
 	if err != nil {
-		e.releaseLease(jobID)
 		return err
 	}
 	if !applied {
-		e.releaseLease(jobID)
-		return nil
+		return nil // another dispatcher claimed it
+	}
+
+	repoID := j.MachineID
+	if mode, ok := LockModeForJobType(j.Type); ok {
+		// Non-blocking / short-timeout (M2-S3): if prune holds exclusive, revert
+		// to pending and do not stall DeliverPending for other jobs.
+		lease, err := e.tryAcquireLease(ctx, repoID, mode, jobID)
+		if err != nil {
+			e.Log.Info("dispatch deferred: repo lease unavailable",
+				"job_id", jobID, "repo_id", repoID, "mode", mode.String(), "err", err)
+			// Revert claim so a later DeliverPending can retry.
+			e.untrackRunning(j.MachineID, jobID)
+			_, _ = e.DB.TransitionJob(ctx, jobID,
+				[]string{catalog.JobStateRunning},
+				catalog.JobStatePending,
+				catalog.JobTransition{},
+			)
+			return nil
+		}
+		e.mu.Lock()
+		e.leases[jobID] = lease
+		e.mu.Unlock()
 	}
 
 	e.trackRunning(j.MachineID, jobID)
@@ -380,14 +396,20 @@ func (e *Engine) HandleInventory(ctx context.Context, machineID string, items []
 	return e.DB.ReplaceMachineInventory(ctx, machineID, items)
 }
 
+// CancelConfirmTimeout is how long a cancelling vault-writing job may hold its
+// Shared lease waiting for agent JobResult before the server force-fails it
+// (S3-F10). Prevents a hung agent on a live channel from wedging prune forever.
+// Overridable via Engine.CancelTimeout for tests.
+const CancelConfirmTimeout = 2 * time.Minute
+
 // Cancel notifies the agent (when running) and cancels the job.
 //
 // Lease discipline (S2-F6 / M2-S3): for vault-touching job types that are
 // already running, transition to cancelling, send JobCancel, and keep the
-// shared lease until agent confirmation (JobResult) or channel teardown.
-// Releasing the lease while the agent may still write allows prune to race
-// an in-flight backup. Non-vault jobs (inventory/noop) cancel immediately.
-// Pending jobs (never dispatched) cancel immediately with no lease.
+// shared lease until agent confirmation (JobResult), channel teardown, or
+// CancelConfirmTimeout (S3-F10). Releasing the lease while the agent may still
+// write allows prune to race an in-flight backup. Non-vault jobs (inventory/noop)
+// cancel immediately. Pending jobs (never dispatched) cancel immediately with no lease.
 func (e *Engine) Cancel(ctx context.Context, jobID, reason string) error {
 	if reason == "" {
 		reason = "cancelled"
@@ -407,7 +429,7 @@ func (e *Engine) Cancel(ctx context.Context, jobID, reason string) error {
 		return nil
 	}
 
-	// Running vault-writing job: soft-cancel (lease held until result/teardown).
+	// Running vault-writing job: soft-cancel (lease held until result/teardown/timeout).
 	if j.State == catalog.JobStateRunning && HoldsVaultLease(j.Type) {
 		if e.Dispatch != nil && j.MachineID != "" {
 			if _, err := e.Dispatch.SendJobCancel(j.MachineID, jobID, reason); err != nil {
@@ -423,7 +445,9 @@ func (e *Engine) Cancel(ctx context.Context, jobID, reason string) error {
 			return err
 		}
 		if applied {
-			e.Log.Info("job cancelling (lease held until agent confirms)", "job_id", jobID, "reason", reason)
+			e.Log.Info("job cancelling (lease held until agent confirms or timeout)",
+				"job_id", jobID, "reason", reason)
+			e.scheduleCancelDeadline(jobID)
 		}
 		return nil
 	}
@@ -498,6 +522,45 @@ func (e *Engine) HasLease(jobID string) bool {
 	defer e.mu.Unlock()
 	_, ok := e.leases[jobID]
 	return ok
+}
+
+// scheduleCancelDeadline force-fails a cancelling job if the agent never confirms (S3-F10).
+func (e *Engine) scheduleCancelDeadline(jobID string) {
+	timeout := e.CancelTimeout
+	if timeout <= 0 {
+		timeout = CancelConfirmTimeout
+	}
+	e.mu.Lock()
+	if t, ok := e.cancelTimers[jobID]; ok {
+		t.Stop()
+	}
+	e.cancelTimers[jobID] = time.AfterFunc(timeout, func() {
+		e.forceCancelTimeout(jobID)
+	})
+	e.mu.Unlock()
+}
+
+func (e *Engine) clearCancelTimer(jobID string) {
+	e.mu.Lock()
+	if t, ok := e.cancelTimers[jobID]; ok {
+		t.Stop()
+		delete(e.cancelTimers, jobID)
+	}
+	e.mu.Unlock()
+}
+
+func (e *Engine) forceCancelTimeout(jobID string) {
+	ctx := context.Background()
+	j, err := e.DB.JobByID(ctx, jobID)
+	if err != nil || j == nil {
+		return
+	}
+	if j.State != catalog.JobStateCancelling {
+		return
+	}
+	msg := "cancel confirmation timeout: agent did not confirm; lease force-released"
+	e.Log.Error(msg, "job_id", jobID, "machine_id", j.MachineID)
+	_, _ = e.failJob(ctx, jobID, msg)
 }
 
 // Job returns the catalog row (for tests/API).
@@ -593,6 +656,7 @@ func (e *Engine) failJob(ctx context.Context, jobID, msg string) (bool, error) {
 }
 
 func (e *Engine) releaseLease(jobID string) {
+	e.clearCancelTimer(jobID)
 	e.mu.Lock()
 	l, ok := e.leases[jobID]
 	if ok {

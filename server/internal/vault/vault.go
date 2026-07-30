@@ -157,6 +157,11 @@ type Vault interface {
 	// content ID. Larger data must use WriteObject.
 	PutContent(ctx context.Context, data []byte) (ContentID, error)
 
+	// ComputeContentID returns the content ID that PutContent would assign
+	// for data, without writing. Used by DataService to reject ID mismatches
+	// before any vault mutation (S3-F3).
+	ComputeContentID(ctx context.Context, data []byte) (ContentID, error)
+
 	// ObjectFromContents builds an OpenObject-able ObjectID from content IDs
 	// already stored via PutContent. One ID → direct object; multiple →
 	// concatenated indirect object (no payload re-upload).

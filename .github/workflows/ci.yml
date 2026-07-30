@@ -56,6 +56,21 @@ jobs:
         working-directory: pkg
         run: go test ./... -count=1 -race -timeout 5m
 
+      - name: agent unit tests
+        working-directory: agent
+        run: go test ./... -count=1 -race -timeout 5m
+
+      - name: kopia confinement (pkg carve-out only)
+        working-directory: pkg
+        run: go test ./contentid/ -count=1 -run TestKopiaConfinement -v
+
+      - name: no sentinel magic names in data path
+        run: |
+          if grep -rn 'bw-object-from-contents' server/ pkg/ agent/ --include='*.go' | grep -v '_test.go'; then
+            echo "sentinel name still present in non-test code"
+            exit 1
+          fi
+
       - name: Engine gate (reduced — PR/push)
         working-directory: server
         env:

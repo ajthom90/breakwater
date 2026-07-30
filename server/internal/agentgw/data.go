@@ -26,6 +26,9 @@ import (
 // MaxCheckContentsBatch is the have/want batch limit (proto / PLAN).
 const MaxCheckContentsBatch = 4096
 
+// ImageBlockSizeBytes is the fixed block size for image manifests (PLAN FIDX).
+const ImageBlockSizeBytes = 4 << 20 // 4 MiB
+
 // DataServer implements breakwater.v1.DataService — append-only agent data path.
 //
 // Security (structural):
@@ -36,6 +39,8 @@ const MaxCheckContentsBatch = 4096
 //   - Cross-machine isolation: job of machine A is rejected for peer machine B;
 //     HasContents only consults the caller's repo.
 //   - Append-only: only Put/Has/Write/Commit-shaped vault calls.
+//   - PutContents re-validates the lease on every message (S3-F2).
+//   - PutContents computes the content ID before writing (S3-F3).
 type DataServer struct {
 	breakwaterv1.UnimplementedDataServiceServer
 
@@ -83,13 +88,11 @@ func packBitmap(present []bool) []byte {
 }
 
 // PutContents streams content payloads; server re-hashes and rejects mismatches.
+// Lease is re-validated on every message (S3-F2). Content ID is computed before
+// any vault write (S3-F3).
 func (d *DataServer) PutContents(stream breakwaterv1.DataService_PutContentsServer) error {
 	ctx := stream.Context()
-	var (
-		v     vault.Vault
-		jobID string
-		bound bool
-	)
+	var jobID string
 	for {
 		req, err := stream.Recv()
 		if err == io.EOF {
@@ -98,18 +101,23 @@ func (d *DataServer) PutContents(stream breakwaterv1.DataService_PutContentsServ
 		if err != nil {
 			return err
 		}
-		if !bound {
-			var verr error
-			v, jobID, verr = d.vaultForJobRPC(ctx, req.GetJobId())
-			if verr != nil {
-				return verr
-			}
-			bound = true
+		if jobID == "" {
+			jobID = req.GetJobId()
 		} else if req.GetJobId() != "" && req.GetJobId() != jobID {
 			_ = stream.Send(&breakwaterv1.PutContentsResponse{
 				AckSeq: req.GetSeq(), Accepted: false, ErrorMessage: "job_id changed mid-stream",
 			})
 			continue
+		}
+
+		// Per-message lease + job validation (S3-F2): if the job terminated mid-stream
+		// (cancel, disconnect), stop accepting and end cleanly.
+		v, _, verr := d.vaultForJobRPC(ctx, jobID)
+		if verr != nil {
+			_ = stream.Send(&breakwaterv1.PutContentsResponse{
+				AckSeq: req.GetSeq(), Accepted: false, ErrorMessage: verr.Error(),
+			})
+			return verr
 		}
 
 		clientID := req.GetContentId()
@@ -122,14 +130,14 @@ func (d *DataServer) PutContents(stream breakwaterv1.DataService_PutContentsServ
 			continue
 		}
 
-		serverID, err := v.PutContent(ctx, data)
+		// S3-F3: compute expected ID before writing; reject mismatch without vault write.
+		serverID, err := v.ComputeContentID(ctx, data)
 		if err != nil {
 			_ = stream.Send(&breakwaterv1.PutContentsResponse{
 				AckSeq: req.GetSeq(), Accepted: false, ErrorMessage: err.Error(),
 			})
 			continue
 		}
-		// Server re-computes ID via PutContent; reject client mismatch (integrity).
 		if clientID != "" && clientID != string(serverID) {
 			_ = stream.Send(&breakwaterv1.PutContentsResponse{
 				AckSeq: req.GetSeq(), Accepted: false,
@@ -138,28 +146,51 @@ func (d *DataServer) PutContents(stream breakwaterv1.DataService_PutContentsServ
 			})
 			continue
 		}
+
+		storedID, err := v.PutContent(ctx, data)
+		if err != nil {
+			_ = stream.Send(&breakwaterv1.PutContentsResponse{
+				AckSeq: req.GetSeq(), Accepted: false, ErrorMessage: err.Error(),
+			})
+			continue
+		}
 		// Existing ID is a no-op success (dedup) — PutContent is content-addressed.
 		if err := stream.Send(&breakwaterv1.PutContentsResponse{
-			AckSeq: req.GetSeq(), Accepted: true, ContentId: string(serverID),
+			AckSeq: req.GetSeq(), Accepted: true, ContentId: string(storedID),
 		}); err != nil {
 			return err
 		}
 	}
 }
 
-// PutTreeObject stores a directory tree object (JSON) after strict validation.
+// PutTreeObject stores a directory tree object (JSON) OR materializes an object
+// from content_ids already stored via PutContents (S3-F1 first-class field).
+// tree_json and content_ids are mutually exclusive.
 func (d *DataServer) PutTreeObject(ctx context.Context, req *breakwaterv1.PutTreeObjectRequest) (*breakwaterv1.PutTreeObjectResponse, error) {
 	v, _, err := d.vaultForJobRPC(ctx, req.GetJobId())
 	if err != nil {
 		return nil, err
 	}
 	raw := req.GetTreeJson()
-	// Sentinel: materialize object from content IDs already PutContents'd
-	// (multi-chunk file assembly without re-upload). Ephemeral wire convention —
-	// not persisted as a tree. See PROGRESS.md M2-S3 decision.
-	if oid, ok, err := tryObjectFromContentsSentinel(ctx, v, raw); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "object-from-contents: %v", err)
-	} else if ok {
+	cids := req.GetContentIds()
+
+	if len(cids) > 0 && len(raw) > 0 {
+		return nil, status.Error(codes.InvalidArgument, "PutTreeObject: tree_json and content_ids are mutually exclusive")
+	}
+	if len(cids) == 0 && len(raw) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "PutTreeObject: tree_json or content_ids required")
+	}
+
+	// First-class object materialization from content IDs (S3-F1).
+	if len(cids) > 0 {
+		ids := make([]vault.ContentID, len(cids))
+		for i, id := range cids {
+			ids[i] = vault.ContentID(id)
+		}
+		oid, err := v.ObjectFromContents(ctx, ids)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "ObjectFromContents: %v", err)
+		}
 		return &breakwaterv1.PutTreeObjectResponse{ObjectId: string(oid)}, nil
 	}
 
@@ -174,50 +205,8 @@ func (d *DataServer) PutTreeObject(ctx context.Context, req *breakwaterv1.PutTre
 	return &breakwaterv1.PutTreeObjectResponse{ObjectId: string(oid)}, nil
 }
 
-// concatSentinelName is the ephemeral PutTreeObject marker for ObjectFromContents.
-// Not a stored tree shape — rejected by normal tree validation if misused as root.
-const concatSentinelName = ".bw-object-from-contents"
-
-func tryObjectFromContentsSentinel(ctx context.Context, v vault.Vault, raw []byte) (vault.ObjectID, bool, error) {
-	var tree format.TreeObject
-	if err := strictJSONDecode(raw, &tree); err != nil {
-		return "", false, nil // not a tree / not our sentinel — caller validates
-	}
-	if len(tree.Entries) != 1 || tree.Entries[0].Name != concatSentinelName {
-		return "", false, nil
-	}
-	// ObjectID field holds comma-separated content IDs.
-	oidField := tree.Entries[0].ObjectID
-	if oidField == "" {
-		return "", true, fmt.Errorf("empty content id list")
-	}
-	parts := splitComma(oidField)
-	ids := make([]vault.ContentID, len(parts))
-	for i, p := range parts {
-		ids[i] = vault.ContentID(p)
-	}
-	oid, err := v.ObjectFromContents(ctx, ids)
-	return oid, true, err
-}
-
-func splitComma(s string) []string {
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == ',' {
-			if i > start {
-				out = append(out, s[start:i])
-			}
-			start = i + 1
-		}
-	}
-	if start < len(s) {
-		out = append(out, s[start:])
-	}
-	return out
-}
-
 // PutImageManifest stores a fixed-block image manifest after strict validation.
+// Enforces PLAN's 4 MiB fixed-block invariant (S3-F4).
 func (d *DataServer) PutImageManifest(ctx context.Context, req *breakwaterv1.PutImageManifestRequest) (*breakwaterv1.PutImageManifestResponse, error) {
 	v, _, err := d.vaultForJobRPC(ctx, req.GetJobId())
 	if err != nil {
@@ -227,6 +216,10 @@ func (d *DataServer) PutImageManifest(ctx context.Context, req *breakwaterv1.Put
 	var man format.ImageManifest
 	if err := strictJSONDecode(raw, &man); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "manifest_json: %v", err)
+	}
+	if man.BlockSize != 0 && man.BlockSize != ImageBlockSizeBytes {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"image block_size must be %d (4 MiB); got %d", ImageBlockSizeBytes, man.BlockSize)
 	}
 	oid, err := v.WriteObject(ctx, vault.SplitterFixed4M, bytes.NewReader(raw))
 	if err != nil {

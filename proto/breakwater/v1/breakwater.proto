@@ -227,7 +227,13 @@ message PutContentsResponse {
 message PutTreeObjectRequest {
   string job_id = 1;
   // Serialized tree object (JSON; see pkg/format).
+  // Mutually exclusive with content_ids (S3-F1).
   bytes tree_json = 2;
+  // Additive under freeze (S3-F1 / R2-5 / S2-F7 precedent): when non-empty,
+  // server materializes an OpenObject-able object from these content IDs
+  // (already stored via PutContents) via ConcatenateObjects. tree_json must
+  // be empty. Mutually exclusive with tree_json — no in-band magic names.
+  repeated string content_ids = 3;
 }
 
 message PutTreeObjectResponse {
