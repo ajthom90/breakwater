@@ -23,6 +23,12 @@ import (
 // MaxPutContentBytes is the maximum payload for PutContent (one FIXED-4M block).
 const MaxPutContentBytes = 4 << 20 // 4 MiB
 
+// MaxMarkObjectBytes caps how much of a tree/image root the mark phase reads into
+// memory (R3-2). Real TreeObject / ImageManifest JSON is far smaller; a root
+// larger than this is treated as corrupt and fails the prune (fail closed).
+// Without the cap, a flat multi-GiB root (pre-R3-1 test artifact) would OOM.
+const MaxMarkObjectBytes = 16 << 20 // 16 MiB
+
 var errVaultClosed = fmt.Errorf("vault is closed")
 
 // kopiaVault implements Vault using kopia's public repository packages only.
@@ -358,6 +364,10 @@ func (v *kopiaVault) PutSnapshotRecord(ctx context.Context, rec SnapshotRecord) 
 		if _, err := object.ParseID(string(rec.RootObjectID)); err != nil {
 			return "", fmt.Errorf("invalid root object id %q: %w", rec.RootObjectID, err)
 		}
+		// R3-1: root must decode as the kind's format (TreeObject / ImageManifest).
+		if err := validateSnapshotRoot(ctx, v.rep, rec.Kind, rec.RootObjectID); err != nil {
+			return "", err
+		}
 	}
 	if rec.Timestamp.IsZero() {
 		rec.Timestamp = time.Now().UTC()
@@ -381,6 +391,27 @@ func (v *kopiaVault) PutSnapshotRecord(ctx context.Context, rec SnapshotRecord) 
 			return nil
 		})
 	return mid, err
+}
+
+// validateSnapshotRoot ensures the root object decodes as the kind requires (R3-1).
+func validateSnapshotRoot(ctx context.Context, rep repo.Repository, kind SnapshotKind, root ObjectID) error {
+	raw, err := readObjectBytes(ctx, rep, root)
+	if err != nil {
+		return fmt.Errorf("read snapshot root %s: %w", root, err)
+	}
+	switch kind {
+	case KindFileSnapshot:
+		var tree format.TreeObject
+		if err := json.Unmarshal(raw, &tree); err != nil {
+			return fmt.Errorf("file snapshot root %s must be a TreeObject JSON: %w", root, err)
+		}
+	case KindImageSnapshot:
+		var img format.ImageManifest
+		if err := json.Unmarshal(raw, &img); err != nil {
+			return fmt.Errorf("image snapshot root %s must be an ImageManifest JSON: %w", root, err)
+		}
+	}
+	return nil
 }
 
 func (v *kopiaVault) GetSnapshotRecord(ctx context.Context, id SnapshotRecordID) (*SnapshotRecord, error) {
@@ -535,7 +566,9 @@ func (v *kopiaVault) Prune(ctx context.Context, opts ...PruneOption) error {
 	}
 
 	// Session 2: drop deleted contents from indexes and run pack GC.
-	// SafetyNone: server is sole writer (PLAN: per-repo RW lock); min-age is our safety window.
+	// R3-5: when minContentAge > 0, derive maintenance SafetyParameters from it
+	// so blob GC honors the same window; SafetyNone only for WithMinContentAge(0).
+	safety := safetyForMinAge(cfg.minContentAge)
 	return repo.DirectWriteSession(ctx, dr, repo.WriteSessionOptions{Purpose: "prune-gc"},
 		func(ctx context.Context, dw repo.DirectRepositoryWriter) error {
 			p, err := maintenance.GetParams(ctx, dw)
@@ -549,15 +582,39 @@ func (v *kopiaVault) Prune(ctx context.Context, opts ...PruneOption) error {
 			}
 
 			// dropDeletedBefore in the future so all currently-deleted contents qualify.
-			if err := maintenance.DropDeletedContents(ctx, dw, dw.Time().Add(time.Hour), maintenance.SafetyNone); err != nil {
+			if err := maintenance.DropDeletedContents(ctx, dw, dw.Time().Add(time.Hour), safety); err != nil {
 				return fmt.Errorf("DropDeletedContents: %w", err)
 			}
 
 			return maintenance.RunExclusive(ctx, dw, maintenance.ModeFull, true,
 				func(ctx context.Context, runParams maintenance.RunParameters) error {
-					return maintenance.Run(ctx, runParams, maintenance.SafetyNone)
+					return maintenance.Run(ctx, runParams, safety)
 				})
 		})
+}
+
+// safetyForMinAge builds kopia maintenance SafetyParameters from our min-content-age
+// window (R3-5). Zero min-age (explicit test path) keeps SafetyNone so young test
+// data can be fully reclaimed in one Prune call.
+func safetyForMinAge(minAge time.Duration) maintenance.SafetyParameters {
+	if minAge <= 0 {
+		return maintenance.SafetyNone
+	}
+	// Server is sole writer on local FS (strongly consistent). We still apply
+	// BlobDeleteMinAge / SessionExpirationAge ≥ minAge so unflushed sessions and
+	// young blobs are not GC'd below the content-layer guard. RequireTwoGCCycles
+	// stays false: a single exclusive Prune must complete retention for operators.
+	return maintenance.SafetyParameters{
+		BlobDeleteMinAge:                 minAge,
+		SessionExpirationAge:             minAge,
+		MinContentAgeSubjectToGC:         minAge,
+		DropContentFromIndexExtraMargin:  time.Hour,
+		MarginBetweenSnapshotGC:          0,
+		RewriteMinAge:                    min(minAge, 2*time.Hour),
+		RequireTwoGCCycles:               false,
+		DisableEventualConsistencySafety: true, // local filesystem
+		MinRewriteToOrphanDeletionDelay:  time.Hour,
+	}
 }
 
 // markLiveContents walks every live Breakwater snapshot and collects content IDs
@@ -627,6 +684,7 @@ func markSnapshotContents(ctx context.Context, rep repo.Repository, live map[con
 const maxTreeDepth = 256
 
 // markTreeObject recursively marks a TreeObject and all referenced file/dir/ADS objects.
+// Decode failure ALWAYS fails the prune (R3-1 fail closed — no leaf heuristic).
 func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.ID]struct{}, oid ObjectID, manifestID string, depth int) error {
 	if depth > maxTreeDepth {
 		return fmt.Errorf("prune: tree depth exceeds %d (manifest %s, oid %s)", maxTreeDepth, manifestID, oid)
@@ -641,16 +699,7 @@ func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.I
 	}
 	var tree format.TreeObject
 	if err := json.Unmarshal(raw, &tree); err != nil {
-		// Fail closed: a root that is not a TreeObject (e.g. flat engine-gate
-		// payload) is still marked via markObjectContents above; only fail if
-		// we expected structure. Flat snapshots store raw file bytes as root —
-		// treat decode failure as "leaf object, already marked".
-		// However PLAN says trees are JSON; for true tree roots decode must work.
-		// Heuristic: if payload looks like JSON object with "entries", fail; else leaf.
-		if looksLikeTreeJSON(raw) {
-			return fmt.Errorf("prune: decode TreeObject %s (manifest %s): %w", oid, manifestID, err)
-		}
-		return nil
+		return fmt.Errorf("prune: decode TreeObject %s (manifest %s): %w", oid, manifestID, err)
 	}
 
 	for _, ent := range tree.Entries {
@@ -679,34 +728,6 @@ func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.I
 		}
 	}
 	return nil
-}
-
-func looksLikeTreeJSON(raw []byte) bool {
-	// Cheap check: starts with '{' and contains "entries" key marker.
-	if len(raw) == 0 || raw[0] != '{' {
-		return false
-	}
-	return bytesContains(raw, []byte(`"entries"`)) || bytesContains(raw, []byte(`"v"`))
-}
-
-func bytesContains(b, sub []byte) bool {
-	return len(sub) == 0 || (len(b) >= len(sub) && indexBytes(b, sub) >= 0)
-}
-
-func indexBytes(b, sub []byte) int {
-	for i := 0; i+len(sub) <= len(b); i++ {
-		ok := true
-		for j := range sub {
-			if b[i+j] != sub[j] {
-				ok = false
-				break
-			}
-		}
-		if ok {
-			return i
-		}
-	}
-	return -1
 }
 
 // markImageManifest marks the image manifest object and every block content ID.
@@ -750,6 +771,8 @@ func markObjectContents(ctx context.Context, rep repo.Repository, live map[conte
 	return nil
 }
 
+// readObjectBytes reads an object with MaxMarkObjectBytes cap (R3-2).
+// Over-limit is an explicit fail-closed error (never silently truncate).
 func readObjectBytes(ctx context.Context, rep repo.Repository, oid ObjectID) ([]byte, error) {
 	parsed, err := object.ParseID(string(oid))
 	if err != nil {
@@ -760,7 +783,16 @@ func readObjectBytes(ctx context.Context, rep repo.Repository, oid ObjectID) ([]
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	// Read at most MaxMarkObjectBytes+1 to detect overflow without unbounded RAM.
+	limited := io.LimitReader(r, int64(MaxMarkObjectBytes)+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > MaxMarkObjectBytes {
+		return nil, fmt.Errorf("object %s exceeds mark-phase size limit %d bytes (fail closed)", oid, MaxMarkObjectBytes)
+	}
+	return data, nil
 }
 
 func (v *kopiaVault) Stats(ctx context.Context) (VaultStats, error) {

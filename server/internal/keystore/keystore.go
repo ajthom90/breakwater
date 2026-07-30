@@ -22,6 +22,11 @@ import (
 // (CreateRepoPassword seals empty until SetHashingKey runs) (R2-6).
 var ErrHashingKeyNotSet = errors.New("hashing key not set")
 
+// ErrHashingAlgorithmNotSet is returned when a hashing key is present but the
+// algorithm column is empty — the 755f417 upgrade population after migrateV1ToV2
+// (R3-4). Callers must not guess the hash function.
+var ErrHashingAlgorithmNotSet = errors.New("hashing algorithm not set")
+
 // Store encrypts per-repo passwords and hashing keys with a master key.
 type Store struct {
 	db     *catalog.DB
@@ -162,6 +167,10 @@ func (s *Store) GetHashingKey(ctx context.Context, repoID string) (key []byte, a
 	}
 	if len(pt) == 0 {
 		return nil, "", ErrHashingKeyNotSet
+	}
+	// R3-4: upgraded 755f417 rows have a real key but hashing_algorithm DEFAULT ''.
+	if algo.String == "" {
+		return nil, "", ErrHashingAlgorithmNotSet
 	}
 	return pt, algo.String, nil
 }

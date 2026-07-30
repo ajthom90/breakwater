@@ -93,19 +93,21 @@ func TestEngineGate_Kopia(t *testing.T) {
 	wantSum := h.Sum(nil)
 	t.Logf("WriteObject done in %s, object=%s", time.Since(startWrite), objID)
 
-	// Snapshot record (manifest)
+	// R3-1: file snapshot root is a TreeObject; payload is a tree entry (not flat root).
+	// Mark phase only reads the small tree JSON (≤ MaxMarkObjectBytes), not the 10 GiB payload.
+	rootOID := wrapFilePayloadRoot(t, ctx, v, "payload.bin", objID, totalBytes)
 	recID, err := v.PutSnapshotRecord(ctx, vault.SnapshotRecord{
 		Kind:         vault.KindFileSnapshot,
 		MachineID:    repoID,
 		Timestamp:    time.Now().UTC(),
-		RootObjectID: objID,
+		RootObjectID: rootOID,
 		Source:       "engine-gate",
 		JobID:        "job-gate-1",
 	})
 	if err != nil {
 		t.Fatalf("PutSnapshotRecord: %v", err)
 	}
-	t.Logf("snapshot record: %s", recID)
+	t.Logf("snapshot record: %s rootTree=%s", recID, rootOID)
 
 	// Second smaller snapshot that we will forget (retention exercise).
 	// Incompressible unique payload so on-disk reclamation is measurable (R2-13).
@@ -115,6 +117,7 @@ func TestEngineGate_Kopia(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteObject small: %v", err)
 	}
+	smallRoot := wrapFilePayloadRoot(t, ctx, v, "orphan.bin", smallOID, int64(len(small)))
 	forgetContentIDs, err := v.VerifyObject(ctx, smallOID)
 	if err != nil || len(forgetContentIDs) == 0 {
 		t.Fatalf("VerifyObject small: ids=%v err=%v", forgetContentIDs, err)
@@ -123,7 +126,7 @@ func TestEngineGate_Kopia(t *testing.T) {
 		Kind:         vault.KindFileSnapshot,
 		MachineID:    repoID,
 		Timestamp:    time.Now().UTC().Add(-time.Hour),
-		RootObjectID: smallOID,
+		RootObjectID: smallRoot,
 		Source:       "engine-gate-forget",
 	})
 	if err != nil {
@@ -187,7 +190,7 @@ func TestEngineGate_Kopia(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetSnapshotRecord: %v", err)
 	}
-	if gotRec.RootObjectID != objID || gotRec.MachineID != repoID {
+	if gotRec.RootObjectID != rootOID || gotRec.MachineID != repoID {
 		t.Fatalf("snapshot record mismatch: %+v", gotRec)
 	}
 
@@ -357,10 +360,11 @@ func TestVault_SmallRoundTrip(t *testing.T) {
 		t.Fatalf("payload mismatch")
 	}
 
+	rootOID := wrapFilePayloadRoot(t, ctx, v, "payload.bin", oid, int64(len(payload)))
 	sid, err := v.PutSnapshotRecord(ctx, vault.SnapshotRecord{
 		Kind:         vault.KindFileSnapshot,
 		MachineID:    "m1",
-		RootObjectID: oid,
+		RootObjectID: rootOID,
 		Source:       "/data",
 	})
 	if err != nil {

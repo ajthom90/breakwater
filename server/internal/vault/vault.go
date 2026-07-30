@@ -134,6 +134,14 @@ func resolvePruneOptions(opts []PruneOption) pruneOptions {
 //     serialization so the age guard is defense-in-depth, not the only line.
 //   - OpenObject readers must complete before Prune on the same vault (scheduler
 //     serializes jobs per-repo in M2+; see REVIEW-M1 M2).
+//
+// Min-age guard coverage (R3-5):
+//   - Covers: our DeleteContent sweep skips contents younger than MinContentAge;
+//     when MinContentAge > 0, kopia maintenance also uses SafetyParameters with
+//     BlobDeleteMinAge / SessionExpirationAge ≥ that window (not SafetyNone).
+//   - Does not cover: concurrent second live handle on the same repo directory
+//     (see Manager docs — one live handle per repo; Close must not race Open);
+//     structural enforcement is M2 scheduler work.
 type Vault interface {
 	// Close releases repository resources. Subsequent method calls return an error.
 	Close(ctx context.Context) error
@@ -164,7 +172,8 @@ type Vault interface {
 	VerifyObject(ctx context.Context, id ObjectID) ([]ContentID, error)
 
 	// PutSnapshotRecord stores a Breakwater snapshot manifest (labels + JSON payload).
-	// Rejects unknown kinds and unparseable RootObjectID at the write boundary (R2-3/R2-4).
+	// Rejects unknown kinds, unparseable RootObjectID, and roots that do not decode
+	// as the kind's format (TreeObject for file, ImageManifest for image) (R2-3/R2-4/R3-1).
 	PutSnapshotRecord(ctx context.Context, rec SnapshotRecord) (SnapshotRecordID, error)
 
 	// GetSnapshotRecord loads a snapshot record by ID.
@@ -200,6 +209,12 @@ type VaultStats struct {
 }
 
 // Manager owns per-machine vaults under a repos root directory.
+//
+// Invariant (R3-6): at most one live handle per repoID. Close(repoID) must not
+// race Open/Create for the same ID — Close releases the manager lock before
+// waiting on the vault exclusive lock, so a concurrent Open can create a second
+// live handle while the first still has in-flight writes. M2's scheduler must
+// serialize per-repo Close vs Open (same work item as backup-vs-prune).
 type Manager struct {
 	reposDir string
 	mu       sync.Mutex

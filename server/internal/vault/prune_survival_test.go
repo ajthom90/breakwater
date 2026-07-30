@@ -21,6 +21,20 @@ func pruneForTest(ctx context.Context, v vault.Vault) error {
 	return v.Prune(ctx, vault.WithMinContentAge(0))
 }
 
+// wrapFilePayloadRoot stores a one-entry TreeObject whose sole file entry points
+// at payloadOID and returns the tree root object ID (R3-1: file snapshots must
+// have TreeObject roots, not flat raw-byte roots).
+func wrapFilePayloadRoot(t *testing.T, ctx context.Context, v vault.Vault, name string, payloadOID vault.ObjectID, size int64) vault.ObjectID {
+	t.Helper()
+	tree := format.TreeObject{
+		Version: format.FormatVersion,
+		Entries: []format.TreeEntry{
+			{Name: name, Type: format.EntryFile, Size: size, ObjectID: string(payloadOID)},
+		},
+	}
+	return writeJSONObject(t, ctx, v, tree)
+}
+
 // diskBytes walks the repo directory and sums regular file sizes (R2-13).
 func diskBytes(t *testing.T, repoDir string) int64 {
 	t.Helper()
@@ -326,12 +340,13 @@ func TestPruneMinAgeProtectsInFlightBackup(t *testing.T) {
 		t.Fatalf("Prune during in-flight backup: %v", err)
 	}
 
-	// Now commit the snapshot as the agent would.
+	// Now commit the snapshot as the agent would (TreeObject root, R3-1).
+	rootOID := wrapFilePayloadRoot(t, ctx, v, "chunk.bin", oid, int64(len(payload)))
 	_, err = v.PutSnapshotRecord(ctx, vault.SnapshotRecord{
 		Kind:         vault.KindFileSnapshot,
 		MachineID:    "inflight",
 		Timestamp:    time.Now().UTC(),
-		RootObjectID: oid,
+		RootObjectID: rootOID,
 		Source:       "/inflight",
 	})
 	if err != nil {

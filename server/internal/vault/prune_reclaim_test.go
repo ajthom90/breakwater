@@ -26,8 +26,9 @@ func TestPruneReclaimsForgottenContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	liveRoot := wrapFilePayloadRoot(t, ctx, v, "live.bin", liveOID, int64(len(livePayload)))
 	_, err = v.PutSnapshotRecord(ctx, vault.SnapshotRecord{
-		Kind: vault.KindFileSnapshot, MachineID: "d1", RootObjectID: liveOID, Timestamp: time.Now(),
+		Kind: vault.KindFileSnapshot, MachineID: "d1", RootObjectID: liveRoot, Timestamp: time.Now(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -41,12 +42,19 @@ func TestPruneReclaimsForgottenContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	deadRoot := wrapFilePayloadRoot(t, ctx, v, "dead.bin", deadOID, int64(len(deadPayload)))
 	deadCIDs, err := v.VerifyObject(ctx, deadOID)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Include tree root contents among things that must be reclaimed.
+	rootCIDs, err := v.VerifyObject(ctx, deadRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadCIDs = append(deadCIDs, rootCIDs...)
 	deadSnap, err := v.PutSnapshotRecord(ctx, vault.SnapshotRecord{
-		Kind: vault.KindFileSnapshot, MachineID: "d1", RootObjectID: deadOID, Timestamp: time.Now(),
+		Kind: vault.KindFileSnapshot, MachineID: "d1", RootObjectID: deadRoot, Timestamp: time.Now(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -103,7 +111,7 @@ func TestPruneReclaimsForgottenContent(t *testing.T) {
 	if afterDisk >= beforeDisk {
 		t.Fatalf("on-disk bytes did not shrink after prune: %d -> %d", beforeDisk, afterDisk)
 	}
-	// Material shrinkage: at least half the dead payload should leave disk
+	// Material shrinkage: at least a quarter of the dead payload should leave disk
 	// (packs/indexes have overhead; require a meaningful decrease).
 	if saved := beforeDisk - afterDisk; saved < int64(len(deadPayload))/4 {
 		t.Fatalf("on-disk reclamation too small: saved %d bytes, dead payload %d", saved, len(deadPayload))

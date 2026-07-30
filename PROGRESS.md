@@ -4,9 +4,9 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
-**Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; round-2 review fixes applied same day)
+**Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; round-2 + round-3 review fixes)
 
-Addressed [REVIEW-M1.md](REVIEW-M1.md) (round 1) and [REVIEW-M1-ROUND2.md](REVIEW-M1-ROUND2.md) (round 2) against commits `f92837f` → `755f417` → this fix set. All 15 round-2 findings (R2-1…R2-15) fixed; engine gate re-proven at full 10 GiB with recursive mark, min-age guard, and on-disk byte reclamation.
+Addressed [REVIEW-M1.md](REVIEW-M1.md), [REVIEW-M1-ROUND2.md](REVIEW-M1-ROUND2.md), and [REVIEW-M1-ROUND3.md](REVIEW-M1-ROUND3.md) against `f92837f` → `755f417` → `eea1a46` → this fix set. Round-3 closed remaining fail-open mark heuristic, canceled-ctx compensation, empty-algorithm upgrade hole, and related mediums.
 
 ### M1 deliverables
 
@@ -29,12 +29,13 @@ PLAN criterion: write chunked data → restore → verify → retention + **GC t
 
 Implementation (`server/internal/vault/kopia.go` `Prune`):
 
-1. **Mark (recursive, R2-1):** live `bw-*` snapshot manifests → kind-keyed walk:
-   - file: decode `TreeObject`, mark root + recurse dirs / `VerifyObject` files+ADS
+1. **Mark (recursive, R2-1 / R3-1):** live `bw-*` snapshot manifests → kind-keyed walk:
+   - file: decode `TreeObject` (write-boundary validated; **decode failure always fails prune** — no leaf heuristic), mark root + recurse dirs / `VerifyObject` files+ADS
    - image: decode `ImageManifest`, mark root + every block `ContentID`
-   - decode failure / unknown kind → fail closed (R2-3)
-2. **Sweep (R2-2):** `IterateContents` → `DeleteContent` unmarked unprefixed IDs **older than MinContentAge** (default 24h; tests/gate pass `WithMinContentAge(0)`)
-3. Commit session, then `DropDeletedContents(SafetyNone)` + `maintenance.Run(ModeFull, SafetyNone)`
+   - unknown kind → fail closed (R2-3); root reads capped at `MaxMarkObjectBytes` 16 MiB (R3-2)
+   - gate/tests store **TreeObject roots** wrapping payload objects (not flat raw-byte roots)
+2. **Sweep (R2-2 / R3-5):** `IterateContents` → `DeleteContent` unmarked unprefixed IDs **older than MinContentAge** (default 24h; tests/gate pass `WithMinContentAge(0)`)
+3. Commit session, then `DropDeletedContents` + `maintenance.Run` with `SafetyParameters` derived from min-age when >0; `SafetyNone` only for explicit zero min-age
 
 Assertions in `TestEngineGate_Kopia`: forgotten contents absent, `UserContentCount`/`UserSizeBytes` shrink, **on-disk bytes shrink (R2-13)**, live object checksum-verifies after prune and re-open. Prune-survival tests cover indirect trees + image manifests (R2-15).
 
@@ -124,6 +125,22 @@ go test ./internal/agentgw/ -run 'TestM1_EnrollmentAndWrongCertRejection|TestEnr
 
 ---
 
+## REVIEW-M1-ROUND3 disposition
+
+| ID | Status | Evidence |
+|----|--------|----------|
+| R3-1 fail-closed mark / TreeObject roots | ✅ Fixed | Write-boundary `validateSnapshotRoot`; `markTreeObject` always fails decode; deleted `looksLikeTreeJSON`/helpers; gate wraps payload in TreeObject; `TestPutSnapshotRecord_RejectsFlatFileRoot` + `TestMarkTreeObject_UndecodableRootFailsClosed` |
+| R3-2 bounded root reads | ✅ Fixed | `MaxMarkObjectBytes=16MiB` + `io.LimitReader`; over-limit fail-closed |
+| R3-3 compensate on fresh ctx | ✅ Fixed | `context.WithTimeout(Background, 5s)`; `TestEnroll_CompensateDespiteCanceledContext` |
+| R3-4 ErrHashingAlgorithmNotSet | ✅ Fixed | empty algo with non-empty key → sentinel; `TestGetHashingKey_EmptyAlgorithmIsError` |
+| R3-5 SafetyParameters from min-age | ✅ Fixed | `safetyForMinAge`; SafetyNone only for `WithMinContentAge(0)` |
+| R3-6 Manager Close/Open race | ✅ Documented | Manager docs + M2 serialization work item |
+| R3-7 keystore row assert | ✅ Fixed | `failingVault.repoID` + COUNT=0 in compensate tests |
+| R3-8 gRPC status tests | ✅ Fixed | `TestEnroll_gRPCStatusCodes` |
+| R3-9 755f417 migration fixture | ✅ Fixed | `TestUpgradeFrom755f417` |
+
+---
+
 ## Next: M2 (weeks 3–4)
 
 **Do first (protocol debt):** swap enrollment to generated `breakwater.v1.EnrollmentService`, remove `grpc.ForceServerCodec(jsonCodec{})` and hand-written JSON service/codec (**M13**).
@@ -138,9 +155,10 @@ Then:
 - Golden-dataset generator + comparer  
 - Audit middleware (start with `machine.enroll`)  
 - HTTPS on web port before authenticated surface  
-- Per-repo job serialization covering open restore streams **and backup-vs-prune** (R2-2)  
+- Per-repo job serialization covering open restore streams, **backup-vs-prune**, and **Manager Close vs Open** (R2-2 / R3-6)  
 - Vendor kopia; consider v0.23 when on Go 1.25+  
 - Move `breakwater.config`/`.cache` under `/data` (M4)  
+- Optional: backfill `hashing_algorithm` from vault for pre-eea1a46 keystore rows (R3-4)  
 
 *Demo: MSI install → appears in UI in 10s → backup → second run shows dedup ratio.*
 
@@ -216,6 +234,70 @@ workflow_dispatch:
 ```
 
 **Engine gate: PASSED** at full 10 GiB with R2-13 on-disk and R2-15 survival coverage (recursive mark).
+
+---
+
+## Verification evidence (REVIEW-M1-ROUND3)
+
+Run 2026-07-30 after round-3 fixes (darwin/arm64, Go 1.23.x):
+
+### Red-first against unmodified `eea1a46`
+
+```
+=== RUN   TestPrune_FailClosedOnUndecodableFileRoot
+    … Prune must fail closed on undecodable file-kind root; got nil (looksLikeTreeJSON leaf heuristic still active)
+--- FAIL: TestPrune_FailClosedOnUndecodableFileRoot
+
+=== RUN   TestEnroll_CompensateDespiteCanceledContext
+    … keystore row for failed enroll still present … — compensation no-op on canceled ctx
+--- FAIL: TestEnroll_CompensateDespiteCanceledContext
+
+=== RUN   TestGetHashingKey_EmptyAlgorithmIsError
+    … expected error for empty algorithm, got keyLen=33 algo="" err=nil
+--- FAIL: TestGetHashingKey_EmptyAlgorithmIsError
+```
+
+### After fixes
+
+```
+=== gofmt / go vet ===
+(empty / clean)
+
+=== short+race ===
+ok  agentgw, catalog, enroll, keystore, mtls, vault
+
+=== R3-1/2/5 prune ===
+--- PASS: TestMarkTreeObject_UndecodableRootFailsClosed
+--- PASS: TestPutSnapshotRecord_RejectsFlatFileRoot
+--- PASS: TestPruneReclaimsForgottenContent
+--- PASS: TestPruneSurvivesIndirectTreeReferences
+--- PASS: TestPruneSurvivesImageManifestBlocks
+--- PASS: TestPruneMinAgeProtectsInFlightBackup
+
+=== R3-3/4/7 enroll+keystore ===
+--- PASS: TestEnroll_CompensateDespiteCanceledContext
+--- PASS: TestEnroll_CompensateOnVaultFailure (keystore COUNT=0)
+--- PASS: TestGetHashingKey_EmptyAlgorithmIsError
+
+=== R3-8/9 ===
+--- PASS: TestEnroll_gRPCStatusCodes (InvalidArgument; Internal "enrollment failed")
+--- PASS: TestUpgradeFromV1
+--- PASS: TestUpgradeFrom755f417
+
+=== reduced gate 256MB ===
+rootTree=… (TreeObject); user_contents 56→53; disk shrink; ENGINE GATE PASSED
+
+=== full 10GB gate ===
+engine gate: writing 10737418240 bytes (10.00 GiB)
+WriteObject ~1m29s; restore ~12s; rootTree=… (mark reads tiny JSON only)
+stats before: user_contents=1966; after=1963; disk 9521924786→9518190352
+--- PASS: TestEngineGate_Kopia (126.05s)
+
+=== pkg ===
+ok  pkg/format
+```
+
+**Engine gate: PASSED** at full 10 GiB after R3-1 (TreeObject roots; mark no longer materializes the 10 GiB payload).
 
 ---
 

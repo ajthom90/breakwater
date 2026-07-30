@@ -2,7 +2,6 @@ package enroll_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -14,10 +13,13 @@ import (
 	"github.com/ajthom90/breakwater/server/internal/mtls"
 )
 
-// failingVault always errors on Create — injects post-consume failure (R2-9).
-type failingVault struct{}
+// failingVault always errors on Create — injects post-consume failure (R2-9/R3-7).
+type failingVault struct {
+	repoID string
+}
 
-func (failingVault) Create(ctx context.Context, repoID, password string) ([]byte, string, error) {
+func (f *failingVault) Create(ctx context.Context, repoID, password string) ([]byte, string, error) {
+	f.repoID = repoID
 	return nil, "", fmt.Errorf("injected vault create failure")
 }
 
@@ -53,10 +55,11 @@ func TestEnroll_CompensateOnVaultFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	failing := &failingVault{}
 	svc := &enroll.Service{
 		DB:       db,
 		Keystore: ks,
-		Vaults:   failingVault{},
+		Vaults:   failing,
 		ServerFP: serverFP,
 	}
 
@@ -70,18 +73,23 @@ func TestEnroll_CompensateOnVaultFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected enroll to fail")
 	}
-	if !errors.Is(err, err) { // just ensure we got an error
-		t.Fatal(err)
-	}
 	t.Logf("enroll failed as expected: %v", err)
 
+	// R3-7: keystore row for the failed attempt must be gone.
+	if failing.repoID == "" {
+		t.Fatal("vault Create never ran")
+	}
+	var n int
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM keystore WHERE repo_id = ?`, failing.repoID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("keystore row still present for failed enroll repo_id=%s", failing.repoID)
+	}
+
 	// Token must be reusable after compensation.
-	// Keystore row for the attempted machine should be gone — we don't know machineID
-	// easily, but re-enroll with a working vault proves the token was released.
 	okVault := &stubVault{key: []byte("0123456789abcdef0123456789abcdef"), algo: "BLAKE2B-256-128"}
 	svc.Vaults = okVault
-	// Also need a fresh keystore Create not to conflict — DeleteRepo should have run.
-	// Use same token.
 	resp, err := svc.Enroll(ctx, enroll.EnrollRequest{
 		Token:            rawTok,
 		Hostname:         "h2",

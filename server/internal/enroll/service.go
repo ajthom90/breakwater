@@ -119,18 +119,23 @@ func (s *Service) Enroll(ctx context.Context, req EnrollRequest) (*EnrollRespons
 		return nil, mapTokenError(err)
 	}
 
-	// R2-9: compensate on failure — un-consume token and remove keystore row.
+	// R2-9 / R3-3: compensate on failure — un-consume token and remove keystore row.
+	// MUST use a fresh context: the request ctx may already be canceled/deadline-
+	// exceeded (the failure class that co-occurs with slow vault create). modernc
+	// sqlite returns ctx.Err() before executing when the context is done.
 	success := false
 	var keystoreCreated bool
 	defer func() {
 		if success {
 			return
 		}
-		if err := s.DB.ReleaseEnrollToken(ctx, tokenID); err != nil && s.Log != nil {
+		cctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := s.DB.ReleaseEnrollToken(cctx, tokenID); err != nil && s.Log != nil {
 			s.Log.Error("enroll compensate: release token", "token_id", tokenID, "err", err)
 		}
 		if keystoreCreated {
-			if err := s.Keystore.DeleteRepo(ctx, machineID); err != nil && s.Log != nil {
+			if err := s.Keystore.DeleteRepo(cctx, machineID); err != nil && s.Log != nil {
 				s.Log.Error("enroll compensate: delete keystore", "repo_id", machineID, "err", err)
 			}
 		}
