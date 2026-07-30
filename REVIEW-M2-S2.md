@@ -92,3 +92,20 @@ cd ../pkg && go test ./... -count=1
 ```
 
 **Standing rules:** unchanged, except the proto freeze explicitly admits the S2-F7 additive enum values (precedent: R2-5's `hashing_algorithm`). Everything else frozen.
+
+---
+
+## Fix dispositions (post-70e26a2)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| S2-F1 | ✅ Fixed | `ReplaceMachineInventory` skip-and-log; `handleAgentMsg` logs app errors without killing stream |
+| S2-F2 | ✅ Fixed | Session tracks undelivered JobStarts; close/supersede → `RevertUndeliveredJobStarts`; queue-full → `(false,nil)` pending |
+| S2-F3 | ✅ Fixed | `exclusiveWaiters` + Shared blocks while > 0 (writer preference) |
+| S2-F4 | ✅ Fixed | `HandleResult` / `completeJob` only from `running`; pending results ignored |
+| S2-F5 | ✅ Fixed | `RecoverOnStartup` fails all running; called from `breakwaterd` main |
+| S2-F6 | ✅ Fixed | `Dispatcher.SendJobCancel`; Cancel sends then cancels; stage-3 lease-on-confirm documented on `Cancel` |
+| S2-F7 | ✅ Fixed | `JOB_TYPE_INVENTORY=6`, `JOB_TYPE_NOOP=7` additive; regenerated; agent contract uses type |
+| S2-F8 | ✅ Fixed | Heartbeat calls `SetMachineOnline` (idempotent re-assert) |
+
+Red-first captures and after-fix evidence: see `PROGRESS.md` stage-2 fix round.

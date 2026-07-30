@@ -1,7 +1,6 @@
 package agentgw
 
 import (
-	"fmt"
 	"log/slog"
 	"sync"
 
@@ -19,14 +18,54 @@ type session struct {
 	send      chan *breakwaterv1.ServerToAgent
 	// done is closed when the session is superseded or the stream ends.
 	done chan struct{}
-	// closeOnce guards close(done).
+	// closeOnce guards close(done) and undelivered flush.
 	closeOnce sync.Once
+
+	// undelivered JobStart job IDs enqueued but not yet stream.Send-delivered (S2-F2).
+	undelMu     sync.Mutex
+	undelivered map[string]struct{}
 }
 
-func (s *session) close() {
+func (s *session) noteJobStartQueued(jobID string) {
+	if jobID == "" {
+		return
+	}
+	s.undelMu.Lock()
+	if s.undelivered == nil {
+		s.undelivered = make(map[string]struct{})
+	}
+	s.undelivered[jobID] = struct{}{}
+	s.undelMu.Unlock()
+}
+
+func (s *session) noteJobStartDelivered(jobID string) {
+	if jobID == "" {
+		return
+	}
+	s.undelMu.Lock()
+	delete(s.undelivered, jobID)
+	s.undelMu.Unlock()
+}
+
+func (s *session) takeUndeliveredJobStarts() []string {
+	s.undelMu.Lock()
+	defer s.undelMu.Unlock()
+	out := make([]string, 0, len(s.undelivered))
+	for id := range s.undelivered {
+		out = append(out, id)
+	}
+	s.undelivered = nil
+	return out
+}
+
+// close closes done and returns undelivered JobStart IDs (at most once).
+func (s *session) close() []string {
+	var undelivered []string
 	s.closeOnce.Do(func() {
 		close(s.done)
+		undelivered = s.takeUndeliveredJobStarts()
 	})
+	return undelivered
 }
 
 // Registry tracks at most one live control channel per machine.
@@ -38,6 +77,10 @@ type Registry struct {
 	mu       sync.Mutex
 	sessions map[string]*session // machineID → live session
 	Log      *slog.Logger
+	// OnUndelivered is invoked with JobStart job IDs that were queued but never
+	// stream.Send-delivered when a session closes (supersede or death). Wired by
+	// AttachControlPlane to Engine.RevertUndeliveredJobStarts (S2-F2).
+	OnUndelivered func(jobIDs []string)
 }
 
 // NewRegistry constructs an empty connection registry.
@@ -51,25 +94,35 @@ func NewRegistry(log *slog.Logger) *Registry {
 	}
 }
 
+func (r *Registry) fireUndelivered(ids []string) {
+	if len(ids) == 0 || r.OnUndelivered == nil {
+		return
+	}
+	r.OnUndelivered(ids)
+}
+
 // Register installs a new session for machineID, superseding any previous one.
 // The caller must call Unregister with the returned session when the stream ends
 // (only if it is still the current session).
 func (r *Registry) Register(machineID, sessionID string) *session {
 	r.mu.Lock()
-	defer r.mu.Unlock()
+	var undelivered []string
 	if old, ok := r.sessions[machineID]; ok {
 		r.Log.Info("superseding control channel", "machine_id", machineID, "old_session", old.sessionID, "new_session", sessionID)
-		old.close()
-		// Do not close old.send — the old writer exits on done and the channel
-		// is GC'd; sends after close would panic. Writers select on done first.
+		undelivered = old.close()
 	}
 	s := &session{
-		machineID: machineID,
-		sessionID: sessionID,
-		send:      make(chan *breakwaterv1.ServerToAgent, sendBuf),
-		done:      make(chan struct{}),
+		machineID:   machineID,
+		sessionID:   sessionID,
+		send:        make(chan *breakwaterv1.ServerToAgent, sendBuf),
+		done:        make(chan struct{}),
+		undelivered: make(map[string]struct{}),
 	}
 	r.sessions[machineID] = s
+	r.mu.Unlock()
+
+	// Outside the lock: revert undelivered JobStarts from the superseded session (S2-F2).
+	r.fireUndelivered(undelivered)
 	return s
 }
 
@@ -79,12 +132,13 @@ func (r *Registry) Unregister(s *session) {
 		return
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	cur, ok := r.sessions[s.machineID]
 	if ok && cur == s {
 		delete(r.sessions, s.machineID)
 	}
-	s.close()
+	r.mu.Unlock()
+	undelivered := s.close()
+	r.fireUndelivered(undelivered)
 }
 
 // IsOnline reports whether a control channel is live for machineID.
@@ -104,6 +158,7 @@ func (r *Registry) IsOnline(machineID string) bool {
 }
 
 // SendJobStart implements scheduler.Dispatcher.
+// Returns (false, nil) when offline or queue-full (engine reverts to pending; S2-F2).
 func (r *Registry) SendJobStart(machineID, jobID, jobType string, paramsJSON []byte) (bool, error) {
 	msg := &breakwaterv1.ServerToAgent{
 		Msg: &breakwaterv1.ServerToAgent_JobStart{
@@ -114,10 +169,10 @@ func (r *Registry) SendJobStart(machineID, jobID, jobType string, paramsJSON []b
 			},
 		},
 	}
-	return r.send(machineID, msg)
+	return r.send(machineID, msg, jobID)
 }
 
-// SendJobCancel delivers a cancel to the live channel (best-effort).
+// SendJobCancel implements scheduler.Dispatcher (S2-F6).
 func (r *Registry) SendJobCancel(machineID, jobID, reason string) (bool, error) {
 	msg := &breakwaterv1.ServerToAgent{
 		Msg: &breakwaterv1.ServerToAgent_JobCancel{
@@ -127,24 +182,34 @@ func (r *Registry) SendJobCancel(machineID, jobID, reason string) (bool, error) 
 			},
 		},
 	}
-	return r.send(machineID, msg)
+	return r.send(machineID, msg, "")
 }
 
-func (r *Registry) send(machineID string, msg *breakwaterv1.ServerToAgent) (bool, error) {
+func (r *Registry) send(machineID string, msg *breakwaterv1.ServerToAgent, jobStartID string) (bool, error) {
 	r.mu.Lock()
 	s, ok := r.sessions[machineID]
 	r.mu.Unlock()
 	if !ok {
 		return false, nil
 	}
+	// Track before enqueue so a concurrent writer cannot deliver-and-clear first (S2-F2).
+	if jobStartID != "" {
+		s.noteJobStartQueued(jobStartID)
+	}
 	select {
 	case <-s.done:
+		if jobStartID != "" {
+			s.noteJobStartDelivered(jobStartID) // not actually queued
+		}
 		return false, nil
 	case s.send <- msg:
 		return true, nil
 	default:
-		// Queue full — treat as transient failure so the engine can fail/retry.
-		return false, fmt.Errorf("control send queue full for machine %s", machineID)
+		// Queue full → pending (like offline), never hard-fail (S2-F2).
+		if jobStartID != "" {
+			s.noteJobStartDelivered(jobStartID) // not actually queued
+		}
+		return false, nil
 	}
 }
 

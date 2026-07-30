@@ -169,6 +169,10 @@ enum JobType {
   JOB_TYPE_HYPERV_BACKUP = 3;
   JOB_TYPE_RESTORE = 4;
   JOB_TYPE_UPDATE = 5;
+  // Additive under M1 freeze (S2-F7 / R2-5 precedent): inventory + test noop.
+  // Agents branch on JobStart.type — do not overload UNSPECIFIED.
+  JOB_TYPE_INVENTORY = 6;
+  JOB_TYPE_NOOP = 7; // diagnostics/tests only
   // prune/verify/replicate are server-side only — never dispatched to agents
 }
 

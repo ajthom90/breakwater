@@ -112,6 +112,20 @@ func (db *DB) CountJobsByMachineState(ctx context.Context, machineID, state stri
 	return n, err
 }
 
+// ListJobsByState returns all jobs in the given state (oldest first).
+func (db *DB) ListJobsByState(ctx context.Context, state string) ([]Job, error) {
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT id, COALESCE(machine_id, ''), type, state, started_at, finished_at,
+		       bytes_read, bytes_stored, error_message, log_ref, params_json, created_at
+		FROM jobs WHERE state = ?
+		ORDER BY created_at ASC`, state)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanJobs(rows)
+}
+
 // JobTransition holds optional field updates during a state transition.
 type JobTransition struct {
 	SetStarted   bool

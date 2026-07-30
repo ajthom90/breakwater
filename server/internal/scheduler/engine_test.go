@@ -15,6 +15,7 @@ type memDispatch struct {
 	mu      sync.Mutex
 	online  map[string]bool
 	starts  []string // job IDs sent
+	cancels []string // job IDs cancelled (S2-F6)
 	sendErr error
 }
 
@@ -45,6 +46,24 @@ func (m *memDispatch) SendJobStart(machineID, jobID, jobType string, paramsJSON 
 	}
 	m.starts = append(m.starts, jobID)
 	return true, nil
+}
+
+func (m *memDispatch) SendJobCancel(machineID, jobID, reason string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.online[machineID] {
+		return false, nil
+	}
+	m.cancels = append(m.cancels, jobID)
+	return true, nil
+}
+
+func (m *memDispatch) Cancels() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]string, len(m.cancels))
+	copy(out, m.cancels)
+	return out
 }
 
 func (m *memDispatch) Starts() []string {
@@ -277,6 +296,27 @@ func TestEngine_Cancel(t *testing.T) {
 	d.SetOnline("mach1", true)
 	e.DeliverPending(ctx, "mach1")
 	j, _ = e.Job(ctx, id)
+	if j.State != catalog.JobStateCancelled {
+		t.Fatal(j.State)
+	}
+}
+
+// TestS2F6_CancelSendsJobCancel (S2-F6): Cancel of a running job notifies the agent.
+func TestS2F6_CancelSendsJobCancel(t *testing.T) {
+	e, _, d := setupEngine(t)
+	ctx := context.Background()
+	d.SetOnline("mach1", true)
+	id, err := e.Submit(ctx, scheduler.SubmitRequest{MachineID: "mach1", Type: scheduler.TypeNoop})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Cancel(ctx, id, "operator cancel"); err != nil {
+		t.Fatal(err)
+	}
+	if got := d.Cancels(); len(got) != 1 || got[0] != id {
+		t.Fatalf("S2-F6: expected JobCancel for %s, got %v", id, got)
+	}
+	j, _ := e.Job(ctx, id)
 	if j.State != catalog.JobStateCancelled {
 		t.Fatal(j.State)
 	}

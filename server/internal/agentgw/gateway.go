@@ -74,13 +74,17 @@ func New(serverID *mtls.Identity, enrollSvc *enroll.Service, log *slog.Logger) *
 }
 
 // AttachControlPlane wires catalog, job engine, and connection registry for Channel.
-// Safe to call before Start. Engine.Dispatch is set to the registry.
+// Safe to call before Start. Engine.Dispatch is set to the registry; undelivered
+// JobStarts on session close revert via Engine.RevertUndeliveredJobStarts (S2-F2).
 func (g *Gateway) AttachControlPlane(db *catalog.DB, engine *scheduler.Engine, reg *Registry) {
 	g.Catalog = db
 	g.Engine = engine
 	g.Registry = reg
 	if engine != nil && reg != nil {
 		engine.Dispatch = reg
+		reg.OnUndelivered = func(jobIDs []string) {
+			engine.RevertUndeliveredJobStarts(context.Background(), jobIDs)
+		}
 	}
 }
 

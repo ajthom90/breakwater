@@ -17,6 +17,10 @@
 // Enrollment exception: Create at enroll time is safe without a lease because
 // the machine/repo ID is brand-new and no job can exist yet for that ID. Once
 // the machine row is inserted, subsequent Open/Close/Prune/backup must lease.
+//
+// Writer preference (S2-F3): while any exclusive waiter exists, new Shared
+// acquisitions block. Prevents continuous backup/restore traffic from starving
+// prune/verify forever.
 package scheduler
 
 import (
@@ -65,13 +69,16 @@ type RepoLocks struct {
 }
 
 type repoState struct {
-	// cond is signaled whenever shared/exclusive counts change.
+	// cond is signaled whenever shared/exclusive/waiter counts change.
 	cond *sync.Cond
 	// shared is the count of shared holders.
 	shared int
 	// exclusive is true when an exclusive holder is present.
 	exclusive bool
-	// waiters is a diagnostic counter (not required for correctness).
+	// exclusiveWaiters is the count of goroutines waiting for exclusive (S2-F3).
+	// While > 0, new Shared acquisitions block (writer preference).
+	exclusiveWaiters int
+	// waiters is total Wait() callers (diagnostics / ctx-cancel broadcast).
 	waiters int
 }
 
@@ -92,6 +99,8 @@ func (r *RepoLocks) state(repoID string) *repoState {
 
 // Acquire obtains a job-scoped lease. Blocks until available or ctx is done.
 // mode Shared vs Exclusive follows PLAN; jobID is recorded for diagnostics.
+//
+// Writer preference (S2-F3): Shared succeeds only when !exclusive && exclusiveWaiters==0.
 func (r *RepoLocks) Acquire(ctx context.Context, repoID string, mode LockMode, jobID string) (Lease, error) {
 	if repoID == "" {
 		return nil, fmt.Errorf("repolock: empty repoID")
@@ -100,33 +109,47 @@ func (r *RepoLocks) Acquire(ctx context.Context, repoID string, mode LockMode, j
 		return nil, fmt.Errorf("repolock: invalid mode %v", mode)
 	}
 
-	// Fast path: try under lock; if must wait, use cond with ctx cancellation.
 	r.mu.Lock()
 	st := r.state(repoID)
 
+	// Exclusive waiters are counted while blocked so Shared sees writer preference.
+	countedExWaiter := false
+	clearExWaiter := func() {
+		if countedExWaiter {
+			st.exclusiveWaiters--
+			countedExWaiter = false
+			st.cond.Broadcast()
+		}
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
+			clearExWaiter()
 			r.mu.Unlock()
 			return nil, err
 		}
 		switch mode {
 		case Shared:
-			if !st.exclusive {
+			if !st.exclusive && st.exclusiveWaiters == 0 {
 				st.shared++
 				l := &lease{r: r, repoID: repoID, mode: Shared, jobID: jobID}
 				r.mu.Unlock()
 				return l, nil
 			}
 		case Exclusive:
+			if !countedExWaiter {
+				st.exclusiveWaiters++
+				countedExWaiter = true
+			}
 			if !st.exclusive && st.shared == 0 {
 				st.exclusive = true
+				clearExWaiter() // drops our waiter count; we now hold exclusive
 				l := &lease{r: r, repoID: repoID, mode: Exclusive, jobID: jobID}
 				r.mu.Unlock()
 				return l, nil
 			}
 		}
 
-		// Wait with context: spawn a waiter that broadcasts on cancel.
 		st.waiters++
 		done := make(chan struct{})
 		go func() {
@@ -141,7 +164,6 @@ func (r *RepoLocks) Acquire(ctx context.Context, repoID string, mode LockMode, j
 		st.cond.Wait()
 		close(done)
 		st.waiters--
-		// loop re-checks ctx.Err and availability
 	}
 }
 
@@ -181,14 +203,26 @@ func (r *RepoLocks) Held(repoID string) (shared, exclusive int) {
 	return st.shared, ex
 }
 
+// ExclusiveWaiters returns the exclusive waiter count (tests).
+func (r *RepoLocks) ExclusiveWaiters(repoID string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, ok := r.repos[repoID]
+	if !ok {
+		return 0
+	}
+	return st.exclusiveWaiters
+}
+
 // TryAcquire is a non-blocking acquire for tests. Returns nil, false if busy.
+// Respects writer preference for Shared.
 func (r *RepoLocks) TryAcquire(repoID string, mode LockMode, jobID string) (Lease, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.state(repoID)
 	switch mode {
 	case Shared:
-		if st.exclusive {
+		if st.exclusive || st.exclusiveWaiters > 0 {
 			return nil, false
 		}
 		st.shared++

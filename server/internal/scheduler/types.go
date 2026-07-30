@@ -51,10 +51,8 @@ func IsServerOnly(jobType string) bool {
 	return ServerOnlyJobTypes[jobType]
 }
 
-// WireJobType maps catalog type → frozen proto JobType.
-// inventory/noop have no dedicated enum values; they use UNSPECIFIED and
-// params_json {"kind":"<type>"} so the stage-4 agent can branch without a
-// proto change (proto is frozen — see PROGRESS deviations).
+// WireJobType maps catalog type → proto JobType (S2-F7 additive enums).
+// Stage-4 agent branches on JobStart.type — not params_json.kind.
 func WireJobType(jobType string) breakwaterv1.JobType {
 	switch jobType {
 	case TypeFileBackup:
@@ -67,8 +65,11 @@ func WireJobType(jobType string) breakwaterv1.JobType {
 		return breakwaterv1.JobType_JOB_TYPE_RESTORE
 	case TypeUpdate:
 		return breakwaterv1.JobType_JOB_TYPE_UPDATE
+	case TypeInventory:
+		return breakwaterv1.JobType_JOB_TYPE_INVENTORY
+	case TypeNoop:
+		return breakwaterv1.JobType_JOB_TYPE_NOOP
 	default:
-		// inventory, noop, and any future server-only types if mis-sent
 		return breakwaterv1.JobType_JOB_TYPE_UNSPECIFIED
 	}
 }

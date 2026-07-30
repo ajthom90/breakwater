@@ -2,7 +2,6 @@ package agentgw_test
 
 import (
 	"context"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -230,10 +229,8 @@ func (a *fakeAgent) handleServer(msg *breakwaterv1.ServerToAgent) {
 }
 
 func (a *fakeAgent) defaultHandleJob(js *breakwaterv1.JobStart) {
-	var params map[string]any
-	_ = json.Unmarshal(js.GetParamsJson(), &params)
-	kind, _ := params["kind"].(string)
-	if kind == scheduler.TypeInventory {
+	// Stage-4 agent contract: branch on JobStart.type (S2-F7), not params_json.kind.
+	if js.GetType() == breakwaterv1.JobType_JOB_TYPE_INVENTORY {
 		_ = a.stream.Send(&breakwaterv1.AgentToServer{
 			Msg: &breakwaterv1.AgentToServer_Inventory{
 				Inventory: &breakwaterv1.InventoryReport{

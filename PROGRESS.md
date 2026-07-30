@@ -254,8 +254,57 @@ Stage-4 Windows agent will bind to this contract.
 | Lease released on fail/cancel/disconnect | ✅ | `TestEngine_Disconnect…` + `TestM2S2_DisconnectReleasesRunningLease` |
 | Audit policy documented (no channel noise; job.* deferred) | ✅ | `server/internal/audit` package comment |
 | **Demo** `TestM2S2_ControlPlaneDemo` | ✅ | PASS under `-race` |
+| **S2-F1…F8 fix round** (review `REVIEW-M2-S2.md`) | ✅ | See below |
 
-#### Red-first (serialization + reconnect)
+#### Fix round S2-F1…F8 (post-70e26a2 review)
+
+| ID | Fix | Evidence |
+|----|-----|----------|
+| S2-F1 | Skip-and-log malformed inventory; app errors not stream-fatal | `TestS2F1_MalformedInventoryDoesNotKillChannel` PASS |
+| S2-F2 | Undelivered JobStart → pending on session close; queue-full → pending | `TestS2F2_Supersede…` + `TestS2F2_QueueFull…` PASS |
+| S2-F3 | Writer preference: Shared blocks while exclusiveWaiters > 0 | `TestS2F3_ExclusiveNotStarvedBySharedChain` PASS |
+| S2-F4 | JobResult only for `running` (pending ignored) | `TestS2F4_ResultIgnoredForPendingJob` PASS |
+| S2-F5 | `Engine.RecoverOnStartup` → fail orphaned running; called from main | `TestS2F5_RecoverOnStartup` PASS |
+| S2-F6 | `Dispatcher.SendJobCancel` wired into `Cancel`; stage-3 lease doc | `TestS2F6_CancelSendsJobCancel` PASS |
+| S2-F7 | Additive `JOB_TYPE_INVENTORY=6`, `JOB_TYPE_NOOP=7`; regenerate; agent docs | WireJobType + fake agent on type |
+| S2-F8 | Heartbeat re-asserts `SetMachineOnline` | channel Heartbeat handler |
+
+##### Red-first against unmodified `70e26a2` (+ compile stubs)
+
+```
+=== RUN   TestS2F1_MalformedInventoryDoesNotKillChannel
+    … heartbeat: EOF
+--- FAIL: TestS2F1_MalformedInventoryDoesNotKillChannel
+    (persist inventory hard-error → stream-fatal → agent disconnected)
+
+=== RUN   TestS2F2_SupersedeRevertsUndeliveredJobStart
+    … undelivered JobStart after supersede: state=running want pending (job wedged in running)
+--- FAIL: TestS2F2_SupersedeRevertsUndeliveredJobStart
+=== RUN   TestS2F2_QueueFullRevertsToPending
+    … queue-full hard-failed job (want pending): state=failed
+--- FAIL: TestS2F2_QueueFullRevertsToPending
+
+=== RUN   TestS2F3_ExclusiveNotStarvedBySharedChain
+    … exclusive starved/failed: context deadline exceeded
+--- FAIL: TestS2F3_ExclusiveNotStarvedBySharedChain
+
+=== RUN   TestS2F4_ResultIgnoredForPendingJob
+    … pending job terminal-ized by result: state=success want pending
+--- FAIL: TestS2F4_ResultIgnoredForPendingJob
+
+=== RUN   TestS2F5_RecoverOnStartup
+    … orphaned running state=running want failed
+--- FAIL: TestS2F5_RecoverOnStartup
+```
+
+##### After fixes
+
+```
+TestS2F1… TestS2F2… TestS2F3… TestS2F4… TestS2F5… TestS2F6…  # PASS
+gofmt / go vet / short+race / scheduler -race / agentgw M1+M2S2 / gate 256MB / pkg  # all green
+```
+
+#### Red-first (serialization + reconnect — stage-2 original)
 
 Unserialised stub allows backup+prune critical-section overlap; real `RepoLocks` forbids it:
 
@@ -276,20 +325,21 @@ demo section).
 
 | Item | Note |
 |------|------|
-| `inventory` / `noop` JobType | Not in frozen proto enum. Wire uses `JOB_TYPE_UNSPECIFIED` + `params_json.kind`. Catalog stores string type. Stage-4 agent must branch on `kind`. |
+| `inventory` / `noop` JobType | ✅ Closed S2-F7 — additive `JOB_TYPE_INVENTORY=6` / `JOB_TYPE_NOOP=7` (R2-5 freeze precedent). Stage-4 agent branches on `JobStart.type`. Server still stores `kind` in params_json as catalog convenience only. |
 | Enrollment Create vs RepoLocks | Create at enroll remains outside leases: brand-new repo ID, no concurrent job can exist. Documented on `Manager` and `scheduler` package. Subsequent Open/Close/Prune must take exclusive via `RepoLocks.WithExclusive`. |
 | Server prune execution | Type registry + lock map ready; no server-side prune runner this stage (stage 3+). Submit of prune for agent dispatch is rejected and tested. |
+| Cancel lease release | Stage 2 releases lease immediately on Cancel. Stage 3 must move vault-touching types to agent-confirmation / teardown (documented on `Engine.Cancel`). |
 | UpdateOffer | Not sent; agents may ignore if received. |
 | Job audit events | `job.run_manual` / `job.cancel` deferred until web surface; engine stores `initiator` in params_json. |
 
-#### Verification (stage 2)
+#### Verification (stage 2 + fix round)
 
 ```
 gofmt -l server pkg agent cli restore   # empty
 go vet ./...                            # clean
 go test ./... -short -race              # all ok (incl. scheduler, agentgw)
-go test ./internal/scheduler/ -race -v  # PASS (red-first + locks + engine)
-go test ./internal/agentgw/ -run 'TestM1_|TestEnroll_|TestM2S2_' -v  # PASS
+go test ./internal/scheduler/ -race -v  # PASS (S2-F3/4/5/6 + locks + engine)
+go test ./internal/agentgw/ -race -run 'TestM1_|TestEnroll_|TestM2S2_|TestS2F' -v  # PASS
 BW_GATE_BYTES=268435456 TestEngineGate_Kopia  # PASS
 pkg tests                               # PASS
 ```

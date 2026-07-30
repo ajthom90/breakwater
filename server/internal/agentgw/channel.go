@@ -27,16 +27,24 @@ import (
 //   - Expect HelloAck with session_id; then Heartbeat roughly every ≤30s.
 //   - Server enforces gRPC keepalive (see KeepaliveServerParameters): Time=30s.
 //     Client should enable keepalive with Time≈30s and PermitWithoutStream as needed.
-//   - On JobStart: run work; stream JobProgress; finish with JobResult (echo job_id).
-//   - inventory jobs (JobType UNSPECIFIED + params kind=inventory): send InventoryReport
-//     then JobResult. noop: JobResult success immediately.
+//   - On JobStart: branch on JobStart.type (JOB_TYPE_INVENTORY, JOB_TYPE_NOOP,
+//     JOB_TYPE_FILE_BACKUP, …). Stream JobProgress; finish with JobResult (echo job_id).
+//   - inventory (JOB_TYPE_INVENTORY): send InventoryReport then JobResult.
+//     noop (JOB_TYPE_NOOP): JobResult success immediately.
 //   - Reconnect: open a new Channel (supersedes old). Do not re-run a job_id you
 //     already completed; server ignores duplicate JobResult for terminal jobs and
-//     does not re-send JobStart for jobs already in running/terminal.
+//     does not re-send JobStart for jobs already delivered (running/terminal).
+//     JobStarts that never left the server buffer are reverted to pending and
+//     re-dispatched on the new channel.
 //   - UpdateOffer on the wire is reserved; agents may ignore. Server does not send it yet.
+//   - JobCancel: stop work for job_id; report JobResult (success=false) when stopped.
 //
 // Append-only: Channel never accepts agent-originated prune/verify/delete. JobCancel
 // cancels work only. Server-only job types cannot be submitted via this surface.
+//
+// Application-level errors (bad job id, inventory persistence, DB blips) are logged
+// and do NOT tear down the stream (S2-F1). Only protocol violations (duplicate Hello,
+// machine_id mismatch) are stream-fatal.
 type controlServer struct {
 	breakwaterv1.UnimplementedControlServiceServer
 	gw *Gateway
@@ -98,7 +106,7 @@ func (c *controlServer) Channel(stream breakwaterv1.ControlService_ChannelServer
 	}
 	log.Info("control channel up", "machine_id", machineID, "session_id", sessionID, "agent_version", hello.GetAgentVersion())
 
-	// Writer goroutine: session.send → stream.Send
+	// Writer goroutine: session.send → stream.Send; tracks delivered JobStarts (S2-F2).
 	writeErr := make(chan error, 1)
 	go func() {
 		for {
@@ -117,6 +125,10 @@ func (c *controlServer) Channel(stream breakwaterv1.ControlService_ChannelServer
 				if err := stream.Send(msg); err != nil {
 					writeErr <- err
 					return
+				}
+				// Mark JobStart delivered only after stream.Send succeeds.
+				if js := msg.GetJobStart(); js != nil {
+					sess.noteJobStartDelivered(js.GetJobId())
 				}
 			}
 		}
@@ -161,7 +173,7 @@ func (c *controlServer) Channel(stream breakwaterv1.ControlService_ChannelServer
 
 	select {
 	case err := <-readErr:
-		sess.close()
+		// Unregister in defer closes session and reverts undelivered JobStarts (S2-F2).
 		if err == io.EOF || err == nil {
 			return nil
 		}
@@ -171,22 +183,19 @@ func (c *controlServer) Channel(stream breakwaterv1.ControlService_ChannelServer
 		if err == context.Canceled || ctx.Err() != nil {
 			return nil
 		}
-		// stream closed / transport
 		if err == io.EOF {
 			return nil
 		}
 		return err
 	case err := <-writeErr:
-		sess.close()
 		if err == nil || err == context.Canceled {
 			return nil
 		}
 		return err
 	case <-sess.done:
-		// Superseded by a newer channel for this machine.
+		// Superseded by a newer channel (undelivered already flushed by Register).
 		return status.Error(codes.Aborted, "session superseded by newer channel")
 	case <-ctx.Done():
-		sess.close()
 		return nil
 	}
 }
@@ -194,12 +203,16 @@ func (c *controlServer) Channel(stream breakwaterv1.ControlService_ChannelServer
 func (c *controlServer) handleAgentMsg(ctx context.Context, machineID string, msg *breakwaterv1.AgentToServer, sess *session, log *slog.Logger) error {
 	switch m := msg.Msg.(type) {
 	case *breakwaterv1.AgentToServer_Hello:
-		// Duplicate Hello on an established stream — reject (first already consumed).
+		// Protocol violation — stream-fatal.
 		return status.Error(codes.InvalidArgument, "unexpected Hello after session established")
 
 	case *breakwaterv1.AgentToServer_Heartbeat:
+		// Re-assert online (S2-F8): self-heals supersede race where old teardown
+		// SetMachineOffline wins after new SetMachineOnline.
 		if c.gw.Catalog != nil {
-			_ = c.gw.Catalog.TouchLastSeen(ctx, machineID)
+			if err := c.gw.Catalog.SetMachineOnline(ctx, machineID); err != nil {
+				log.Error("heartbeat set online", "machine_id", machineID, "err", err)
+			}
 		}
 		hb := &breakwaterv1.ServerToAgent{
 			Msg: &breakwaterv1.ServerToAgent_HeartbeatAck{
@@ -220,21 +233,28 @@ func (c *controlServer) handleAgentMsg(ctx context.Context, machineID string, ms
 		if p == nil {
 			return nil
 		}
-		return c.gw.Engine.HandleProgress(ctx, machineID, p.GetJobId(), p.GetBytesDone(), p.GetBytesTotal())
+		// Application-level errors: log, keep stream (S2-F1).
+		if err := c.gw.Engine.HandleProgress(ctx, machineID, p.GetJobId(), p.GetBytesDone(), p.GetBytesTotal()); err != nil {
+			log.Error("HandleProgress", "machine_id", machineID, "job_id", p.GetJobId(), "err", err)
+		}
+		return nil
 
 	case *breakwaterv1.AgentToServer_JobResult:
 		r := m.JobResult
 		if r == nil {
 			return nil
 		}
-		return c.gw.Engine.HandleResult(ctx, machineID, scheduler.Result{
+		if err := c.gw.Engine.HandleResult(ctx, machineID, scheduler.Result{
 			JobID:        r.GetJobId(),
 			Success:      r.GetSuccess(),
 			ErrorMessage: r.GetErrorMessage(),
 			BytesRead:    r.GetBytesRead(),
 			BytesStored:  r.GetBytesStored(),
 			SnapshotID:   r.GetSnapshotId(),
-		})
+		}); err != nil {
+			log.Error("HandleResult", "machine_id", machineID, "job_id", r.GetJobId(), "err", err)
+		}
+		return nil
 
 	case *breakwaterv1.AgentToServer_Inventory:
 		inv := m.Inventory
@@ -244,12 +264,11 @@ func (c *controlServer) handleAgentMsg(ctx context.Context, machineID string, ms
 		items := inventoryToItems(machineID, inv)
 		if err := c.gw.Engine.HandleInventory(ctx, machineID, items); err != nil {
 			log.Error("persist inventory", "machine_id", machineID, "err", err)
-			return status.Errorf(codes.Internal, "persist inventory: %v", err)
+			// Not stream-fatal (S2-F1).
 		}
 		return nil
 
 	default:
-		// Unknown oneof — ignore gracefully for forward compatibility.
 		log.Debug("ignoring unknown AgentToServer message", "machine_id", machineID)
 		return nil
 	}
@@ -296,8 +315,8 @@ func inventoryToItems(machineID string, inv *breakwaterv1.InventoryReport) []cat
 //	})
 //
 // Application-level Heartbeat messages remain useful for last_seen / free_bytes
-// telemetry; transport keepalive keeps the HTTP/2 connection from going idle
-// through NATs/LBs.
+// telemetry and re-assert online status (S2-F8); transport keepalive keeps the
+// HTTP/2 connection from going idle through NATs/LBs.
 func KeepaliveServerParameters() (time.Duration, time.Duration) {
 	return 30 * time.Second, 10 * time.Second
 }

@@ -92,6 +92,11 @@ func main() {
 	// the documented exception — brand-new repo, no concurrent jobs).
 	repoLocks := scheduler.NewRepoLocks()
 	jobEngine := scheduler.NewEngine(db, repoLocks, log)
+	// S2-F5: orphaned running rows from a previous process cannot resume.
+	if err := jobEngine.RecoverOnStartup(context.Background()); err != nil {
+		log.Error("job recovery", "err", err)
+		os.Exit(1)
+	}
 	controlReg := agentgw.NewRegistry(log)
 
 	enrollSvc := &enroll.Service{

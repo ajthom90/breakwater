@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 )
 
 // InventoryItem is one volume or VM row in machine_inventory.
@@ -19,6 +20,10 @@ type InventoryItem struct {
 
 // ReplaceMachineInventory atomically replaces all inventory rows for a machine
 // with the provided set (full refresh from InventoryReport).
+//
+// Malformed items (empty kind or external_id) are skipped and logged — they do
+// not fail the whole report (S2-F1). One agent enumeration quirk must not wipe
+// the control plane.
 func (db *DB) ReplaceMachineInventory(ctx context.Context, machineID string, items []InventoryItem) error {
 	return db.WithTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM machine_inventory WHERE machine_id = ?`, machineID); err != nil {
@@ -26,13 +31,17 @@ func (db *DB) ReplaceMachineInventory(ctx context.Context, machineID string, ite
 		}
 		for _, it := range items {
 			if it.Kind == "" || it.ExternalID == "" {
-				return fmt.Errorf("inventory item missing kind or external_id")
+				slog.Warn("skipping malformed inventory item",
+					"machine_id", machineID, "kind", it.Kind, "external_id", it.ExternalID, "name", it.Name)
+				continue
 			}
 			details := "{}"
 			if it.Details != nil {
 				b, err := json.Marshal(it.Details)
 				if err != nil {
-					return fmt.Errorf("marshal details: %w", err)
+					slog.Warn("skipping inventory item with bad details",
+						"machine_id", machineID, "external_id", it.ExternalID, "err", err)
+					continue
 				}
 				details = string(b)
 			}
