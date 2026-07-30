@@ -73,3 +73,40 @@ grep -rn 'bw-object-from-contents' server/ pkg/ agent/ ; echo "sentinel grep exi
 ```
 
 **Standing rules:** unchanged, except the proto freeze admits S3-F1's additive field/RPC (precedent R2-5, S2-F7). The `pkg/contentid` kopia carve-out (repo/hashing + repo/splitter only) stands as specified in the stage-3 contract.
+
+---
+
+## Subreview A — `pkg/contentid`, `pkg/backup`, agent module
+
+Independent adversarial pass (source-level, cross-checked against kopia v0.19.0 sources in the module cache).
+
+### S3-F5 · High — symlinks are silently dropped from every backup (success reported, data missing)
+`pkg/backup/backup.go:173-181`
+The comment says "symlinks treated as files with content of target path — portable MVP", but the code never special-cases `os.ModeSymlink`. `os.ReadDir` + `DirEntry.Info()` are Lstat-based, so a symlink (to file *or* directory) always fails `IsRegular()` and hits `continue`: no `TreeEntry`, no stats increment, no warning, no error. A tree containing symlinks backs up as **success** with every symlink silently omitted — the same "success but incomplete restore" class as S3-F1. `pkg/backup` has **no unit tests at all**; the only exercising test is the server demo fixture, which contains no symlinks. Corollary: the pre-scan counts symlink sizes into `totalBytes` but they're never added to `bytesDone`, so progress can never reach 100% when symlinks exist.
+**Fix:** decide and implement the M2 policy explicitly — store symlinks as `format.EntrySymlink` with the target in `ReparseData` (the format already has both fields) — and record any deliberately skipped entry type in the job result/stats so "skipped" is always visible, never silent. Add `pkg/backup` unit tests covering symlinks (file + dir targets, loops), device/socket files, empty files/dirs.
+**Test first:** backup a tree with symlinks → assert they appear in the snapshot (or are explicitly reported as skipped, never silently missing).
+**Client-side defense-in-depth for S3-F1:** `backupDir` must also reject/escape a real entry named `.bw-object-from-contents` regardless of the server-side fix.
+
+### S3-F6 · Medium — the multi-chunk round-trip test is non-deterministic and usually tests only one chunk
+`server/internal/vault/contentid_roundtrip_test.go:41-54`
+The "multi-chunk" case uses a 3 MiB random payload. Verified against pinned kopia v0.19.0: `DYNAMIC-4M-BUZHASH` has minSize 2 MiB / avgSize 4 MiB / maxSize 8 MiB, and bytes below minSize are never hash-checked — so only ~1 MiB is eligible, giving **P(zero splits) ≈ 78%**. The test never asserts `len(ids) > 1`, so it usually degenerates to the single-chunk path and never exercises `ConcatenateObjects`. This is the test that is supposed to lock the have/want contract (the R2-14 role).
+**Fix:** use a payload > maxSize (**> 8 MiB**), which forces a split unconditionally, and assert `len(ids) > 1` explicitly. Add small/edge sizes (0, 1, exactly minSize, exactly maxSize) as separate cases.
+
+### S3-F7 · Medium — kopia confinement is enforced only for the `pkg` module, not `agent`/`cli`
+`pkg/contentid/confinement_test.go:75-97`
+The test walks only the directory containing `pkg/go.mod` (it does correctly catch a *new* `pkg/<subpackage>` violation). But `agent/` and `cli/` are separate modules and are never scanned, while `agent/go.mod` already carries kopia as an indirect dep — so a direct `import "github.com/kopia/kopia/repo/content"` anywhere under `agent/` or `cli/` compiles and every test stays green. The carve-out doc comment claims coverage of "pkg/agent/cli".
+**Fix:** extend the confinement check to all modules (walk the workspace root, or add equivalent tests in `agent`/`cli`), and wire it into CI so the rule is enforced by the pipeline, not one module's test.
+
+### S3-F8 · Low — splitter boundary identity with `WriteObject` is true by construction but untested
+`pkg/contentid/contentid.go:127-197` vs `server/internal/vault/kopia.go` (`WriteObject`, `SplitterDynamic`)
+Both sides resolve the same `"DYNAMIC-4M-BUZHASH"` factory from the same pinned kopia and the streaming loops are algorithmically equivalent, so boundaries match today — but nothing tests it, and the production data path never invokes `WriteObject` with the dynamic splitter (only `FIXED-4M` for tree/manifest JSON). A future kopia bump could silently break the agent/server chunk agreement.
+**Fix:** one regression test that splits a >8 MiB payload with `pkg/contentid` and with vault `WriteObject(SplitterDynamic)` and asserts identical content-ID sequences.
+
+### Verified clean (subreview A)
+- `contentid.New()` cannot fall back to an unkeyed hash (unexported fields, empty algorithm/secret rejected, unknown algorithm hits an explicit error).
+- Content-ID string form is byte-identical to kopia's `index.ID.String()` for unprefixed IDs.
+- `CheckContents` batching caps at 4096 with no off-by-one; directory entries are name-sorted before tree construction (deterministic trees → dedup of unchanged subtrees works); empty dirs/files produce valid entries consistent with kopia's own flush-on-empty behavior; no symlink-loop hang risk (dir symlinks never satisfy `IsDir()`).
+- `agent/internal/fileback` is a pure re-export with no kopia imports.
+
+### Noted, not scored
+The pipeline aborts the whole job on the first per-file error rather than skip-and-record. PLAN doesn't state a policy; fail-loud is defensible and consistent with this project's aversion to silent omissions. **Decide it explicitly in the fix round** and document it — with S3-F5 fixed, "skipped" must always be visible in the job result either way.
