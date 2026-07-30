@@ -92,3 +92,34 @@ TestS5F1_MaxSegmentEqualsMaxPutContentBytes  # PASS (max==8MiB)
 TestS5F1_VerifyObjectOrderIsNotStreamOrder  # documents map order
 go test ./internal/vault/ -count=10 -run 'TestS3F8|ContentID|RoundTrip|TestS5F1'  # PASS ×10
 ```
+
+---
+
+## M2 closeout audit (reviewer, 2026-07-30)
+
+Re-ran the full closeout verification on `aee9a10` — all green: server suite
+under `-race`; vault contract tests at `-count=10`; `pkg` at `-count=3`; agent,
+`tools/golden`, web (`tsc --noEmit` + build); reduced engine gate; M2S4/M2S5
+demos. The committed UI bundle rebuilt **byte-identically**, so the working tree
+stayed clean.
+
+PROGRESS.md's M2 closeout is **accurate as written**: the Windows agent row is
+marked ⚠️ code-complete/runtime-unproven, and the demo table explicitly marks MSI
+install and LocalSystem service start as ❌ unproven. That matches the evidence.
+
+Two observations recorded for later (neither gates M2):
+
+1. **A green `windows-latest` job will NOT by itself prove the demo.** The job
+   runs agent unit tests, full Windows golden fixtures, the agent build, WiX
+   install and MSI build — i.e. it validates the *toolchain and fixtures*, not
+   the runtime. Untested-list items that remain open even after that job goes
+   green: service SCM lifecycle (start/stop/shutdown, delayed auto-start),
+   `msiexec /i` install/uninstall end-to-end, state-dir ACL enforcement, volume
+   inventory against real drives, and the `PendingEnrollToken`→enroll→delete
+   path. Those need a Windows VM with an actual install, not a build runner.
+   Do not let "Windows CI is green" collapse into "the M2 demo is proven".
+2. **The built UI bundle (`server/internal/web/dist`) is committed.** That is a
+   reasonable choice (keeps `go build ./...` working without Node), but nothing
+   verifies the committed bundle matches `web/src` — a UI change without a
+   rebuild would silently ship a stale bundle. Cheap fix when convenient: have
+   CI rebuild and `git diff --exit-code` the dist path.
