@@ -109,3 +109,22 @@ cd ../pkg && go test ./... -count=1
 | S2-F8 | ✅ Fixed | Heartbeat calls `SetMachineOnline` (idempotent re-assert) |
 
 Red-first captures and after-fix evidence: see `PROGRESS.md` stage-2 fix round.
+
+---
+
+## Reviewer verification (fix round, 2026-07-30)
+
+Independently verified `90e7ba4`: full race-enabled suite green; diffs match all eight
+prescriptions (track-before-enqueue ordering in the registry is correct; undelivered
+revert runs before disconnect-failure in teardown, so requeued jobs cannot be
+collaterally failed; writer-preference cleanup handles ctx cancellation under the
+mutex). Mutation battery: F1 (hard-error restored) and F2 (revert no-op'd) and F3
+(preference removed) all killed by their tests. The F4 mutation survived as an
+EQUIVALENT mutant — `completeJob` independently allows only `running`, so behavior is
+double-guarded; noted test-hardening item (failure-result for pending) queued into the
+stage-3 contract. **Stage 2 closed.**
+
+Carried into the stage-3 contract: lease-only vault access (structural), Cancel
+lease-release-on-confirmation for vault-touching types, non-blocking dispatch-loop
+lease acquisition, a pending-job retrigger for queue-full/live-channel (no retrigger
+until reconnect today), and the F4 failure-result test hardening.
