@@ -4,7 +4,7 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
-**Phase 1 — M2 (weeks 3–4)** — ✅ **COMPLETE** on Linux/darwin evidence (stage 5 closed; Windows demo subset still gated — see [M2 closeout](#m2-closeout))
+**Phase 1 — M2 (weeks 3–4)** — ✅ **COMPLETE** on Linux/darwin evidence (stage 5 + S5-F1/F2; Windows demo subset still gated — see [M2 closeout](#m2-closeout))
 
 **Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; closed at `161fb18`)
 
@@ -658,23 +658,107 @@ dedup ratio run2/run1 ≈ 0.0000  (≪ 5%)
 snapshots=2; audit chain_ok=true; unauth API → 401
 ```
 
-#### Verification (stage 5)
+#### Verification (stage 5 — single run; superseded by S5-F1/F2 below)
 
 ```
 gofmt -l server pkg agent cli restore tools   # empty
 cd server && go vet ./... && go test ./... -count=1 -short -race -timeout 10m  # PASS
-cd agent && go test ./... -count=1 -race                                      # PASS
-cd pkg && go test ./... -count=1 -race                                        # PASS
-cd tools/golden && go test ./... -count=1 -race                               # PASS
-cd web && npm ci && npx tsc --noEmit -p tsconfig.app.json && npm run build    # PASS
-cd server && go build ./... && go test ./internal/web/ -count=1 -race -v      # PASS
-go test ./internal/agentgw/ -count=1 -race -run 'TestM2S5|TestM2S4|Golden' -v # PASS
-BW_GATE_BYTES=268435456 go test ./internal/vault/ -run TestEngineGate_Kopia -v # PASS
+… (web, agentgw M2S5, gate) …
+```
+
+#### Fix round S5-F1 / S5-F2 (post-`9ab2831` review `REVIEW-M2-S5.md`)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| S5-F1 | ✅ Fixed | Root cause + stream-order IDs + deterministic seeded contract |
+| S5-F2 | ✅ Fixed | Closeout re-run with `-count=10` (vault) / `-count=3` (pkg) |
+
+##### Root cause (S5-F1) — not a splitter divergence
+
+PLAN's bit-identical have/want contract **holds**. `pkg/contentid.ChunkAndID` and
+kopia `object.Writer` (via `WriteObject(DYNAMIC)`) produce the **same chunk
+boundaries and the same content IDs** for every seed tested (1–40, including the
+review list). Evidence:
+
+1. Whole-slice vs incremental `NextSplitPoint` (32 KiB `io.Copy` buffers): **0**
+   size divergences for seeds 1–40.
+2. `PutContent` of each pkg chunk reproduces the pkg ID (`putOK=true` for all).
+3. Multiset of data IDs from `VerifyObject` equals the pkg ID sequence for all
+   seeds — **true content divergence count = 0**.
+
+What failed was **TestS3F8's comparison method**: it compared the pkg ID
+*sequence* to `VerifyObject`'s return order. Kopia's `object.VerifyObject` uses
+a `map[content.ID]bool` tracker and returns IDs in **map iteration order**
+(non-deterministic). Same count, first index differs → looks like a first-boundary
+bug; it is only reordering. Flake rate ~15% matches map-order collision chance.
+
+Fix:
+
+- `Vault.ObjectDataContentIDs` — walk the kopia **indirect index in stream order**
+  (exported for tests / future re-chunk-sensitive paths).
+- `TestS3F8` and new `TestS5F1_SeededSplitterSequenceIdentity` compare against
+  stream order, with deterministic seeds (incl. 11, 16, 26, 28, 36, 39) and
+  `len(chunk) <= MaxPutContentBytes` (DYNAMIC-4M max segment **equals** 8 MiB;
+  PutContent guard is `>`, so exact-max is valid — seed 16 hits 8388608).
+- Document on `VerifyObject`: not for sequence identity.
+
+No kopia pin change; splitter code in `pkg/contentid` unchanged (was already correct).
+
+##### Red-first (against `9ab2831` VerifyObject-ordered compare)
+
+Probe (removed after capture) ordered-compared pkg IDs to filtered `VerifyObject`
+output for seeds 11,16,26,28,36,39 then 1–40. **Must fail** (map order):
+
+```
+=== RUN   TestS5F1_RedFirst_VerifyObjectOrderedCompare
+    SEED 28 DIVERGENCE at chunk 0: pkg=1cdccc58a2499287… server=e9d3ebe742592085… (pkgN=2 serverN=2)
+    SEED 36 DIVERGENCE at chunk 0: pkg=fc1a8ee58cd70885… server=a016bb8b59942116… (pkgN=3 serverN=3)
+    RED-FIRST evidence: 2 seed(s) failed ordered VerifyObject compare (S5-F1)
+--- FAIL: TestS5F1_RedFirst_VerifyObjectOrderedCompare
+
+=== RUN   TestS5F1_RedFirst_VerifyObjectOrderedCompare  (-count=3 run 2)
+    SEED 7 DIVERGENCE at chunk 0: … (pkgN=3 serverN=3)
+--- FAIL
+
+=== RUN   TestS5F1_RedFirst_VerifyObjectOrderedCompare  (-count=3 run 3)
+    SEED 26 DIVERGENCE at chunk 0: … (pkgN=4 serverN=4)
+--- FAIL
+```
+
+(Which seeds fail varies by run — confirms non-determinism, not fixed boundary bugs.)
+
+After fix, `TestS5F1_SeededSplitterSequenceIdentity` + `TestS3F8` use
+`ObjectDataContentIDs` and pass every seed every run.
+
+##### Repeat-count evidence (S5-F2)
+
+```
+# vault contract — must be green EVERY run
+go test ./internal/vault/ -count=10 -run 'TestS3F8|ContentID|RoundTrip|TestS5F1' -v
+# → PASS all 10 (incl. 40 seeds × 10 + MaxSegment + VerifyObjectOrder doc)
+
+# full short+race
+cd server && go test ./... -count=1 -short -race -timeout 10m   # PASS
+
+# pkg
+cd pkg && go test ./... -count=3 -race                         # PASS all 3
+
+# agent, golden, web, engine gate
+cd agent && go test ./... -count=1 -race                       # PASS
+cd tools/golden && go test ./... -count=1 -race                # PASS
+cd web && npm ci && npx tsc --noEmit -p tsconfig.app.json && npm run build  # PASS
+cd server && go test ./internal/web/ -count=1 -race -v         # PASS
+BW_GATE_BYTES=268435456 go test ./internal/vault/ -run TestEngineGate_Kopia -v  # PASS
 ```
 
 ---
 
 ## M2 closeout
+
+**M2 is closed on Linux/darwin evidence after S5-F1/F2.** Stage-5 UI/API was
+already good; the blocking issue was a latent stage-3 **test** defect that made
+the suite non-reproducible. Windows half of PLAN's demo remains unproven
+(see untested-on-Windows list).
 
 ### PLAN M2 deliverables (honest status)
 

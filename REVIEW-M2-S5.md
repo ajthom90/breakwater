@@ -64,3 +64,31 @@ BW_GATE_BYTES=268435456 go test ./internal/vault/ -count=1 -run TestEngineGate_K
 ```
 
 **Standing rules unchanged.** Proto frozen; kopia confined (`pkg/contentid` carve-out); no new deps.
+
+---
+
+## Disposition (append-only — fix round after `9ab2831`)
+
+| ID | Status | Resolution |
+|----|--------|------------|
+| S5-F1 | ✅ Fixed | **Root cause revised:** agent/server CDC boundaries are bit-identical; `TestS3F8` compared pkg sequence to kopia `VerifyObject` **map-iteration order** (non-deterministic). Added `Vault.ObjectDataContentIDs` (stream-order via indirect index). `TestS3F8` + `TestS5F1_SeededSplitterSequenceIdentity` (seeds 1–40 incl. 11,16,26,28,36,39) assert sequence equality + `len(chunk) ≤ MaxPutContentBytes`. Splitter/`ChunkAndID` code unchanged. Red-first: VerifyObject-ordered probe FAILED on unmodified `9ab2831` (see PROGRESS). |
+| S5-F2 | ✅ Fixed | Closeout re-run: vault contract `-count=10` green every run; pkg `-count=3`; full short+race; web/agent/golden/gate. Recorded in PROGRESS. |
+
+### Red-first capture (VerifyObject ordered compare on `9ab2831`)
+
+```
+=== RUN   TestS5F1_RedFirst_VerifyObjectOrderedCompare
+    SEED 28 DIVERGENCE at chunk 0: pkg=1cdccc58a2499287… server=e9d3ebe742592085… (pkgN=2 serverN=2)
+    SEED 36 DIVERGENCE at chunk 0: pkg=fc1a8ee58cd70885… server=a016bb8b59942116… (pkgN=3 serverN=3)
+--- FAIL  (failed seed set varies by run — map order)
+```
+
+### After fix
+
+```
+TestS5F1_SeededSplitterSequenceIdentity  # 40 seeds PASS
+TestS3F8_SplitterBoundaryIdentityWithWriteObject  # PASS (stream order)
+TestS5F1_MaxSegmentEqualsMaxPutContentBytes  # PASS (max==8MiB)
+TestS5F1_VerifyObjectOrderIsNotStreamOrder  # documents map order
+go test ./internal/vault/ -count=10 -run 'TestS3F8|ContentID|RoundTrip|TestS5F1'  # PASS ×10
+```

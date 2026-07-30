@@ -182,7 +182,14 @@ type Vault interface {
 	OpenObject(ctx context.Context, id ObjectID) (io.ReadCloser, error)
 
 	// VerifyObject checks object integrity and returns backing content IDs.
+	// Order is NOT stream order (kopia uses a map tracker — S5-F1). Use
+	// ObjectDataContentIDs when sequence matters for have/want identity.
 	VerifyObject(ctx context.Context, id ObjectID) ([]ContentID, error)
+
+	// ObjectDataContentIDs returns the object's data content IDs in stream order
+	// (indirect index entry order). Metadata/index contents (x-prefix) are omitted.
+	// This is the sequence that must match pkg/contentid ChunkAndID (S5-F1).
+	ObjectDataContentIDs(ctx context.Context, id ObjectID) ([]ContentID, error)
 
 	// PutSnapshotRecord stores a Breakwater snapshot manifest (labels + JSON payload).
 	// Rejects unknown kinds, unparseable RootObjectID, and roots that do not decode

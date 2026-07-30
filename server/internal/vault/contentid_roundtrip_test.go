@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	mathrand "math/rand"
 	"testing"
 
 	"github.com/ajthom90/breakwater/pkg/contentid"
@@ -119,8 +120,13 @@ func TestPkgContentID_RoundTripWithVault(t *testing.T) {
 	}
 }
 
-// TestS3F8_SplitterBoundaryIdentityWithWriteObject (S3-F8): pkg splitter + hash
-// must match content IDs from vault WriteObject(DYNAMIC) on the same payload.
+// TestS3F8_SplitterBoundaryIdentityWithWriteObject (S3-F8 / S5-F1): pkg splitter
+// + hash must match content IDs from vault WriteObject(DYNAMIC) on the same
+// payload, in stream order.
+//
+// S5-F1: do NOT use VerifyObject for sequence — kopia returns map iteration
+// order. Use ObjectDataContentIDs (indirect index walk). Deterministic seeds
+// including the REVIEW-M2-S5 list live in TestS5F1_SeededSplitterSequenceIdentity.
 func TestS3F8_SplitterBoundaryIdentityWithWriteObject(t *testing.T) {
 	ctx := context.Background()
 	mgr := vault.NewManager(t.TempDir(), t.TempDir())
@@ -143,43 +149,40 @@ func TestS3F8_SplitterBoundaryIdentityWithWriteObject(t *testing.T) {
 	}
 	defer sp.Close()
 
+	// Deterministic payload (not crypto/rand) so this test is not flaky.
 	payload := make([]byte, 10<<20)
-	if _, err := rand.Read(payload); err != nil {
+	rng := mathrand.New(mathrand.NewSource(42))
+	if _, err := rng.Read(payload); err != nil {
 		t.Fatal(err)
 	}
-	_, pkgIDs, err := contentid.ChunkAndID(h, sp, payload)
+	chunks, pkgIDs, err := contentid.ChunkAndID(h, sp, payload)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pkgIDs) <= 1 {
 		t.Fatalf("need multi-chunk, got %d", len(pkgIDs))
 	}
+	for i, c := range chunks {
+		if len(c) > vault.MaxPutContentBytes {
+			t.Fatalf("chunk[%d] len=%d > MaxPutContentBytes=%d", i, len(c), vault.MaxPutContentBytes)
+		}
+	}
 
 	oid, err := v.WriteObject(ctx, vault.SplitterDynamic, bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
-	serverIDs, err := v.VerifyObject(ctx, oid)
+	serverIDs, err := v.ObjectDataContentIDs(ctx, oid)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("ObjectDataContentIDs: %v", err)
 	}
-	// Filter out indirect-index contents (prefixed x/g-z).
-	var dataIDs []string
-	for _, id := range serverIDs {
-		s := string(id)
-		if len(s) > 0 && s[0] >= 'g' && s[0] <= 'z' {
-			continue // metadata/index prefix
-		}
-		dataIDs = append(dataIDs, s)
+	if len(serverIDs) != len(pkgIDs) {
+		t.Fatalf("S3-F8: content count pkg=%d server=%d serverIDs=%v", len(pkgIDs), len(serverIDs), serverIDs)
 	}
-	if len(dataIDs) != len(pkgIDs) {
-		t.Fatalf("S3-F8: content count pkg=%d server=%d (all=%v)", len(pkgIDs), len(dataIDs), serverIDs)
-	}
-	// Order and values must match (same splitter + same keyed hash).
 	for i := range pkgIDs {
-		if pkgIDs[i] != dataIDs[i] {
-			t.Fatalf("S3-F8: id[%d] pkg=%s server=%s", i, pkgIDs[i], dataIDs[i])
+		if pkgIDs[i] != string(serverIDs[i]) {
+			t.Fatalf("S3-F8: id[%d] pkg=%s server=%s", i, pkgIDs[i], serverIDs[i])
 		}
 	}
-	t.Logf("S3-F8 PASS: %d content IDs match WriteObject(DYNAMIC)", len(pkgIDs))
+	t.Logf("S3-F8 PASS: %d content IDs match WriteObject(DYNAMIC) in stream order", len(pkgIDs))
 }

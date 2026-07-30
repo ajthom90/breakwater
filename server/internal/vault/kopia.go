@@ -490,6 +490,8 @@ func (v *kopiaVault) VerifyObject(ctx context.Context, id ObjectID) ([]ContentID
 	if err != nil {
 		return nil, fmt.Errorf("parse object id: %w", err)
 	}
+	// NOTE (S5-F1): kopia object.VerifyObject returns IDs from a map tracker —
+	// order is non-deterministic and must not be used for sequence identity.
 	ids, err := v.rep.VerifyObject(ctx, oid)
 	if err != nil {
 		return nil, err
@@ -499,6 +501,93 @@ func (v *kopiaVault) VerifyObject(ctx context.Context, id ObjectID) ([]ContentID
 		out[i] = ContentID(c.String())
 	}
 	return out, nil
+}
+
+// ObjectDataContentIDs returns data content IDs in stream order by walking the
+// kopia indirect index (or a single direct content for small objects).
+//
+// S5-F1: VerifyObject cannot provide this order — it iterates a map. Agent-side
+// ChunkAndID and server-side WriteObject produce the same sequence; this method
+// is how tests and future re-chunk-sensitive paths observe it.
+func (v *kopiaVault) ObjectDataContentIDs(ctx context.Context, id ObjectID) ([]ContentID, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	if err := v.requireOpen(); err != nil {
+		return nil, err
+	}
+
+	oid, err := object.ParseID(string(id))
+	if err != nil {
+		return nil, fmt.Errorf("parse object id: %w", err)
+	}
+
+	// Direct single-content object (common for small payloads / FIXED-8M PutContent).
+	if cid, _, ok := oid.ContentID(); ok {
+		return []ContentID{ContentID(cid.String())}, nil
+	}
+
+	indexOID, ok := oid.IndexObjectID()
+	if !ok {
+		return nil, fmt.Errorf("object %s: unrecognized object type", id)
+	}
+
+	dr, ok := v.rep.(repo.DirectRepository)
+	if !ok {
+		return nil, fmt.Errorf("object content IDs: repository is not DirectRepository")
+	}
+
+	// Walk seek table in stream order. Each entry's Object is a direct content
+	// (or nested indirect — recurse for completeness).
+	return collectDataContentIDsInOrder(ctx, directContentReader{dr: dr}, indexOID)
+}
+
+// directContentReader adapts DirectRepository to the contentReader surface
+// expected by object.LoadIndexObject (GetContent/ContentInfo/PrefetchContents).
+// ContentManager is only on DirectRepositoryWriter; ContentReader + PrefetchContents
+// on DirectRepository/Repository are sufficient for index walks.
+type directContentReader struct {
+	dr repo.DirectRepository
+}
+
+func (r directContentReader) GetContent(ctx context.Context, id content.ID) ([]byte, error) {
+	return r.dr.ContentReader().GetContent(ctx, id)
+}
+
+func (r directContentReader) ContentInfo(ctx context.Context, id content.ID) (content.Info, error) {
+	return r.dr.ContentReader().ContentInfo(ctx, id)
+}
+
+func (r directContentReader) PrefetchContents(ctx context.Context, ids []content.ID, hint string) []content.ID {
+	return r.dr.PrefetchContents(ctx, ids, hint)
+}
+
+// collectDataContentIDsInOrder walks an indirect index object and returns leaf
+// data content IDs in stream order. Nested indirection is expanded; the index
+// content itself is not included (only data leaves).
+func collectDataContentIDsInOrder(ctx context.Context, cr directContentReader, indexOID object.ID) ([]ContentID, error) {
+	entries, err := object.LoadIndexObject(ctx, cr, indexOID)
+	if err != nil {
+		return nil, fmt.Errorf("LoadIndexObject: %w", err)
+	}
+	var out []ContentID
+	for _, e := range entries {
+		ids, err := leafDataContentIDs(ctx, cr, e.Object)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ids...)
+	}
+	return out, nil
+}
+
+func leafDataContentIDs(ctx context.Context, cr directContentReader, oid object.ID) ([]ContentID, error) {
+	if cid, _, ok := oid.ContentID(); ok {
+		return []ContentID{ContentID(cid.String())}, nil
+	}
+	if indexOID, ok := oid.IndexObjectID(); ok {
+		return collectDataContentIDsInOrder(ctx, cr, indexOID)
+	}
+	return nil, fmt.Errorf("unrecognized object ID in index: %v", oid)
 }
 
 func (v *kopiaVault) PutSnapshotRecord(ctx context.Context, rec SnapshotRecord) (SnapshotRecordID, error) {
