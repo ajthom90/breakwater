@@ -546,20 +546,30 @@ TestS4F6… TestS4F1… TestS4F3…  # PASS under -race
 gofmt / go vet / short+race / agent -race / golden -race / M2S4 -race / gate 256MB  # green
 ```
 
-#### Untested on Windows / must verify on first real run
+#### Windows CI vs still-unproven runtime
 
-**Do not claim these work until `windows-latest` CI or a Windows VM proves them.**
+**Proven by `windows-latest` CI** (steps that actually ran green before MSI authoring
+failed — confirmed on failed runs through M2-s5; re-confirmed when MSI build is green):
+
+| Item | CI evidence |
+|------|-------------|
+| Agent unit/integration tests (`agent/`) | `go test ./...` on windows-latest |
+| Golden fixtures (Windows set) | ACLs, ADS, sparse, junction loops, long paths, deny-share-locked — `tools/golden` tests pass |
+| Agent windows/amd64 build + `--version` | CI build step executes the binary |
+| WiX v5 toolchain install | `dotnet tool install wix` + `wix --version` |
+
+**Still unproven** (no `msiexec` / service runtime on a real box yet — a green MSI
+*build* is not an MSI *install*):
 
 1. **Service SCM lifecycle** — Start/Stop/Shutdown via `sc.exe` / services.msc; graceful job cancel on Stop; delayed auto-start after reboot; event-log source `BreakwaterAgent`.
 2. **State dir ACL** — `SecureDir` sets SYSTEM+Administrators only, inheritance disabled; standard user cannot read `identity.json` / certs. Window between MSI CreateFolder and first SecureDir (inherited ACLs while folder empty / token write).
 3. **Volume inventory** — `GetLogicalDrives` / serial IDs; fixed drives appear; empty CD does not panic; network drives excluded.
-4. **MSI install/uninstall** — `msiexec /i … BWTOKEN=BW1:…` enrolls on first start; service starts as LocalSystem; silent install; uninstall stops service, removes files, **never** touches server-side backups; SHA256 artifact published.
-5. **WiX v5 toolchain** — `wix build` on `windows-latest` (encoded in CI; first green run is the validation).
-6. **Windows golden fixtures** — long paths, SYSTEM ACLs, ADS, junction loops, exclusive share-lock during backup.
-7. **Token-at-rest (S4-F2)** — deferred CA writes `pending-enroll.token` under ProgramData; MsiHiddenProperties redacts BWTOKEN from `/l*v` logs; agent deletes file (not blank) after enroll; legacy HKLM value migrated then deleted.
-8. **SD comparison path (S4-F7)** — GetNamedSecurityInfo + SDDL equality on NTFS after restore; SACL privilege fallback.
-9. **Directory fsync after rename (S4-F4)** — FlushFileBuffers on a directory handle after identity.json rename survives hard power loss.
-10. **SeBackupPrivilege / VSS** — not in stage 4 scope (plain-directory `pkg/backup` only); Phase later.
+4. **MSI install/uninstall** — `msiexec /i … BWTOKEN=BW1:…` enrolls on first start; service starts as LocalSystem; silent install; uninstall stops service, removes files, **never** touches server-side backups.
+5. **Token-at-rest path (S4-F2)** — deferred CA writes `pending-enroll.token` under ProgramData; `Property/@Hidden` redacts BWTOKEN from `/l*v` logs (WiX v5; not `MsiHiddenProperties`); agent deletes file after enroll; legacy HKLM migrate+delete on a real install.
+6. **SD comparison path (S4-F7)** — GetNamedSecurityInfo + SDDL equality on NTFS after restore; SACL privilege fallback (unit path exercises in golden CI; full restore-from-backup still needs an install+backup cycle).
+7. **Directory fsync after rename (S4-F4)** — FlushFileBuffers on a directory handle after identity.json rename survives hard power loss.
+8. **SeBackupPrivilege / VSS** — not in stage 4 scope (plain-directory `pkg/backup` only); Phase later.
+9. **MSI product build** — `wix build` of `BreakwaterAgent.wxs` (CI was red on WIX0070 from invalid `MsiHiddenProperties`; fixed — green MSI *build* still does not prove install).
 
 #### Decisions (stage 4)
 
@@ -570,7 +580,7 @@ gofmt / go vet / short+race / agent -race / golden -race / M2S4 -race / gate 256
 5. **WiX is build-tool only** (MS-RL); output MSI is ours (PLAN pre-approved). Unsigned MVP; SHA256 in CI.
 6. **Multi-GB golden** is opt-in (`LargeFiles=true`) — default CI uses multi-MB for multi-chunk coverage without multi-minute fixtures.
 7. **Control send path (S4-F1):** single `sendMu` choke point for every Channel client Send/CloseSend.
-8. **Enrollment token (S4-F2):** MsiHiddenProperties + file under SecureDir; never world-readable HKLM as the at-rest store.
+8. **Enrollment token (S4-F2):** `Property Id="BWTOKEN" Secure="yes" Hidden="yes"` + file under SecureDir; never world-readable HKLM as the at-rest store. (WiX v5: do not author `MsiHiddenProperties` — WIX0070.)
 
 #### Verification (stage 4 + fix round — darwin/arm64)
 

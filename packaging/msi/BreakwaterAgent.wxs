@@ -35,9 +35,14 @@
 
     <MediaTemplate EmbedCab="yes" />
 
-    <!-- Enrollment token: Secure for elevation; MsiHiddenProperties redacts from logs (S4-F2). -->
+    <!--
+      Enrollment token (S4-F2):
+      - Secure="yes" — may cross elevation boundary into deferred custom actions
+      - Hidden="yes" — WiX v5 way to redact the value from msiexec verbose logs
+        (Property/@Hidden). Do NOT author Id="MsiHiddenProperties" — WiX v5
+        rejects that special property (WIX0070: use attributes on Property instead).
+    -->
     <Property Id="BWTOKEN" Secure="yes" Hidden="yes" />
-    <Property Id="MsiHiddenProperties" Value="BWTOKEN" />
 
     <!-- Install dir -->
     <StandardDirectory Id="ProgramFiles64Folder">
@@ -58,7 +63,14 @@
               Name="breakwater-agent.exe"
               KeyPath="yes" />
 
-        <!-- Windows service: SYSTEM, auto-start, delayed -->
+        <!--
+          Windows service: SYSTEM, auto-start, delayed.
+          ServiceConfig here is the native MSI table (WiX emits WIX1149: SDK docs
+          say ServiceConfig "does not work as expected"). We keep DelayedAutoStart
+          for the intended post-boot behavior and accept the warning for MVP;
+          replacing with WixToolset.Util.wixext ServiceConfig is a later cleanup.
+          Runtime delayed-auto-start still requires a real Windows install to prove.
+        -->
         <ServiceInstall
             Id="BreakwaterAgentService"
             Name="BreakwaterAgent"

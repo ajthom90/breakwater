@@ -1,6 +1,12 @@
 # Breakwater server — single static binary, distroless runtime.
 # Build from repository root:
 #   docker build -f packaging/docker/Dockerfile -t breakwater:dev .
+#
+# go.work members (keep this list in sync when adding modules):
+#   agent, cli, pkg, restore, server, tools/golden
+# Module go.mod (+ go.sum) for EVERY workspace member must be COPYed before
+# `go mod download`, or the workspace load fails even if the binary does not
+# import that package.
 
 FROM node:22-bookworm AS web
 WORKDIR /src/web
@@ -15,17 +21,25 @@ WORKDIR /src
 ENV GOTOOLCHAIN=local
 ENV CGO_ENABLED=0
 
-# Module files first for better layer caching
+# --- go.work + per-module go.mod/go.sum (cache layer; one COPY per workspace member) ---
 COPY go.work go.work.sum* ./
+# pkg
 COPY pkg/go.mod pkg/go.sum ./pkg/
+# server
 COPY server/go.mod server/go.sum ./server/
+# agent
 COPY agent/go.mod agent/go.sum* ./agent/
+# restore
 COPY restore/go.mod restore/go.sum* ./restore/
+# cli
 COPY cli/go.mod cli/go.sum* ./cli/
+# tools/golden (stage 4 — required by go.work even though breakwaterd does not import it)
+COPY tools/golden/go.mod tools/golden/go.sum ./tools/golden/
 
 WORKDIR /src/server
 RUN go mod download
 
+# --- sources needed to build breakwaterd (server + shared pkg) ---
 WORKDIR /src
 COPY pkg/ ./pkg/
 COPY server/ ./server/
