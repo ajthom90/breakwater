@@ -74,13 +74,49 @@ func (db *DB) ListMachines(ctx context.Context) ([]Machine, error) {
 	return out, rows.Err()
 }
 
-// TouchLastSeen updates last_seen_at.
+// Machine presence statuses (subset of machines.status).
+// "active" = control channel currently connected (online).
+// "enrolled" = enrolled but not currently connected (offline after disconnect).
+const (
+	MachineStatusEnrolled = "enrolled"
+	MachineStatusActive   = "active"
+	MachineStatusDisabled = "disabled"
+	MachineStatusRemoved  = "removed"
+)
+
+// TouchLastSeen updates last_seen_at (and updated_at) without changing status.
 func (db *DB) TouchLastSeen(ctx context.Context, id string) error {
 	return db.WithTx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			UPDATE machines SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
 			                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 			WHERE id = ?`, id)
+		return err
+	})
+}
+
+// SetMachineOnline marks the machine active (control channel up) and touches last_seen.
+func (db *DB) SetMachineOnline(ctx context.Context, id string) error {
+	return db.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE machines SET status = ?,
+			                    last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+			                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+			WHERE id = ? AND status NOT IN ('disabled', 'removed')`,
+			MachineStatusActive, id)
+		return err
+	})
+}
+
+// SetMachineOffline marks the machine enrolled (channel down). last_seen_at is
+// left as the last heartbeat so the UI can show "last seen …".
+func (db *DB) SetMachineOffline(ctx context.Context, id string) error {
+	return db.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `
+			UPDATE machines SET status = ?,
+			                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+			WHERE id = ? AND status = ?`,
+			MachineStatusEnrolled, id, MachineStatusActive)
 		return err
 	})
 }

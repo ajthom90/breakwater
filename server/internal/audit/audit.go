@@ -21,6 +21,24 @@
 // stored in the database (no JSON re-encoding of detail beyond the stored
 // detail_json blob). row_hash and prev_hash are lowercase hex encodings of the
 // 32-byte SHA-256 digest (64 hex chars).
+//
+// # Audit policy (M2 stage 2 — explicit)
+//
+// PLAN taxonomy: audit records ADMIN actions. Scope of this package's interceptors
+// and current emitters:
+//
+//   - Audited: machine.enroll (success + reject), auth.fail (unknown cert pin denials
+//     on non-enroll methods). These are security-boundary / admin-visible events.
+//   - NOT audited: agent heartbeats, control-channel traffic (Hello/JobProgress/…),
+//     automatic job state transitions, inventory reports. They have no admin actor
+//     and would drown the audit log in noise.
+//   - Deferred: job.run_manual and job.cancel begin when jobs become human-triggerable
+//     on the web surface (later stage). The job engine already stores `initiator` in
+//     params_json so those events can name the actor without a schema change.
+//
+// Placeholder Unary/Stream interceptors remain pass-through; method-level audit for
+// human REST/gRPC will attach there when the web API lands. Do not log agent Channel
+// messages as audit rows.
 package audit
 
 import (

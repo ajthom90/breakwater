@@ -220,8 +220,13 @@ type VaultStats struct {
 // Invariant (R3-6): at most one live handle per repoID. Close(repoID) must not
 // race Open/Create for the same ID — Close releases the manager lock before
 // waiting on the vault exclusive lock, so a concurrent Open can create a second
-// live handle while the first still has in-flight writes. M2's scheduler must
-// serialize per-repo Close vs Open (same work item as backup-vs-prune).
+// live handle while the first still has in-flight writes.
+//
+// Structural enforcement (M2 stage 2): callers must hold an exclusive lease from
+// scheduler.RepoLocks for the repoID around Manager.Close and any Open that could
+// race Close (scheduler.RepoLocks.WithExclusive). Job-scoped shared leases cover
+// backup/restore; exclusive covers prune/verify. Enrollment Create is exempt:
+// the repo ID is brand-new and no job can hold a lease yet.
 type Manager struct {
 	reposDir string
 	dataDir  string

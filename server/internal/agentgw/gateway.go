@@ -11,17 +11,21 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 
 	breakwaterv1 "github.com/ajthom90/breakwater/pkg/proto/breakwater/v1"
 	"github.com/ajthom90/breakwater/server/internal/audit"
+	"github.com/ajthom90/breakwater/server/internal/catalog"
 	"github.com/ajthom90/breakwater/server/internal/enroll"
 	"github.com/ajthom90/breakwater/server/internal/mtls"
+	"github.com/ajthom90/breakwater/server/internal/scheduler"
 )
 
 // Full method names allowed without prior enrollment (pre-pin).
@@ -37,6 +41,15 @@ type Gateway struct {
 	// and the enrollment handler (machine.enroll and interceptor denials).
 	Auditor *audit.Writer
 
+	// Catalog is used by ControlService for online/offline + last_seen.
+	Catalog *catalog.DB
+	// Engine is the job lifecycle core (dispatch, progress, results, inventory).
+	Engine *scheduler.Engine
+	// Registry is the live control-channel table (one per machine).
+	Registry *Registry
+	// ServerVersion is returned in HelloAck (defaults to 0.0.1-dev).
+	ServerVersion string
+
 	// TestDataService, when non-nil, registers DataService for post-enroll pin
 	// tests only. Production main never sets this.
 	TestDataService breakwaterv1.DataServiceServer
@@ -48,6 +61,7 @@ type Gateway struct {
 }
 
 // New creates a gateway. serverID is the TLS identity for :9443.
+// Call AttachControlPlane before Start to enable ControlService.Channel.
 func New(serverID *mtls.Identity, enrollSvc *enroll.Service, log *slog.Logger) *Gateway {
 	if log == nil {
 		log = slog.Default()
@@ -56,6 +70,17 @@ func New(serverID *mtls.Identity, enrollSvc *enroll.Service, log *slog.Logger) *
 		Enroll:   enrollSvc,
 		Log:      log,
 		serverID: serverID,
+	}
+}
+
+// AttachControlPlane wires catalog, job engine, and connection registry for Channel.
+// Safe to call before Start. Engine.Dispatch is set to the registry.
+func (g *Gateway) AttachControlPlane(db *catalog.DB, engine *scheduler.Engine, reg *Registry) {
+	g.Catalog = db
+	g.Engine = engine
+	g.Registry = reg
+	if engine != nil && reg != nil {
+		engine.Dispatch = reg
 	}
 }
 
@@ -81,12 +106,29 @@ func (g *Gateway) Start(addr string) (string, error) {
 		stream = append(stream, g.Auditor.StreamServerInterceptor())
 	}
 
+	// PLAN: 30s keepalive on the agent control plane. Enforcement MinTime is
+	// slightly under 30s so compliant clients are not punished for jitter.
+	kaTime, kaTimeout := KeepaliveServerParameters()
 	g.gs = grpc.NewServer(
 		grpc.Creds(credentials.NewTLS(tlsCfg)),
 		grpc.ChainUnaryInterceptor(unary...),
 		grpc.ChainStreamInterceptor(stream...),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    kaTime,
+			Timeout: kaTimeout,
+			// MaxConnectionIdle left default — long-lived channels are expected.
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             15 * time.Second,
+			PermitWithoutStream: true,
+		}),
 	)
 	breakwaterv1.RegisterEnrollmentServiceServer(g.gs, &enrollmentServer{gw: g, svc: g.Enroll})
+	// ControlService.Channel — always registered; returns Internal if engine unset.
+	if g.ServerVersion == "" {
+		g.ServerVersion = serverVersionDefault
+	}
+	breakwaterv1.RegisterControlServiceServer(g.gs, &controlServer{gw: g})
 	if g.TestDataService != nil {
 		breakwaterv1.RegisterDataServiceServer(g.gs, g.TestDataService)
 	}

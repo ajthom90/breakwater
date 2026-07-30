@@ -20,6 +20,7 @@ import (
 	"github.com/ajthom90/breakwater/server/internal/enroll"
 	"github.com/ajthom90/breakwater/server/internal/keystore"
 	"github.com/ajthom90/breakwater/server/internal/mtls"
+	"github.com/ajthom90/breakwater/server/internal/scheduler"
 	"github.com/ajthom90/breakwater/server/internal/vault"
 )
 
@@ -86,6 +87,13 @@ func main() {
 
 	auditor := audit.NewWriter(db)
 
+	// Per-repo job serialization (R2-2 / R3-6). All vault Open/Close/prune for an
+	// existing repo must go through leases from these locks (enrollment Create is
+	// the documented exception — brand-new repo, no concurrent jobs).
+	repoLocks := scheduler.NewRepoLocks()
+	jobEngine := scheduler.NewEngine(db, repoLocks, log)
+	controlReg := agentgw.NewRegistry(log)
+
 	enrollSvc := &enroll.Service{
 		DB:       db,
 		Keystore: ks,
@@ -96,6 +104,8 @@ func main() {
 
 	gw := agentgw.New(serverID, enrollSvc, log)
 	gw.Auditor = auditor
+	gw.ServerVersion = version
+	gw.AttachControlPlane(db, jobEngine, controlReg)
 	if _, err := gw.Start(*agentAddr); err != nil {
 		log.Error("agent gateway", "err", err)
 		os.Exit(1)

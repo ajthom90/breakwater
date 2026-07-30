@@ -4,7 +4,7 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
-**Phase 1 — M2 (weeks 3–4)** — 🔄 **IN PROGRESS** (stage 1 complete; see [M2 progress](#m2-progress) below)
+**Phase 1 — M2 (weeks 3–4)** — 🔄 **IN PROGRESS** (stages 1–2 complete; see [M2 progress](#m2-progress) below)
 
 **Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; closed at `161fb18`)
 
@@ -98,7 +98,7 @@ go test ./internal/agentgw/ -run 'TestM1_EnrollmentAndWrongCertRejection|TestEnr
 | M10 docs/actor_type | ✅ Fixed | README + column + migration |
 | M12 drop pkg/errors direct dep | ✅ Fixed | |
 | M1 kopia version pin | ⏳ Deferred | Documented; upgrade with Go 1.25+ |
-| M2 OpenObject vs prune | ⏳ Deferred M2 | Documented on Vault interface (+ backup-vs-prune serialization R2-2) |
+| M2 OpenObject vs prune | ✅ Fixed M2 stage 2 | `scheduler.RepoLocks` job-scoped shared/exclusive; restore holds shared until terminal |
 | M4 config/cache under /data | ✅ Fixed M2 stage 1 | `<dataDir>/kopia-config/<id>.config` + `cache/<id>`; legacy migrate |
 | M11 web HTTPS | ✅ Fixed M2 stage 1 | `ListenAndServeTLS` with server identity leaf |
 | **M13 ForceServerCodec JSON** | ✅ Fixed M2 stage 1 | Generated `EnrollmentService`; codec deleted |
@@ -136,7 +136,7 @@ go test ./internal/agentgw/ -run 'TestM1_EnrollmentAndWrongCertRejection|TestEnr
 | R3-3 compensate on fresh ctx | ✅ Fixed | `context.WithTimeout(Background, 5s)`; `TestEnroll_CompensateDespiteCanceledContext` |
 | R3-4 ErrHashingAlgorithmNotSet | ✅ Fixed | empty algo with non-empty key → sentinel; `TestGetHashingKey_EmptyAlgorithmIsError` |
 | R3-5 SafetyParameters from min-age | ✅ Fixed | `safetyForMinAge`; SafetyNone only for `WithMinContentAge(0)` |
-| R3-6 Manager Close/Open race | ✅ Documented | Manager docs + M2 serialization work item |
+| R3-6 Manager Close/Open race | ✅ Fixed M2 stage 2 | `RepoLocks.WithExclusive` for Close/Open; Manager docs reference lease requirement |
 | R3-7 keystore row assert | ✅ Fixed | `failingVault.repoID` + COUNT=0 in compensate tests |
 | R3-8 gRPC status tests | ✅ Fixed | `TestEnroll_gRPCStatusCodes` |
 | R3-9 755f417 migration fixture | ✅ Fixed | `TestUpgradeFrom755f417` |
@@ -233,22 +233,83 @@ grep ForceServerCodec\|jsonCodec server/        # OK (gone)
 
 ---
 
+### Stage 2 — control plane: Channel, scheduler, per-repo serialization (2026-07-30)
+
+Server-side control plane, buildable/testable on Linux/macOS with a fake Go agent.
+Stage-4 Windows agent will bind to this contract.
+
+| Deliverable | Status | Evidence |
+|-------------|--------|----------|
+| **ControlService.Channel** (Hello/HB/Progress/Result/Inventory; JobStart/Cancel) | ✅ | `server/internal/agentgw/channel.go` + registry |
+| Cert↔machine bind on Hello (cross-machine isolation) | ✅ | `TestM2S2_HelloMachineMismatch` |
+| One live channel per machine; new supersedes old | ✅ | `Registry.Register` closes prior session |
+| Online/offline + last_seen on machines table | ✅ | `SetMachineOnline`/`Offline`; demo asserts active→enrolled |
+| gRPC keepalive 30s (server) + client expectation docs | ✅ | `KeepaliveServerParameters` + channel package comment |
+| Idempotent reconnect (no re-JobStart; duplicate Result no-op) | ✅ | engine + `TestM2S2_ControlPlaneDemo` + engine unit tests |
+| Job engine: create/dispatch/progress/complete/fail/cancel | ✅ | `server/internal/scheduler/engine.go` |
+| Types: `inventory` (real), `noop` (test); open registry | ✅ | `types.go`; prune server-only rejected |
+| Offline queue (bound 64, oldest-first) | ✅ | `MaxPendingJobsPerMachine`; offline deliver test |
+| Inventory → machine_inventory | ✅ | demo + `HandleInventory` |
+| Per-repo RW locks (shared backup/restore; exclusive prune) | ✅ | `repolock.go`; red-first + race tests |
+| Lease released on fail/cancel/disconnect | ✅ | `TestEngine_Disconnect…` + `TestM2S2_DisconnectReleasesRunningLease` |
+| Audit policy documented (no channel noise; job.* deferred) | ✅ | `server/internal/audit` package comment |
+| **Demo** `TestM2S2_ControlPlaneDemo` | ✅ | PASS under `-race` |
+
+#### Red-first (serialization + reconnect)
+
+Unserialised stub allows backup+prune critical-section overlap; real `RepoLocks` forbids it:
+
+```
+=== RUN   TestRepoLock_RedFirst_UnserialisedOverlaps
+    RED-FIRST evidence: unserialised stub peak overlap=2 (backup+prune concurrent)
+--- PASS: TestRepoLock_RedFirst_UnserialisedOverlaps
+=== RUN   TestRepoLock_BackupPruneNeverOverlap
+    serialized backup+prune peak overlap=1 (want ≤1)
+--- PASS: TestRepoLock_BackupPruneNeverOverlap
+```
+
+Idempotent reconnect: `DeliverPending` does not re-send JobStart for running jobs;
+duplicate `JobResult` on terminal state is a no-op (`TestEngine_ReconnectDoesNotRedispatchRunning`,
+demo section).
+
+#### Deviations / notes (stage 2)
+
+| Item | Note |
+|------|------|
+| `inventory` / `noop` JobType | Not in frozen proto enum. Wire uses `JOB_TYPE_UNSPECIFIED` + `params_json.kind`. Catalog stores string type. Stage-4 agent must branch on `kind`. |
+| Enrollment Create vs RepoLocks | Create at enroll remains outside leases: brand-new repo ID, no concurrent job can exist. Documented on `Manager` and `scheduler` package. Subsequent Open/Close/Prune must take exclusive via `RepoLocks.WithExclusive`. |
+| Server prune execution | Type registry + lock map ready; no server-side prune runner this stage (stage 3+). Submit of prune for agent dispatch is rejected and tested. |
+| UpdateOffer | Not sent; agents may ignore if received. |
+| Job audit events | `job.run_manual` / `job.cancel` deferred until web surface; engine stores `initiator` in params_json. |
+
+#### Verification (stage 2)
+
+```
+gofmt -l server pkg agent cli restore   # empty
+go vet ./...                            # clean
+go test ./... -short -race              # all ok (incl. scheduler, agentgw)
+go test ./internal/scheduler/ -race -v  # PASS (red-first + locks + engine)
+go test ./internal/agentgw/ -run 'TestM1_|TestEnroll_|TestM2S2_' -v  # PASS
+BW_GATE_BYTES=268435456 TestEngineGate_Kopia  # PASS
+pkg tests                               # PASS
+```
+
+---
+
 ## Next: M2 remaining (weeks 3–4)
 
-Stage 1 done (M13, audit start, M11, M4, strict roots). Remaining:
+Stages 1–2 done. Remaining:
 
-- Windows agent service (SYSTEM) + WiX MSI  
-- Persistent dial-out + keepalives  
-- Server-dispatched jobs  
-- Plain-directory backup (chunk → have/want → append-only upload → manifest)  
-- UI shell against fake API  
-- Golden-dataset generator + comparer  
-- Per-repo job serialization covering open restore streams, **backup-vs-prune**, and **Manager Close vs Open** (R2-2 / R3-6)  
-- Vendor kopia; consider v0.23 when on Go 1.25+  
-- Optional: backfill `hashing_algorithm` from vault for pre-eea1a46 keystore rows (R3-4)  
-- Directory sharding vs `MaxMarkObjectBytes` (16 MiB ≈ max entries per single TreeObject): shard huge dirs across child trees or revisit the cap (round-3 addendum note 2)  
+- Windows agent service (SYSTEM) + WiX MSI (stage 4 — bind to Channel contract above)
+- Plain-directory backup (chunk → have/want → append-only upload → manifest) — stage 3
+- UI shell against fake API — stage 5
+- Golden-dataset generator + comparer
+- Cron schedules / windows / retry (M5; dispatch core is stage 2)
+- Vendor kopia; consider v0.23 when on Go 1.25+
+- Optional: backfill `hashing_algorithm` from vault for pre-eea1a46 keystore rows (R3-4)
+- Directory sharding vs `MaxMarkObjectBytes` (16 MiB ≈ max entries per single TreeObject)
 
-*Demo: MSI install → appears in UI in 10s → backup → second run shows dedup ratio.*
+*Demo (later): MSI install → appears in UI in 10s → backup → second run shows dedup ratio.*
 
 ---
 
