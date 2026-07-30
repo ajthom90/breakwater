@@ -123,3 +123,37 @@ Fixed on commit after `eea1a46` (round-3 fix set). Evidence in PROGRESS.md.
 | R3-7 | ✅ Fixed — keystore COUNT assert in compensate tests |
 | R3-8 | ✅ Fixed — `TestEnroll_gRPCStatusCodes` |
 | R3-9 | ✅ Fixed — `TestUpgradeFrom755f417` |
+
+---
+
+## Round-4 verification addendum (reviewer, 2026-07-30)
+
+Independent verification of the fix commit `161fb18`:
+
+- **All verification commands re-run locally and green**, including the full 10 GiB
+  gate — **124 s**, faster than round 3's 152 s because the mark phase no longer
+  materializes the payload (gate log now shows a `rootTree=` TreeObject root).
+- **Mutation battery — all five killed:** flat-mark revert → both survival tests
+  fail; min-age guard disabled → in-flight test fails; fail-open decode restored →
+  `TestMarkTreeObject_UndecodableRootFailsClosed` fails; compensation moved back to
+  the request ctx → `TestEnroll_CompensateDespiteCanceledContext` fails; algorithm
+  sentinel removed → `TestGetHashingKey_EmptyAlgorithmIsError` fails. Every round-3
+  guard is genuinely enforced by a test.
+- Diff inspection: fixes match the prescriptions exactly; heuristic helpers deleted;
+  `validateSnapshotRoot` + always-fail-closed decode + 16 MiB capped reads +
+  `safetyForMinAge` all present and correct.
+
+**Verdict: round 3 findings are all closed. No new gating findings. M1 is honestly
+closeable at `161fb18`.**
+
+Two non-gating hardening notes recorded for M2 (also added to PROGRESS.md's M2 list):
+
+1. `validateSnapshotRoot` uses loose JSON decoding, so a *mislabeled* kind (e.g. a
+   TreeObject root stored under `bw-image-snapshot`) passes validation and would
+   mark only the manifest's own contents — children swept. Only reachable via a bug
+   in our own M2 writer code; fix cheaply with `json.Decoder.DisallowUnknownFields`
+   in `validateSnapshotRoot` when M2's `PutTreeObject`/`PutImageManifest` land.
+2. `MaxMarkObjectBytes` (16 MiB) implies a maximum single-directory entry count
+   (~100k+ entries per TreeObject). M2's backup pipeline must either shard huge
+   directories across child trees or revisit the cap; over-limit fails closed at
+   both write and prune, so this is a usability ceiling, not a data-loss risk.

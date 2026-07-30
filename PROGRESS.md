@@ -159,6 +159,8 @@ Then:
 - Vendor kopia; consider v0.23 when on Go 1.25+  
 - Move `breakwater.config`/`.cache` under `/data` (M4)  
 - Optional: backfill `hashing_algorithm` from vault for pre-eea1a46 keystore rows (R3-4)  
+- Strict root validation: `DisallowUnknownFields` in `validateSnapshotRoot` when `PutTreeObject`/`PutImageManifest` land, so a mislabeled kind cannot pass loose JSON decode (round-3 addendum note 1)  
+- Directory sharding vs `MaxMarkObjectBytes` (16 MiB ≈ max entries per single TreeObject): shard huge dirs across child trees or revisit the cap (round-3 addendum note 2)  
 
 *Demo: MSI install → appears in UI in 10s → backup → second run shows dedup ratio.*
 
