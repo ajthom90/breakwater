@@ -1,0 +1,21 @@
+[Unit]
+Description=Breakwater backup server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=breakwater
+Group=breakwater
+ExecStart=/usr/local/bin/breakwaterd -data /var/lib/breakwater/data -repos /var/lib/breakwater/repos
+Restart=on-failure
+RestartSec=5
+# Hardening (adjust for your environment)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/breakwater
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

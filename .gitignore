@@ -1,0 +1,53 @@
+# Binaries (root / bin only — do not ignore cmd/<name>/ source dirs)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+/breakwaterd
+/breakwater-agent
+/breakwater-restore
+/bwctl
+
+# Test / coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace local
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local data / repos (dev)
+/data/
+/repos/
+*.db
+*.db-wal
+*.db-shm
+
+# Node / web build intermediates (dist may be committed later for embed)
+web/node_modules/
+web/dist/
+
+# Secrets — never commit
+*.pem
+*.key
+master.key
+**/testdata/tmp/
+**/testdata/repo/
+
+# Vendor is intentional when present (kopia pin); ignore accidental local only if needed
+# vendor/ is committed for server when we pin kopia
+
+# Env
+.env
+.env.*

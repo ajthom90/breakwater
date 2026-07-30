@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux build & test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+          cache-dependency-path: |
+            server/go.sum
+            pkg/go.sum
+            agent/go.sum
+            cli/go.sum
+            restore/go.sum
+
+      - name: Go work sync
+        run: go work sync
+
+      - name: Build breakwaterd
+        working-directory: server
+        run: |
+          CGO_ENABLED=0 go build -o /tmp/breakwaterd ./cmd/breakwaterd
+          /tmp/breakwaterd -version
+
+      - name: Unit tests (short — skips 10GB engine gate)
+        working-directory: server
+        run: go test ./... -count=1 -short -timeout 10m
+
+      - name: Engine gate (10GB write/restore/verify/GC)
+        working-directory: server
+        run: go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -timeout 45m -v
+
+      - name: Enrollment + mTLS demo
+        working-directory: server
+        run: go test ./internal/agentgw/ -count=1 -run TestM1_EnrollmentAndWrongCertRejection -v
+
+      - name: Windows cross-compile (server)
+        working-directory: server
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: go build -o /tmp/breakwaterd.exe ./cmd/breakwaterd
+
+      - name: Windows cross-compile (agent stub)
+        working-directory: agent
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: go build -o /tmp/breakwater-agent.exe ./cmd/breakwater-agent
+
+      - name: Docker build
+        run: docker build -f packaging/docker/Dockerfile -t breakwater:ci .
+
+  windows:
+    name: Windows agent unit tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+
+      - name: Agent tests
+        working-directory: agent
+        run: go test ./... -count=1 -timeout 5m

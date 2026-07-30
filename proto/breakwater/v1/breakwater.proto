@@ -1,0 +1,364 @@
+// Breakwater agent/replication wire contract.
+// Frozen for M1 — additive changes only after this milestone.
+// See PLAN.md → Transport & protocol.
+//
+// Append-only is structural: NO RPC on the agent port deletes, prunes, or
+// mutates retention. Those exist only on the human-authenticated web/REST port.
+syntax = "proto3";
+
+package breakwater.v1;
+
+option go_package = "github.com/ajthom90/breakwater/pkg/proto/breakwater/v1;breakwaterv1";
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Enrollment — only tokenless-cert (pre-mTLS) RPC path
+// ---------------------------------------------------------------------------
+
+service EnrollmentService {
+  // Enroll exchanges a one-time enrollment token for a machine identity.
+  // Client presents a self-signed cert; server verifies the token embeds the
+  // server cert fingerprint (zero TOFU) and binds agent cert FP → machine row.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+}
+
+message EnrollRequest {
+  // Token format: BW1:<host:port>:<serverCertFP-sha256-hex>:<secret>
+  string token = 1;
+  // Agent identity info (hostname, OS, agent version).
+  AgentInfo agent_info = 2;
+  // PEM-encoded self-signed client certificate (public half of agent keypair).
+  bytes client_cert_pem = 3;
+}
+
+message EnrollResponse {
+  string machine_id = 1;           // ULID
+  bytes hashing_key = 2;           // per-repo hashing key only (never encryption keys)
+  string server_cert_fingerprint = 3; // confirmed pin
+  // Default policy summary applied at enrollment (informational).
+  string policy_id = 4;
+}
+
+message AgentInfo {
+  string hostname = 1;
+  string os = 2;              // e.g. "windows"
+  string os_version = 3;
+  string agent_version = 4;
+  string arch = 5;            // e.g. "amd64"
+}
+
+// ---------------------------------------------------------------------------
+// Control — long-lived bidirectional stream
+// ---------------------------------------------------------------------------
+
+service ControlService {
+  // Channel is the persistent agent control plane: keepalives, job dispatch,
+  // inventory, progress. Idempotent reconnect/resume.
+  rpc Channel(stream AgentToServer) returns (stream ServerToAgent);
+}
+
+message AgentToServer {
+  oneof msg {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    JobProgress job_progress = 3;
+    JobResult job_result = 4;
+    InventoryReport inventory = 5;
+  }
+}
+
+message ServerToAgent {
+  oneof msg {
+    HelloAck hello_ack = 1;
+    JobStart job_start = 2;
+    JobCancel job_cancel = 3;
+    UpdateOffer update_offer = 4;
+    HeartbeatAck heartbeat_ack = 5;
+  }
+}
+
+message Hello {
+  string machine_id = 1;
+  string agent_version = 2;
+  // Optional resume: last completed job step token.
+  string resume_token = 3;
+}
+
+message HelloAck {
+  string server_version = 1;
+  google.protobuf.Timestamp server_time = 2;
+  // Server may assign a session id for resume correlation.
+  string session_id = 3;
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp client_time = 1;
+  // Free disk on agent data volume, etc. (optional telemetry).
+  int64 free_bytes = 2;
+}
+
+message HeartbeatAck {
+  google.protobuf.Timestamp server_time = 1;
+}
+
+message JobStart {
+  string job_id = 1;
+  JobType type = 2;
+  // Job-type-specific payload (JSON for flexibility in MVP).
+  bytes params_json = 3;
+}
+
+message JobCancel {
+  string job_id = 1;
+  string reason = 2;
+}
+
+message JobProgress {
+  string job_id = 1;
+  int64 bytes_done = 2;
+  int64 bytes_total = 3; // 0 if unknown
+  string phase = 4;
+  string message = 5;
+  uint32 percent = 6; // 0-100, advisory
+}
+
+message JobResult {
+  string job_id = 1;
+  bool success = 2;
+  string error_message = 3;
+  int64 bytes_read = 4;
+  int64 bytes_stored = 5;
+  string snapshot_id = 6; // set on success for backup jobs
+  string resume_token = 7;
+}
+
+message InventoryReport {
+  repeated VolumeInfo volumes = 1;
+  repeated VMInfo vms = 2;
+}
+
+message VolumeInfo {
+  string id = 1;          // volume GUID or mount
+  string mount = 2;       // e.g. "C:\\"
+  int64 size_bytes = 3;
+  string fs_type = 4;
+}
+
+message VMInfo {
+  string id = 1;
+  string name = 2;
+  bool rct_capable = 3;
+  string state = 4;
+}
+
+message UpdateOffer {
+  string version = 1;
+  string download_url = 2; // relative path on :9443
+  bytes ed25519_signature = 3;
+  bool mandatory = 4;
+}
+
+enum JobType {
+  JOB_TYPE_UNSPECIFIED = 0;
+  JOB_TYPE_FILE_BACKUP = 1;
+  JOB_TYPE_IMAGE_BACKUP = 2;
+  JOB_TYPE_HYPERV_BACKUP = 3;
+  JOB_TYPE_RESTORE = 4;
+  JOB_TYPE_UPDATE = 5;
+  // prune/verify/replicate are server-side only — never dispatched to agents
+}
+
+// ---------------------------------------------------------------------------
+// Data — append-only content path (have/want + upload + commit)
+// ---------------------------------------------------------------------------
+
+service DataService {
+  // CheckContents is the have/want handshake. Batches of up to 4096 IDs.
+  rpc CheckContents(CheckContentsRequest) returns (CheckContentsResponse);
+
+  // PutContents streams content payloads; server re-hashes and rejects mismatches.
+  rpc PutContents(stream PutContentsRequest) returns (stream PutContentsResponse);
+
+  // PutTreeObject stores a directory tree object (JSON).
+  rpc PutTreeObject(PutTreeObjectRequest) returns (PutTreeObjectResponse);
+
+  // PutImageManifest stores a fixed-block image manifest (later phases).
+  rpc PutImageManifest(PutImageManifestRequest) returns (PutImageManifestResponse);
+
+  // CommitSnapshot finalizes a snapshot record after all contents/objects are present.
+  rpc CommitSnapshot(CommitSnapshotRequest) returns (CommitSnapshotResponse);
+}
+
+message CheckContentsRequest {
+  string job_id = 1;
+  // Content IDs as hex/opaque strings (kopia content ID format).
+  repeated string content_ids = 2;
+}
+
+message CheckContentsResponse {
+  // Bitmap: bit i set ⇒ content_ids[i] already present. Packed little-endian bytes.
+  bytes present_bitmap = 1;
+}
+
+message PutContentsRequest {
+  string job_id = 1;
+  // Client-computed content ID; server re-computes and rejects mismatches.
+  string content_id = 2;
+  bytes data = 3;
+  // Optional sequence for windowed acks.
+  uint64 seq = 4;
+}
+
+message PutContentsResponse {
+  uint64 ack_seq = 1;
+  bool accepted = 2;
+  string error_message = 3;
+  string content_id = 4; // server-confirmed ID
+}
+
+message PutTreeObjectRequest {
+  string job_id = 1;
+  // Serialized tree object (JSON; see pkg/format).
+  bytes tree_json = 2;
+}
+
+message PutTreeObjectResponse {
+  string object_id = 1;
+}
+
+message PutImageManifestRequest {
+  string job_id = 1;
+  bytes manifest_json = 2;
+}
+
+message PutImageManifestResponse {
+  string object_id = 1;
+}
+
+message CommitSnapshotRequest {
+  string job_id = 1;
+  SnapshotKind kind = 2;
+  string root_object_id = 3;
+  string source = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp finished_at = 6;
+  int64 bytes_read = 7;
+  int64 bytes_stored = 8;
+}
+
+message CommitSnapshotResponse {
+  string snapshot_id = 1;
+  string manifest_ref = 2;
+}
+
+enum SnapshotKind {
+  SNAPSHOT_KIND_UNSPECIFIED = 0;
+  SNAPSHOT_KIND_FILE = 1;
+  SNAPSHOT_KIND_IMAGE = 2;
+  SNAPSHOT_KIND_HYPERV = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Restore — read-only from agent/restore-client perspective
+// ---------------------------------------------------------------------------
+
+service RestoreService {
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  rpc GetObject(GetObjectRequest) returns (stream GetObjectResponse);
+  rpc GetContentRange(GetContentRangeRequest) returns (stream GetContentRangeResponse);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+}
+
+message GetSnapshotRequest {
+  string snapshot_id = 1;
+}
+
+message GetSnapshotResponse {
+  string snapshot_id = 1;
+  SnapshotKind kind = 2;
+  string root_object_id = 3;
+  string source = 4;
+  google.protobuf.Timestamp created_at = 5;
+  string machine_id = 6;
+}
+
+message GetObjectRequest {
+  string object_id = 1;
+}
+
+message GetObjectResponse {
+  bytes data = 1;
+}
+
+message GetContentRangeRequest {
+  string content_id = 1;
+  int64 offset = 2;
+  int64 length = 3; // 0 = to end
+}
+
+message GetContentRangeResponse {
+  bytes data = 1;
+}
+
+message ListSnapshotsRequest {
+  string machine_id = 1; // empty = caller's machine
+  int32 limit = 2;
+  string page_token = 3;
+}
+
+message ListSnapshotsResponse {
+  repeated GetSnapshotResponse snapshots = 1;
+  string next_page_token = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Replication — same data protocol + cursor (Phase 2; defined early for freeze)
+// ---------------------------------------------------------------------------
+
+service ReplicationService {
+  // ListSnapshotsSince returns snapshot records after a cursor for a mirrored repo.
+  rpc ListSnapshotsSince(ListSnapshotsSinceRequest) returns (ListSnapshotsSinceResponse);
+  // CheckContents / PutContents reuse DataService semantics on peer role.
+}
+
+message ListSnapshotsSinceRequest {
+  string machine_id = 1; // source machine being mirrored
+  string cursor = 2;     // opaque; empty = from beginning
+  int32 limit = 3;
+}
+
+message ListSnapshotsSinceResponse {
+  repeated GetSnapshotResponse snapshots = 1;
+  string next_cursor = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Update — agent self-update channel (gated on code signing; defined early)
+// ---------------------------------------------------------------------------
+
+service UpdateService {
+  rpc CheckUpdate(CheckUpdateRequest) returns (CheckUpdateResponse);
+  rpc DownloadUpdate(DownloadUpdateRequest) returns (stream DownloadUpdateResponse);
+}
+
+message CheckUpdateRequest {
+  string current_version = 1;
+  string channel = 2; // edge|beta|stable
+}
+
+message CheckUpdateResponse {
+  bool available = 1;
+  string version = 2;
+  bytes ed25519_signature = 3;
+  int64 size_bytes = 4;
+  string sha256_hex = 5;
+}
+
+message DownloadUpdateRequest {
+  string version = 1;
+}
+
+message DownloadUpdateResponse {
+  bytes chunk = 1;
+}

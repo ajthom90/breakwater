@@ -1,0 +1,20 @@
+# Local / TrueNAS SCALE Custom App compose for breakwaterd (M1).
+# Volumes: /data (catalog+keys, ZFS recordsize=64K); /repos (bulk, recordsize=1M, compression=lz4, dedup=off).
+
+services:
+  breakwater:
+    image: breakwater:dev
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    ports:
+      - "8443:8443"
+      - "9443:9443"
+    volumes:
+      - breakwater-data:/data
+      - breakwater-repos:/repos
+    restart: unless-stopped
+
+volumes:
+  breakwater-data:
+  breakwater-repos:
