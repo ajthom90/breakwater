@@ -5,16 +5,17 @@
 //
 //	row_hash = SHA-256( prev_hash || canonical )
 //
-// where canonical is the UTF-8 concatenation of these fields, each terminated
-// by a single ASCII newline (0x0a), in this exact order:
+// where canonical is the UTF-8 concatenation of these seven fields, each
+// length-prefixed as decimal-len + ':' + raw bytes (no trailing delimiter),
+// in this exact order:
 //
-//	id\n
-//	ts\n
-//	actor\n
-//	actor_type\n
-//	action\n
-//	target\n
-//	detail_json\n
+//	id, ts, actor, actor_type, action, target, detail_json
+//
+// Example for id="ab", ts="t":  "2:ab1:t…"
+//
+// Length-prefixing is unambiguous even when a field contains ':' or newlines
+// (S1-F2). The first commit (bc65f8a) used newline-terminated raw fields; that
+// encoding was never deployed outside tests — no migration is required.
 //
 // The first row's prev_hash is the empty string "". Fields are the exact strings
 // stored in the database (no JSON re-encoding of detail beyond the stored
@@ -149,14 +150,19 @@ func ComputeRowHash(prevHash, id, ts, actor, actorType, action, target, detailJS
 
 // CanonicalEncoding returns the exact bytes hashed after prev_hash.
 // Documented compatibility surface — see package comment.
+// Each field is encoded as "<decimal-byte-len>:<field-bytes>" (S1-F2).
 func CanonicalEncoding(id, ts, actor, actorType, action, target, detailJSON string) string {
-	return id + "\n" +
-		ts + "\n" +
-		actor + "\n" +
-		actorType + "\n" +
-		action + "\n" +
-		target + "\n" +
-		detailJSON + "\n"
+	return lengthPrefixed(id) +
+		lengthPrefixed(ts) +
+		lengthPrefixed(actor) +
+		lengthPrefixed(actorType) +
+		lengthPrefixed(action) +
+		lengthPrefixed(target) +
+		lengthPrefixed(detailJSON)
+}
+
+func lengthPrefixed(s string) string {
+	return fmt.Sprintf("%d:%s", len(s), s)
 }
 
 // ChainBreak describes where VerifyChain found a mismatch.

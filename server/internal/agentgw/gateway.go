@@ -157,8 +157,9 @@ func (g *Gateway) unaryInterceptor(ctx context.Context, req any, info *grpc.Unar
 	if !enrollMethods[info.FullMethod] && pi.MachineID == "" {
 		g.Log.Warn("rejected unknown client cert", "method", info.FullMethod, "fp", pi.CertFP[:16]+"…")
 		// Audit pin rejection (security boundary for non-enroll RPCs).
+		// WithoutCancel: client cancel must not drop the auth.fail row (S1-F1).
 		if g.Auditor != nil {
-			_ = g.Auditor.Append(ctx, audit.Event{
+			if aerr := g.Auditor.Append(context.WithoutCancel(ctx), audit.Event{
 				Actor:     pi.CertFP,
 				ActorType: audit.ActorAgent,
 				Action:    audit.ActionAuthFail,
@@ -168,7 +169,9 @@ func (g *Gateway) unaryInterceptor(ctx context.Context, req any, info *grpc.Unar
 					"reason":  "unknown_client_certificate",
 					"method":  info.FullMethod,
 				},
-			})
+			}); aerr != nil {
+				g.Log.Error("audit append failed", "action", audit.ActionAuthFail, "actor", pi.CertFP[:16]+"…", "err", aerr)
+			}
 		}
 		return nil, status.Error(codes.PermissionDenied, "unknown client certificate fingerprint")
 	}
@@ -182,8 +185,9 @@ func (g *Gateway) streamInterceptor(srv any, ss grpc.ServerStream, info *grpc.St
 		return err
 	}
 	if !enrollMethods[info.FullMethod] && pi.MachineID == "" {
+		// WithoutCancel: client cancel must not drop the auth.fail row (S1-F1).
 		if g.Auditor != nil {
-			_ = g.Auditor.Append(ss.Context(), audit.Event{
+			if aerr := g.Auditor.Append(context.WithoutCancel(ss.Context()), audit.Event{
 				Actor:     pi.CertFP,
 				ActorType: audit.ActorAgent,
 				Action:    audit.ActionAuthFail,
@@ -193,7 +197,9 @@ func (g *Gateway) streamInterceptor(srv any, ss grpc.ServerStream, info *grpc.St
 					"reason":  "unknown_client_certificate",
 					"method":  info.FullMethod,
 				},
-			})
+			}); aerr != nil {
+				g.Log.Error("audit append failed", "action", audit.ActionAuthFail, "actor", pi.CertFP[:16]+"…", "err", aerr)
+			}
 		}
 		return status.Error(codes.PermissionDenied, "unknown client certificate fingerprint")
 	}
@@ -274,14 +280,22 @@ func (e *enrollmentServer) auditEnroll(ctx context.Context, certFP, hostname, os
 			target = resp.MachineID
 		}
 	}
-	if aerr := e.gw.Auditor.Append(ctx, audit.Event{
+	// WithoutCancel: client cancel/deadline must not drop machine.enroll (S1-F1).
+	// Always log append failures (never silent discard).
+	if aerr := e.gw.Auditor.Append(context.WithoutCancel(ctx), audit.Event{
 		Actor:     certFP,
 		ActorType: audit.ActorAgent,
 		Action:    audit.ActionMachineEnroll,
 		Target:    target,
 		Detail:    detail,
-	}); aerr != nil && e.svc != nil && e.svc.Log != nil {
-		e.svc.Log.Error("audit append failed", "action", audit.ActionMachineEnroll, "err", aerr)
+	}); aerr != nil {
+		log := e.gw.Log
+		if log == nil && e.svc != nil {
+			log = e.svc.Log
+		}
+		if log != nil {
+			log.Error("audit append failed", "action", audit.ActionMachineEnroll, "actor", certFP[:min(16, len(certFP))]+"…", "err", aerr)
+		}
 	}
 }
 

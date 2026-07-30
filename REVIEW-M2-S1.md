@@ -49,3 +49,15 @@ cd ../pkg && go test ./... -count=1
 (The full 10 GiB gate is not required for this fix round — the mark/sweep algorithm is untouched by F1/F2, and F3's change tightens validation only; the reduced gate covers it.)
 
 **Standing rules unchanged.** Proto stays frozen; no new deps (context.WithoutCancel is stdlib).
+
+---
+
+## Disposition (fix round)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| S1-F1 | ✅ Fixed | Unary/stream interceptors + `auditEnroll` use `context.WithoutCancel(ctx)`; append errors always logged. Red-first: cancel enroll + white-box canceled interceptor both left zero rows on `bc65f8a`; both green after. |
+| S1-F2 | ✅ Fixed | `CanonicalEncoding` is length-prefixed `<decimal-len>:<bytes>` per field (same order). Package doc notes no migration needed (no real deployments had audit rows). Ambiguity regression proves old newline encoding collides and new does not. |
+| S1-F3 | ✅ Fixed | `strictJSONDecode` requires second `Decode` → `io.EOF`. Trailing-garbage Put test red on `bc65f8a`, green after. |
+
+Verification re-run locally after fixes: gofmt/vet clean, short+race green, audit/agentgw/vault Root\|Trailing green, reduced gate green, pkg green.

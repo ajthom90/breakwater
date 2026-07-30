@@ -117,9 +117,10 @@ func TestChainConcurrentAppends(t *testing.T) {
 }
 
 func TestCanonicalEncodingSurface(t *testing.T) {
-	// Frozen shape: seven newline-terminated fields after prev_hash.
+	// Length-prefixed fields (S1-F2). Format: <decimal-len>:<bytes> per field, in order.
 	got := audit.CanonicalEncoding("id1", "ts1", "act", "agent", "machine.enroll", "tgt", `{"a":1}`)
-	want := "id1\nts1\nact\nagent\nmachine.enroll\ntgt\n{\"a\":1}\n"
+	// len("machine.enroll") == 14
+	want := "3:id1" + "3:ts1" + "3:act" + "5:agent" + "14:machine.enroll" + "3:tgt" + "7:{\"a\":1}"
 	if got != want {
 		t.Fatalf("canonical encoding changed (compatibility break):\n got %q\nwant %q", got, want)
 	}
@@ -127,4 +128,45 @@ func TestCanonicalEncodingSurface(t *testing.T) {
 	if len(h) != 64 {
 		t.Fatalf("row_hash hex len=%d want 64", len(h))
 	}
+}
+
+// oldNewlineCanonical is the bc65f8a newline-delimited encoding (S1-F2).
+// Kept only to prove the ambiguity the length-prefix encoding closes.
+func oldNewlineCanonical(id, ts, actor, actorType, action, target, detailJSON string) string {
+	return id + "\n" +
+		ts + "\n" +
+		actor + "\n" +
+		actorType + "\n" +
+		action + "\n" +
+		target + "\n" +
+		detailJSON + "\n"
+}
+
+// TestCanonicalEncoding_NoAmbiguity is S1-F2: two distinct field tuples that
+// collide under the old newline-delimited encoding must produce different
+// row hashes under the length-prefixed encoding.
+func TestCanonicalEncoding_NoAmbiguity(t *testing.T) {
+	// Collision under old encoding: action="x\ny", target="z" vs action="x", target="y\nz"
+	// both yield: id\nts\nactor\ntype\nx\ny\nz\n{}\n
+	aID, aTS, aActor, aType := "id", "ts", "actor", "type"
+	aDetail := "{}"
+	old1 := oldNewlineCanonical(aID, aTS, aActor, aType, "x\ny", "z", aDetail)
+	old2 := oldNewlineCanonical(aID, aTS, aActor, aType, "x", "y\nz", aDetail)
+	if old1 != old2 {
+		t.Fatalf("test fixture broken: old encodings must collide\n 1=%q\n 2=%q", old1, old2)
+	}
+	t.Logf("old encoding collides as expected (len=%d)", len(old1))
+
+	// New encoding must distinguish them.
+	new1 := audit.CanonicalEncoding(aID, aTS, aActor, aType, "x\ny", "z", aDetail)
+	new2 := audit.CanonicalEncoding(aID, aTS, aActor, aType, "x", "y\nz", aDetail)
+	if new1 == new2 {
+		t.Fatalf("length-prefixed encoding still collides:\n 1=%q\n 2=%q", new1, new2)
+	}
+	h1 := audit.ComputeRowHash("", aID, aTS, aActor, aType, "x\ny", "z", aDetail)
+	h2 := audit.ComputeRowHash("", aID, aTS, aActor, aType, "x", "y\nz", aDetail)
+	if h1 == h2 {
+		t.Fatalf("row hashes collide under new encoding: %s", h1)
+	}
+	t.Logf("new encoding distinguishes: h1=%s… h2=%s…", h1[:16], h2[:16])
 }

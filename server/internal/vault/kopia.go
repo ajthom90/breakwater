@@ -453,12 +453,25 @@ func validateSnapshotRoot(ctx context.Context, rep repo.Repository, kind Snapsho
 	return nil
 }
 
-// strictJSONDecode decodes with DisallowUnknownFields so cross-kind roots fail.
+// strictJSONDecode decodes with DisallowUnknownFields so cross-kind roots fail,
+// and requires EOF after the first JSON value so trailing garbage is rejected
+// (S1-F3 — Decoder.Decode alone is weaker than json.Unmarshal on this axis).
 // Shared by write-boundary validation and the mark phase (same contract).
 func strictJSONDecode(raw []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	// Second Decode must hit EOF — any further token is trailing garbage.
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("trailing data after JSON value")
+		}
+		return fmt.Errorf("trailing data after JSON value: %w", err)
+	}
+	return nil
 }
 
 func (v *kopiaVault) GetSnapshotRecord(ctx context.Context, id SnapshotRecordID) (*SnapshotRecord, error) {

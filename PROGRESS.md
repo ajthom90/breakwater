@@ -156,6 +156,46 @@ Server-side foundations buildable/testable on Linux/macOS. Wire contract uses re
 | HTTPS on :8443 (M11) | ✅ | `ListenAndServeTLS` with server leaf; plain HTTP gone |
 | Config/cache under `/data` (M4) | ✅ | `kopia-config/<repoID>.config` + `cache/<repoID>`; legacy migrate test |
 | Strict root validation (R3 note 1) | ✅ | `DisallowUnknownFields` at write boundary **and** mark phase; cross-kind test |
+| **S1-F1…F3 fix round** (review `REVIEW-M2-S1.md`) | ✅ | WithoutCancel audit; length-prefix canonical; trailing-EOF decode — see below |
+
+#### Fix round S1-F1…F3 (post-bc65f8a review)
+
+| ID | Fix | Evidence |
+|----|-----|----------|
+| S1-F1 | `context.WithoutCancel(ctx)` for all audit appends; always log failures | `TestEnroll_AuditDespiteCanceledContext` + `TestAuthFail_AuditDespiteCanceledContext` PASS |
+| S1-F2 | Length-prefixed canonical fields (`<len>:<bytes>`); no migration (no real deploys) | `TestCanonicalEncoding_NoAmbiguity` PASS |
+| S1-F3 | `strictJSONDecode` requires EOF after first value | `TestPutSnapshotRecord_RejectsTrailingGarbage` PASS |
+
+##### Red-first against unmodified `bc65f8a`
+
+```
+=== RUN   TestEnroll_AuditDespiteCanceledContext
+    … expected machine.enroll audit row after canceled-ctx enroll failure; got none (S1-F1)
+--- FAIL: TestEnroll_AuditDespiteCanceledContext
+=== RUN   TestAuthFail_AuditDespiteCanceledContext
+    … expected auth.fail audit row despite pre-canceled ctx; got none (S1-F1)
+--- FAIL: TestAuthFail_AuditDespiteCanceledContext
+
+=== RUN   TestCanonicalEncoding_NoAmbiguity
+    old encoding collides as expected (len=26)
+    length-prefixed encoding still collides: 1="id\nts\n…" 2="id\nts\n…"
+--- FAIL: TestCanonicalEncoding_NoAmbiguity
+
+=== RUN   TestPutSnapshotRecord_RejectsTrailingGarbage
+    … must reject TreeObject with trailing garbage after JSON value (S1-F3)
+--- FAIL: TestPutSnapshotRecord_RejectsTrailingGarbage
+```
+
+##### After fixes (review verification commands)
+
+```
+gofmt / go vet / short+race     # clean / all ok
+go test ./internal/audit/ -v    # PASS incl. NoAmbiguity + Surface
+go test ./internal/agentgw/ -run 'TestM1_|TestEnroll_' -v  # PASS (+ AuditDespiteCanceled)
+go test ./internal/vault/ -run 'Root|Strict|Trailing' -v   # PASS trailing garbage
+BW_GATE_BYTES=268435456 TestEngineGate_Kopia               # PASS
+pkg tests                                                   # PASS
+```
 
 #### Red-first (strict root — loose decode must accept cross-kind)
 

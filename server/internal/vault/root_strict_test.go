@@ -117,3 +117,39 @@ func TestPutSnapshotRecord_RejectsCrossKindRoot(t *testing.T) {
 		t.Fatalf("correct kind must still be accepted: %v", err)
 	}
 }
+
+// TestPutSnapshotRecord_RejectsTrailingGarbage is S1-F3: a valid TreeObject JSON
+// prefix followed by trailing bytes must be rejected at the write boundary.
+//
+// Red-first on bc65f8a: strictJSONDecode only Decode()s one value and ignores
+// trailing garbage → Put accepts. After EOF check: Put rejects.
+func TestPutSnapshotRecord_RejectsTrailingGarbage(t *testing.T) {
+	ctx := context.Background()
+	mgr := vault.NewManager(t.TempDir(), t.TempDir())
+	defer mgr.CloseAll(ctx)
+
+	v, err := mgr.Create(ctx, "trailing", "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Valid TreeObject JSON + trailing garbage (json.Unmarshal would reject;
+	// Decoder.Decode alone accepts).
+	raw := append([]byte(`{"v":1,"entries":[]}`), []byte("TRAILING-GARBAGE-BYTES")...)
+	oid, err := v.WriteObject(ctx, vault.SplitterFixed4M, bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = v.PutSnapshotRecord(ctx, vault.SnapshotRecord{
+		Kind:         vault.KindFileSnapshot,
+		MachineID:    "trailing",
+		Timestamp:    time.Now().UTC(),
+		RootObjectID: oid,
+		Source:       "/trailing",
+	})
+	if err == nil {
+		t.Fatal("PutSnapshotRecord must reject TreeObject with trailing garbage after JSON value (S1-F3)")
+	}
+	t.Logf("trailing garbage rejected: %v", err)
+}
