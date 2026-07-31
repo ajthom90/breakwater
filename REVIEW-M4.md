@@ -70,3 +70,27 @@ BW_GATE_BYTES=268435456 go test ../server/internal/vault/ -count=1 -run TestEngi
 
 Historical prune-only `maxTreeDepth = 256` could fail-closed on legitimate deep trees and permanently wedge retention (same failure class as R2-2/S2-F3, via data shape). Bound is now **4096**, shared by both walkers, documented on `pkg/format.MaxTreeDepth`. Exceeding it still fails prune/restore **loudly** with operator-actionable wording (forget snapshot / flatten tree) — never silent skip.
 
+
+---
+
+## Reviewer verification (fix round, 2026-07-31)
+
+Independently verified `6eb8dac`. Full suite green under `-race` (server, pkg,
+agent, cli, tools/golden); all `TestM4_*` green; reduced engine gate green.
+
+- **M4-F1:** `format.MaxTreeDepth = 4096` is now shared by prune's mark phase and
+  the restore reachability walk. `TestPruneDeepTreeBeyondOld256Limit` proves a
+  300-deep tree — which previously **wedged retention permanently** — now prunes
+  and restores successfully. The over-limit error names manifest and path prefix
+  (`TestTreeDepthExceededError_Actionable`, `TestMarkTreeDepthPathPrefix`).
+- **M4-F2:** reachability cache is evicted via an `Engine.OnJobTerminal` hook
+  fired from `releaseLease`, wired in `breakwaterd`;
+  `TestM4F2_ReachCacheEvictedOnTerminal` asserts no entry survives job terminal.
+
+**Mutation battery — two for two killed:** reverting `MaxTreeDepth` to 256 fails
+the deep-tree prune test; disabling the terminal hooks fails the cache-eviction
+test. Neither test passes vacuously.
+
+**M4 closed.** The product can now back up *and* restore through its own API,
+with cross-machine restore authorized structurally (job-scoped + reachability-
+scoped) and restore streams holding a shared lease that provably blocks prune.
