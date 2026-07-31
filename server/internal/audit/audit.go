@@ -84,6 +84,10 @@ const (
 	// Mutating :8443 (M4): job submit + catalog rescan.
 	ActionJobRunManual  = "job.run_manual"
 	ActionCatalogRescan = "catalog.rescan"
+	// M5 retention (server-side only — never from agent :9443).
+	ActionRetentionForget   = "retention.forget"
+	ActionRetentionUndelete = "retention.undelete"
+	ActionRetentionPruneRun = "retention.prune_run"
 )
 
 // Event is an audit event to append.

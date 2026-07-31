@@ -211,6 +211,43 @@ func (db *DB) UpdateJobProgress(ctx context.Context, id string, bytesRead, bytes
 	})
 }
 
+// LastSuccessfulJobTime returns the finished_at of the most recent successful
+// job of the given type for machineID. Zero time if none.
+func (db *DB) LastSuccessfulJobTime(ctx context.Context, machineID, jobType string) (time.Time, error) {
+	var finished sql.NullString
+	err := db.sql.QueryRowContext(ctx, `
+		SELECT finished_at FROM jobs
+		WHERE machine_id = ? AND type = ? AND state = ?
+		  AND finished_at IS NOT NULL
+		ORDER BY finished_at DESC LIMIT 1`,
+		machineID, jobType, JobStateSuccess).Scan(&finished)
+	if err == sql.ErrNoRows {
+		return time.Time{}, nil
+	}
+	if err != nil {
+		return time.Time{}, err
+	}
+	if !finished.Valid {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339Nano, finished.String)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, finished.String)
+	}
+	return t, err
+}
+
+// LastJobOfType returns the most recent job of type for machine (any state).
+func (db *DB) LastJobOfType(ctx context.Context, machineID, jobType string) (*Job, error) {
+	row := db.sql.QueryRowContext(ctx, `
+		SELECT id, COALESCE(machine_id, ''), type, state, started_at, finished_at,
+		       bytes_read, bytes_stored, error_message, log_ref, params_json, created_at
+		FROM jobs
+		WHERE machine_id = ? AND type = ?
+		ORDER BY created_at DESC LIMIT 1`, machineID, jobType)
+	return scanJob(row)
+}
+
 func scanJobs(rows *sql.Rows) ([]Job, error) {
 	var out []Job
 	for rows.Next() {

@@ -17,9 +17,9 @@ GPL tools (e.g. wimlib, partclone, ntfs-3g) may appear only as separate processe
 | [golang.org/x/sys](https://golang.org/x/sys) | BSD-3 | OS primitives |
 | [golang.org/x/crypto](https://golang.org/x/crypto) | BSD-3 | Crypto helpers |
 | [oklog/ulid](https://github.com/oklog/ulid) | Apache-2.0 | Primary keys |
-| [robfig/cron](https://github.com/robfig/cron) | MIT | Schedule parsing (later milestone) |
+| [robfig/cron](https://github.com/robfig/cron) v3 | MIT | Schedule parsing (M5; parsing only; evaluation uses injected clock) |
 | [pquerna/otp](https://github.com/pquerna/otp) | Apache-2.0 | TOTP (later milestone) |
-| [wneessen/go-mail](https://github.com/wneessen/go-mail) | MIT | SMTP (later milestone) |
+| [wneessen/go-mail](https://github.com/wneessen/go-mail) | MIT | SMTP notifier (M5; credentials never logged) |
 | [klauspost/compress](https://github.com/klauspost/compress) | Apache-2.0 / BSD | Compression |
 | go-ole / microsoft-wmi | MIT | Hyper-V WMI (Phase 3) |
 

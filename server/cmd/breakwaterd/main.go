@@ -17,9 +17,11 @@ import (
 	"github.com/ajthom90/breakwater/server/internal/agentgw"
 	"github.com/ajthom90/breakwater/server/internal/audit"
 	"github.com/ajthom90/breakwater/server/internal/catalog"
+	"github.com/ajthom90/breakwater/server/internal/clock"
 	"github.com/ajthom90/breakwater/server/internal/enroll"
 	"github.com/ajthom90/breakwater/server/internal/keystore"
 	"github.com/ajthom90/breakwater/server/internal/mtls"
+	"github.com/ajthom90/breakwater/server/internal/retention"
 	"github.com/ajthom90/breakwater/server/internal/scheduler"
 	"github.com/ajthom90/breakwater/server/internal/vault"
 	"github.com/ajthom90/breakwater/server/internal/web"
@@ -102,6 +104,15 @@ func main() {
 	}
 	controlReg := agentgw.NewRegistry(log)
 
+	// M5: production clock is always clock.System() — never a fake, never env override.
+	prodClock := productionClock()
+	retentionSvc := &retention.Service{
+		DB: db, Vaults: vm, Keystore: ks, Locks: repoLocks,
+		Clock: prodClock, Auditor: auditor, Log: log,
+	}
+	cronLoop := scheduler.NewCronLoop(prodClock, &scheduler.CatalogCronSource{DB: db}, jobEngine, log)
+	_ = cronLoop.Start(ctx) // window/cron evaluation; jobs dispatch only in-window
+
 	apiToken, err := web.LoadOrCreateAPIToken(*dataDir, log)
 	if err != nil {
 		log.Error("api token", "err", err)
@@ -139,16 +150,18 @@ func main() {
 
 	// HTTPS :8443 — REST + SSE + embedded UI (M2-S5). Auth: dev API token.
 	// M4: mutating job submit + catalog rescan (audited).
+	// M5: retention forget/undelete/prune/scrub (server-side only).
 	webHandler := web.NewHandler(web.Config{
-		DB:       db,
-		Auditor:  auditor,
-		Events:   eventHub,
-		Engine:   jobEngine,
-		Vaults:   vm,
-		Keystore: ks,
-		APIToken: apiToken,
-		Version:  version,
-		Log:      log,
+		DB:        db,
+		Auditor:   auditor,
+		Events:    eventHub,
+		Engine:    jobEngine,
+		Vaults:    vm,
+		Keystore:  ks,
+		Retention: retentionSvc,
+		APIToken:  apiToken,
+		Version:   version,
+		Log:       log,
 	})
 
 	webSrv := &http.Server{
@@ -189,6 +202,13 @@ func (a *vaultAdapter) Create(ctx context.Context, repoID, password string) ([]b
 		return nil, "", err
 	}
 	return v.HashingKey(ctx)
+}
+
+// productionClock returns the only clock breakwaterd may use.
+// Safety: no env-var override, no test hook, no global mutable clock.
+// Tests assert IsSystem(productionClock()).
+func productionClock() clock.Clock {
+	return clock.System()
 }
 
 func loadOrCreateServerIdentity(keysDir, hostname string) (*mtls.Identity, error) {

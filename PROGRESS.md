@@ -4,6 +4,8 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
+**Phase 1 — M5 (schedules, GFS retention, forget/prune, scrub, alerts; PLAN wk9–10)** — ✅ **COMPLETE** on Linux/darwin evidence (2026-07-31)
+
 **Phase 1 — M4 (restore path; PLAN wk7–8, pulled forward)** — ✅ **COMPLETE** on portable Linux/darwin evidence (2026-07-30)
 
 **Phase 1 — M3 (VSS; PLAN wk5–6)** — ⏸️ **BLOCKED** on Windows VM availability (not available yet). M4 does not depend on VSS: it restores plain-directory backups M2 already produces.
@@ -927,6 +929,109 @@ server-loss: DeleteAllSnapshots → rescan added=1 → restore drill.txt OK
 |----|--------|-------|
 | M4-F1 | ✅ Fixed | `format.MaxTreeDepth=4096` shared by prune mark + restore reachability; path-aware over-limit errors; depth=300 prune+restore green (old 256 would fail) |
 | M4-F2 | ✅ Fixed | `Engine.OnJobTerminal` → `RestoreServer.EvictReachCache`; test asserts eviction after terminal |
+
+---
+
+## M5 — schedules, GFS retention, forget/prune split, scrub, alerts
+
+**Closed 2026-07-31** on Linux/darwin. First milestone whose code **deletes**
+customer backups — correctness treated as higher-stakes; fail closed (keep too
+much) over uncertain deletion.
+
+### Deliverables
+
+| Item | Status | Evidence |
+|------|--------|----------|
+| Pure GFS keep-set (`ComputeKeepSet`) | ✅ | `server/internal/retention`; package doc bucketing rules |
+| Policy model + Standard Server seed | ✅ | catalog `policies` (already seeded); `retention.StandardServer()` |
+| Forget = soft-delete (`deleted_at`); no vault touch | ✅ | `Service.Forget`; catalog `SoftDeleteSnapshot(now)` |
+| Undelete within grace | ✅ | `Service.Undelete`; grace from policy (default 7d) |
+| Prune only past grace → vault DeleteSnapshotRecord + Prune | ✅ | `Service.Prune`; in-grace treated LIVE |
+| Min-age (24h) + grace (7d) composition | ✅ | documented in package doc; neither weakened |
+| Audit `retention.forget` / `.undelete` / `.prune_run` | ✅ | mass_forget flag at threshold 10 |
+| Agent has no forget/prune path | ✅ | `TestM5_AgentHasNoForgetOrPrunePath` |
+| Soft-deleted in-grace survives prune | ✅ | `TestM5_GraceWindowSurvivesPrune` (red-first safety) |
+| Injected `Clock`; production = `clock.System()` only | ✅ | `TestProductionUsesSystemClock`; no env override |
+| Scheduler: cron parse + windows + catch-up + retry | ✅ | `scheduler/schedule.go` + `cronloop.go`; window does not kill |
+| Scrub: exclusive lease, 1/Nth slice, affected snapshots | ✅ | `retention.Scrub`; verify_state on catalog + REST |
+| Property tests (seed printed on failure) | ✅ | `TestProperty_*`; `-count=5 -race` green |
+| 90-day time-warp harness | ✅ | `TestM5_TimeWarp90Days` — fires=91 final_keep=21 in ~10ms |
+| SMTP notify + watchdog + digest (fake sender in tests) | ✅ | `server/internal/notify`; wneessen/go-mail |
+| REST :8443 forget/undelete/prune/retention/scrub | ✅ | `web/api.go` |
+| robfig/cron + go-mail in THIRD_PARTY_NOTICES | ✅ | MIT, pre-approved |
+
+### Decisions (explicit)
+
+1. **Bucketing rules** (documented in `retention` package doc): newest-first;
+   keep-last N; per GFS tier up to K distinct non-empty buckets; **newest wins
+   a bucket**; empty buckets skip (do not steal older slots); union of rules;
+   **newest tip always kept** even if keep-last=0; ties broken by ID desc;
+   UTC boundaries (hour/day/Monday-week/month/year).
+
+2. **Grace vs min-content-age composition:**
+   - Catalog grace (default 7d): soft-deleted snapshots stay as vault manifests
+     until `deleted_at + grace ≤ now`. Mark-and-sweep still walks them → LIVE.
+   - Content min-age (R2-2, default 24h): vault sweep never deletes young
+     contents; maintenance SafetyParameters derive from the same window (R3-5).
+   - **Both** must allow deletion for content to go. Dedup may keep shared young
+     chunks past grace until aged. Production defaults never pass
+     `WithMinContentAge(0)`.
+
+3. **Property-test seed policy:** every randomized test logs `seed=<int64>` via
+   `t.Logf` at start. On failure the seed is in the FAIL line message
+   (`SEED %d …`). Re-run by hardcoding that seed in the test source. No flaky
+   unreproducible failures (M2 lesson).
+
+4. **Scrub lease = exclusive** (same as prune/verify): must not race
+   `DeleteContent`. Restore keeps shared.
+
+5. **Window close does not kill** in-flight jobs — windows gate dispatch start
+   only. Missed-window catch-up fires **once** on recovery (`ShouldDispatch`
+   with last success), not every missed cron tick.
+
+### Red-first safety properties
+
+```
+TestM5_GraceWindowSurvivesPrune          PASS  (in-grace soft-delete survives prune;
+                                                 past grace reclaims; live snap OK)
+TestM5_AgentHasNoForgetOrPrunePath       PASS  (Submit prune/verify rejected;
+                                                 gRPC surface has no Forget/Prune/…)
+TestProductionUsesSystemClock            PASS  (main productionClock = System only)
+```
+
+### 90-day time-warp result
+
+```
+TestM5_TimeWarp90Days  PASS
+  fires=91 (nightly 20:00 cron inside 20:00–06:00 window)
+  final_keep=21 under Standard Server (keep-last 3, daily 14, weekly 8, monthly 12, yearly 2)
+  incremental daily apply matches final keep-set exactly
+  wall time ~10ms (fake clock)
+```
+
+### Verification (M5 closeout)
+
+```
+gofmt -l server pkg agent cli restore tools   # empty
+cd server && go vet ./... && go test ./... -count=1 -short -race -timeout 15m  # PASS
+go test ./internal/retention/ -count=5 -race                                  # PASS
+go test ./internal/agentgw/ -count=1 -race -run 'TestM4|TestM5' -v            # PASS
+go test ./internal/vault/ -count=1 -race -run 'Prune|Grace|Depth' -v          # PASS
+cd ../pkg && go test ./... -count=1 -race                                     # PASS
+cd ../agent && go test ./... -count=1 -race                                   # PASS
+cd ../tools/golden && go test ./... -count=1 -race                            # PASS
+cd ../../server && BW_GATE_BYTES=268435456 go test ./internal/vault/ -run TestEngineGate_Kopia -v  # PASS
+docker build -f ../packaging/docker/Dockerfile -t breakwater:m5test ..        # PASS
+```
+
+### Carried forward / not in M5
+
+| Item | Note |
+|------|------|
+| SMTP live integration against real mail server | Fake sender in unit tests; production wires `SMTPSender` when settings configured |
+| Web UI retention editor / undelete button | REST ready; Settings screen still stub |
+| Assign Long Retention policy variant at enrollment | Standard Server seeded; second policy can be added later |
+| M3 VSS | Still Windows-VM blocked |
 
 **Decision:** tree-walk depth bound raised 256→4096 (runaway guard, not data-shape limit). See REVIEW-M4 disposition.
 

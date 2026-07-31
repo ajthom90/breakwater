@@ -11,6 +11,7 @@ import (
 	"github.com/ajthom90/breakwater/server/internal/catalog"
 	"github.com/ajthom90/breakwater/server/internal/keystore"
 	"github.com/ajthom90/breakwater/server/internal/rescan"
+	"github.com/ajthom90/breakwater/server/internal/retention"
 	"github.com/ajthom90/breakwater/server/internal/scheduler"
 	"github.com/ajthom90/breakwater/server/internal/vault"
 )
@@ -22,16 +23,25 @@ import (
 //	POST /api/v1/jobs   — submit agent jobs (file backup, restore, …)
 //	POST /api/v1/rescan — rebuild snapshot index from vault manifests
 //
+// M5 retention (server-side only — never on :9443):
+//
+//	POST /api/v1/snapshots/{id}/forget
+//	POST /api/v1/snapshots/{id}/undelete
+//	POST /api/v1/machines/{id}/prune
+//	POST /api/v1/machines/{id}/retention
+//	POST /api/v1/machines/{id}/scrub
+//
 // Auth remains the single dev API token (M6 replaces with sessions).
 type API struct {
-	DB       *catalog.DB
-	Auditor  *audit.Writer
-	Events   *scheduler.EventHub
-	Engine   *scheduler.Engine
-	Vaults   *vault.Manager
-	Keystore *keystore.Store
-	Version  string
-	Log      *slog.Logger
+	DB        *catalog.DB
+	Auditor   *audit.Writer
+	Events    *scheduler.EventHub
+	Engine    *scheduler.Engine
+	Vaults    *vault.Manager
+	Keystore  *keystore.Store
+	Retention *retention.Service
+	Version   string
+	Log       *slog.Logger
 }
 
 // Register mounts /api/v1/* handlers on mux behind auth middleware.
@@ -46,6 +56,13 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/audit", a.handleListAudit)
 	mux.HandleFunc("GET /api/v1/events", a.handleSSE)
 	mux.HandleFunc("POST /api/v1/rescan", a.handleRescan)
+	// M5 retention — human-authenticated :8443 only.
+	mux.HandleFunc("POST /api/v1/snapshots/{id}/forget", a.handleForget)
+	mux.HandleFunc("POST /api/v1/snapshots/{id}/undelete", a.handleUndelete)
+	mux.HandleFunc("POST /api/v1/machines/{id}/prune", a.handlePrune)
+	mux.HandleFunc("POST /api/v1/machines/{id}/retention", a.handleApplyRetention)
+	mux.HandleFunc("POST /api/v1/machines/{id}/scrub", a.handleScrub)
+	mux.HandleFunc("GET /api/v1/policies", a.handleListPolicies)
 }
 
 // Mount registers API routes under auth on the given mux.
@@ -93,14 +110,16 @@ type jobDTO struct {
 }
 
 type snapshotDTO struct {
-	ID          string `json:"id"`
-	MachineID   string `json:"machine_id"`
-	Kind        string `json:"kind"`
-	Source      string `json:"source"`
-	BytesRead   int64  `json:"bytes_read"`
-	BytesStored int64  `json:"bytes_stored"`
-	JobID       string `json:"job_id,omitempty"`
-	CreatedAt   string `json:"created_at"`
+	ID          string  `json:"id"`
+	MachineID   string  `json:"machine_id"`
+	Kind        string  `json:"kind"`
+	Source      string  `json:"source"`
+	BytesRead   int64   `json:"bytes_read"`
+	BytesStored int64   `json:"bytes_stored"`
+	JobID       string  `json:"job_id,omitempty"`
+	CreatedAt   string  `json:"created_at"`
+	VerifyState string  `json:"verify_state"`
+	DeletedAt   *string `json:"deleted_at,omitempty"`
 }
 
 type auditDTO struct {
@@ -329,10 +348,118 @@ func (a *API) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
 		out = append(out, snapshotDTO{
 			ID: s.ID, MachineID: s.MachineID, Kind: s.Kind, Source: s.Source,
 			BytesRead: s.BytesRead, BytesStored: s.BytesStored, JobID: s.JobID,
-			CreatedAt: formatTime(s.CreatedAt),
+			CreatedAt: formatTime(s.CreatedAt), VerifyState: s.VerifyState,
+			DeletedAt: formatTimePtr(s.DeletedAt),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
+}
+
+func (a *API) handleForget(w http.ResponseWriter, r *http.Request) {
+	if a.Retention == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "retention not configured")
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeJSONError(w, http.StatusBadRequest, "snapshot id required")
+		return
+	}
+	res, err := a.Retention.Forget(r.Context(), []string{id}, "api", audit.ActorUser, "", map[string]string{id: "manual"})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"forgotten": res.Forgotten, "mass_forget": res.Mass})
+}
+
+func (a *API) handleUndelete(w http.ResponseWriter, r *http.Request) {
+	if a.Retention == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "retention not configured")
+		return
+	}
+	id := r.PathValue("id")
+	if err := a.Retention.Undelete(r.Context(), id, "api", audit.ActorUser); err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"undeleted": id})
+}
+
+func (a *API) handlePrune(w http.ResponseWriter, r *http.Request) {
+	if a.Retention == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "retention not configured")
+		return
+	}
+	mid := r.PathValue("id")
+	res, err := a.Retention.Prune(r.Context(), mid, "api", audit.ActorUser)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"machine_id":        res.MachineID,
+		"eligible":          res.Eligible,
+		"manifests_removed": res.ManifestsRemoved,
+		"grace":             res.Grace.String(),
+	})
+}
+
+func (a *API) handleApplyRetention(w http.ResponseWriter, r *http.Request) {
+	if a.Retention == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "retention not configured")
+		return
+	}
+	mid := r.PathValue("id")
+	res, err := a.Retention.ApplyRetention(r.Context(), mid, "api", audit.ActorUser)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"forgotten": res.Forgotten, "mass_forget": res.Mass, "policy_id": res.PolicyID,
+	})
+}
+
+func (a *API) handleScrub(w http.ResponseWriter, r *http.Request) {
+	if a.Retention == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "retention not configured")
+		return
+	}
+	mid := r.PathValue("id")
+	mode := r.URL.Query().Get("mode")
+	if mode == "" {
+		mode = retention.ScrubSubset
+	}
+	res, err := a.Retention.Scrub(r.Context(), mid, mode, retention.DefaultScrubSlices)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"machine_id":         res.MachineID,
+		"mode":               res.Mode,
+		"slice":              res.Slice,
+		"contents_checked":   res.ContentsChecked,
+		"contents_failed":    res.ContentsFailed,
+		"manifests_checked":  res.ManifestsChecked,
+		"manifests_failed":   res.ManifestsFailed,
+		"affected_snapshots": res.AffectedSnapshots,
+		"errors":             res.Errors,
+	})
+}
+
+func (a *API) handleListPolicies(w http.ResponseWriter, r *http.Request) {
+	if a.DB == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "catalog not configured")
+		return
+	}
+	pols, err := a.DB.ListPolicies(r.Context())
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"policies": pols})
 }
 
 func (a *API) handleListAudit(w http.ResponseWriter, r *http.Request) {
