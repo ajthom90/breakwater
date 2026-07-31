@@ -116,3 +116,26 @@ tests if useful, but rename them so they do not claim to cover scrub.
 
 M5-F1 ✅ closed (mutation-verified). M5-F2 code ✅ closed; **its regression guard
 is M5-F3, open.** M5 closes when M5-F3 lands.
+
+---
+
+## Disposition (M5-F3, append-only)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| M5-F3 | ✅ Fixed | `TestM5F3_ScrubCompletesWhileSharedBackupHeld` calls real `Service.Scrub` while a shared backup lease is held; short timeout. Lock-only tests renamed to `TestRepoLocks_*` (do not claim scrub coverage). **Mutation-killed:** `Acquire(..., Exclusive, ...)` → test FAILS with `context deadline exceeded`; restore Shared → PASS. |
+
+### Mutation evidence (self-check)
+
+```
+# Exclusive (regression):
+--- FAIL: TestM5F3_ScrubCompletesWhileSharedBackupHeld
+    Scrub must complete while backup holds shared … context deadline exceeded
+
+# Shared (correct):
+--- PASS: TestM5F3_ScrubCompletesWhileSharedBackupHeld
+```
+
+## Status (after M5-F3)
+
+M5-F1 ✅ · M5-F2 code ✅ · M5-F3 regression guard ✅ — **M5 closed**.

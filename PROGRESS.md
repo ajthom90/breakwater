@@ -953,7 +953,7 @@ much) over uncertain deletion.
 | Soft-deleted in-grace survives prune | ✅ | `TestM5_GraceWindowSurvivesPrune` (red-first safety) |
 | Injected `Clock`; production = `clock.System()` only | ✅ | `TestProductionUsesSystemClock`; no env override |
 | Scheduler: cron parse + windows + catch-up + retry | ✅ | `scheduler/schedule.go` + `cronloop.go`; window does not kill |
-| Scrub: **shared** lease, 1/Nth slice, affected snapshots | ✅ | `retention.Scrub` (M5-F2); verify_state on catalog + REST |
+| Scrub: **shared** lease, 1/Nth slice, affected snapshots | ✅ | `retention.Scrub` (M5-F2); **behaviorally guarded** by `TestM5F3_*` (M5-F3) |
 | Property tests (seed printed + pinned regression seeds) | ✅ | `TestProperty_*`; `-count=5 -race` green |
 | 90-day time-warp harness | ✅ | `TestM5_TimeWarp90Days` — fires=91 final_keep=21 in ~10ms |
 | SMTP notify + watchdog + digest (fake sender in tests) | ✅ | `server/internal/notify`; wneessen/go-mail |
@@ -990,6 +990,9 @@ much) over uncertain deletion.
    shared holder exists. Exclusive for scrub would starve backups under S2-F3
    writer preference during monthly full read-back. Keep exclusive for prune
    and any future vault-mutating repair verify.
+   **Behavioral guard (M5-F3):** `TestM5F3_ScrubCompletesWhileSharedBackupHeld`
+   calls real `Scrub` while a shared backup lease is held — fails under
+   Exclusive (mutation-verified). Lock-primitive tests renamed `TestRepoLocks_*`.
 
 5. **Window close does not kill** in-flight jobs — windows gate dispatch start
    only. Missed-window catch-up fires **once** on recovery (`ShouldDispatch`
@@ -1038,13 +1041,14 @@ cd ../../server && BW_GATE_BYTES=268435456 go test ./internal/vault/ -run TestEn
 docker build -f ../packaging/docker/Dockerfile -t breakwater:m5test ..        # PASS
 ```
 
-### Fix round M5-F1 / M5-F2 (post-`cfb0a82` review `REVIEW-M5.md`)
+### Fix round M5-F1 / M5-F2 / M5-F3 (post-`cfb0a82` / `4b54d6a` review)
 
 | ID | Status | Notes |
 |----|--------|-------|
-| M5-F2 | ✅ Fixed | Scrub acquires **shared**; rationale rewritten; `TestM5F2_*` (backup not blocked; prune blocked while scrub runs) |
-| M5-F1 | ✅ Fixed | `--enable-destructive-api` default off; `TestM5F1_DestructiveAPIDisabledByDefault` |
+| M5-F2 | ✅ Fixed | Scrub acquires **shared**; rationale rewritten |
+| M5-F1 | ✅ Fixed | `--enable-destructive-api` default off; `TestM5F1_DestructiveAPIDisabledByDefault` (mutation-killed) |
 | Nit | ✅ Fixed | `propertyRegressionSeeds` pinned + random |
+| M5-F3 | ✅ Fixed | Real `Scrub` while shared backup held; Exclusive mutation fails; `TestRepoLocks_*` renamed |
 
 ### Carried forward / not in M5
 
