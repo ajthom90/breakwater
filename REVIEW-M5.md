@@ -139,3 +139,31 @@ is M5-F3, open.** M5 closes when M5-F3 lands.
 ## Status (after M5-F3)
 
 M5-F1 ✅ · M5-F2 code ✅ · M5-F3 regression guard ✅ — **M5 closed**.
+
+---
+
+## Reviewer verification — M5 closed (2026-07-31)
+
+Verified `2d327ed` independently. `TestM5F3_ScrubCompletesWhileSharedBackupHeld`
+builds a real vault + snapshot, holds a **shared** lease (in-flight backup), then
+calls the real `Service.Scrub` under a timeout.
+
+**Mutation-killed, re-run by the reviewer rather than taking the report on
+trust:** reverting `scrub.go` to `scheduler.Exclusive` fails the test with
+`context deadline exceeded` (3.37 s); with `Shared` it passes. The lock-primitive
+tests were renamed `TestRepoLocks_*` so they no longer claim scrub coverage.
+
+Full verification green: gofmt/vet; `-race` across server, pkg, agent,
+tools/golden; retention at `-count=3`; reduced engine gate.
+
+**M5 closed** — F1 (destructive-API opt-in), F2 (scrub shared lease), F3
+(behavioral guard) all mutation-verified.
+
+### Milestone note
+
+M5-F3 was the third instance in this project of a test named for a behavior it
+did not exercise (after `HeartbeatInterval: time.Hour` in S4 and the 3 MiB
+"multi-chunk" case in S3). All three were caught by mutation, not by reading —
+a green suite says nothing about whether a test *can* fail. Worth keeping the
+mutation step as standard practice for any guard protecting a silent-failure
+property (lease modes, retention windows, ordering invariants).
