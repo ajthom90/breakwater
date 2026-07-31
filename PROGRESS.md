@@ -1219,7 +1219,7 @@ See [docs/trust-checklist.md](docs/trust-checklist.md) for the honest 13-item ta
 
 | Green | Partial | Red (blocked) |
 |-------|---------|----------------|
-| #3 cross-machine restore, #5 prune/grace, #6 corruption+alert, #7 ENOSPC, #8 mTLS, #9 append-only | #2 restore (portable only), #4 kill-9 (Linux full/reduced; nightly 500), #10 watchdog (lib ✅ / main cron ⏳), #12 server-loss (index rebuild ✅ / container ⏳) | #1 full C: VSS, #11 VSS leaks, #13 cold runbooks |
+| #3 cross-machine, #5 prune/grace, #6 corruption+alert, #7 ENOSPC, #8 mTLS, #9 append-only, **#10 alerts wired (CHAOS-F2)** | #2 restore (portable only), #4 kill-9 (Linux), #12 server-loss (index rebuild ✅ / container ⏳) | #1 full C: VSS, #11 VSS leaks, #13 cold runbooks |
 
 ---
 
@@ -1239,7 +1239,7 @@ PLAN schedules the chaos matrix for M5–M6. Implemented in `server/internal/cha
 | 6 | Token/cert pinning | ✅ by ref | `TestM1_EnrollmentAndWrongCertRejection` |
 | 7 | Agent cannot prune | ✅ by ref | `TestM5_AgentHasNoForgetOrPrunePath` |
 | 8 | Bit-flip pack → scrub | ✅ | `TestChaos08_*` |
-| 9 | Missed backup watchdog | ✅ mechanism | `TestChaos09_*` — production cron still M6 |
+| 9 | Missed backup watchdog | ✅ production-wired | `TestChaos09_*` + `TestCHAOS_F2_WatchdogThroughWireAlerting` |
 | 10 | kill -9 fuzz ≥500 | ✅ | `TestChaos10_Kill9Fuzz` + `ProcessKill9` |
 
 ### CI
@@ -1259,3 +1259,18 @@ PLAN schedules the chaos matrix for M5–M6. Implemented in `server/internal/cha
 ### Crash model justification (#10)
 
 Process-level kill of the test harness is self-defeating. Flagship loop uses concurrent backup+prune with random `Manager.Close` (session death equivalent for open kopia handles) for density (500 iters), plus true `SIGKILL` of a worker subprocess (`TestChaos10_ProcessKill9`) for OS-level durability. Both assert full restore of every survivor after every iteration; seeds printed.
+
+### CHAOS-F2 — alerting wired into `breakwaterd` (2026-07-31)
+
+**Finding:** `server/internal/notify` was complete and chaos-tested, but `breakwaterd` never constructed or scheduled it — no failure emails, no watchdog, no digest in a deployed server.
+
+**Fix:**
+- `wireAlerting` in `server/cmd/breakwaterd/alerting.go` (production construction path)
+- SMTP from catalog `settings` (`smtp.*`); password never logged; unconfigured SMTP → visible startup WARN + `LogSender` (not silent)
+- Failure alerts: `Engine.OnJobTerminal` → enqueue (non-blocking); lease release always notifies hooks
+- Watchdog + daily digest: `alertScheduler` evaluates on **injected clock** (wall ticker only wakes the loop)
+- Retention scrub corruption uses the same `Notifier`
+- E2E: `TestCHAOS_F2_FailureAlertThroughWireAlerting`, `TestCHAOS_F2_WatchdogThroughWireAlerting`, `TestCHAOS_F2_DigestThroughWireAlerting`
+- **Mutation:** unwire OnJobTerminal failure hook → failure e2e **FAILS**; noop `RunOnce` → watchdog e2e **FAILS**; restore → both **PASS**
+
+Trust Checklist #10 → ✅.

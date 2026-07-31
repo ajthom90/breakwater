@@ -54,6 +54,27 @@ type Sender interface {
 	Send(ctx context.Context, msg Message) error
 }
 
+// LogSender logs alerts instead of sending mail. Used when SMTP is not
+// configured so the alert pipeline stays live and events are visible in
+// server logs (not silent). Never logs credentials.
+type LogSender struct {
+	Log *slog.Logger
+}
+
+// Send implements Sender.
+func (s *LogSender) Send(_ context.Context, msg Message) error {
+	log := s.Log
+	if log == nil {
+		log = slog.Default()
+	}
+	log.Info("alert (smtp unconfigured — not emailed)",
+		"kind", msg.Kind,
+		"subject", msg.Subject,
+		"to_count", len(msg.To),
+	)
+	return nil
+}
+
 // FakeSender records messages for tests (no network).
 type FakeSender struct {
 	mu   sync.Mutex

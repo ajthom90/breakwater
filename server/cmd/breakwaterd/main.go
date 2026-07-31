@@ -110,9 +110,25 @@ func main() {
 
 	// M5: production clock is always clock.System() — never a fake, never env override.
 	prodClock := productionClock()
+
+	// CHAOS-F2: wire notify into production — failure alerts, missed-backup
+	// watchdog, daily digest. SMTP from catalog settings; unconfigured SMTP
+	// logs visibly at startup and uses LogSender (not silent).
+	alerts, err := wireAlerting(ctx, alertDeps{
+		DB: db, Engine: jobEngine, Clock: prodClock, Log: log,
+		DigestHourUTC: -1, // load from settings / default
+	})
+	if err != nil {
+		log.Error("alerting wire", "err", err)
+		os.Exit(1)
+	}
+	defer alerts.Close()
+
 	retentionSvc := &retention.Service{
 		DB: db, Vaults: vm, Keystore: ks, Locks: repoLocks,
 		Clock: prodClock, Auditor: auditor, Log: log,
+		// Scrub corruption → same pipeline as job failures (Trust Checklist #6).
+		Notifier: alerts.Notifier,
 	}
 	cronLoop := scheduler.NewCronLoop(prodClock, &scheduler.CatalogCronSource{DB: db}, jobEngine, log)
 	_ = cronLoop.Start(ctx) // window/cron evaluation; jobs dispatch only in-window
@@ -138,12 +154,14 @@ func main() {
 	// M2-S3: append-only DataService (have/want + PutContents + CommitSnapshot).
 	gw.DataService = &agentgw.DataServer{
 		Engine: jobEngine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
+		Clock: prodClock,
 	}
 	// M4: read-only RestoreService (own-repo + restore-job cross-machine).
 	// Reachability cache is evicted when the job lease is released (M4-F2).
 	restoreSrv := &agentgw.RestoreServer{
 		Engine: jobEngine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
 	}
+	// OnJobTerminal: restore cache eviction + failure alerts (registered in wireAlerting).
 	jobEngine.OnJobTerminal(restoreSrv.EvictReachCache)
 	gw.RestoreService = restoreSrv
 	if _, err := gw.Start(*agentAddr); err != nil {

@@ -43,3 +43,31 @@ This matters more than a wiring oversight normally would. PLAN's whole M5 alerti
 1. CHAOS-F2 — wire notify into `breakwaterd` with an end-to-end test.
 
 Remaining gaps are correctly attributed and not actionable here: Trust Checklist #1, #11 (VSS) and the Windows half of #2 need the VM; #13 (cold runbooks) and the full container server-loss drill are M6.
+
+---
+
+## Disposition (CHAOS-F2, append-only)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| CHAOS-F2 | ✅ Fixed | `wireAlerting` in `breakwaterd`: SMTP from catalog settings (redacted logs; unconfigured → startup WARN + `LogSender`); failure alerts via `OnJobTerminal` (non-blocking enqueue); watchdog + daily digest on injected clock (`alertScheduler.RunOnce`); retention scrub shares Notifier. E2E through construction path: `TestCHAOS_F2_FailureAlertThroughWireAlerting`, `TestCHAOS_F2_WatchdogThroughWireAlerting`, `TestCHAOS_F2_DigestThroughWireAlerting`. `releaseLease` always fires terminal hooks (matches prior comment; enables alerts for all terminal paths). Trust Checklist #10 → ✅. |
+
+### Mutation evidence (self-check)
+
+```
+# Unwire failure OnJobTerminal:
+--- FAIL: TestCHAOS_F2_FailureAlertThroughWireAlerting
+    no message kind=failure within 3s (have 0)
+
+# No-op alertScheduler.RunOnce:
+--- FAIL: TestCHAOS_F2_WatchdogThroughWireAlerting
+    no message kind=watchdog within 3s (have 0)
+
+# Restored wiring:
+--- PASS: TestCHAOS_F2_FailureAlertThroughWireAlerting
+--- PASS: TestCHAOS_F2_WatchdogThroughWireAlerting
+```
+
+## Status (after CHAOS-F2)
+
+CHAOS-F1 ✅ · CHAOS-F2 ✅ — chaos matrix accepted; production alerting live in `breakwaterd`.

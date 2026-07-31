@@ -4,7 +4,7 @@ All items must be green before production points at Breakwater as a sole or
 primary backup. This file is written for someone deciding whether to trust this
 product with their only copy of their data.
 
-**Status date:** 2026-07-31 (post M5 + Linux chaos matrix).  
+**Status date:** 2026-07-31 (post M5 + Linux chaos matrix + CHAOS-F2 alerting wire-up).  
 **Do not trust Breakwater with sole copies until this checklist is all green.**
 
 | # | Check | Status | Evidence / what still blocks |
@@ -18,7 +18,7 @@ product with their only copy of their data.
 | 7 | ENOSPC non-destructive + alerted | ✅ | Chaos #4: `TestChaos04_ENOSPC` — tiny FS (darwin ram disk / Linux tmpfs), fill near full, write fails with ENOSPC-class error, failure alert fires, **0 partial snapshots** after reopen. |
 | 8 | mTLS both directions proven | ✅ | M1: `TestM1_EnrollmentAndWrongCertRejection` (enroll + wrong-cert rejected + audit). Chaos matrix #6 by reference. |
 | 9 | Append-only proven from agent credentials | ✅ | Structural :9443 (no destructive RPCs) + `TestM5_AgentHasNoForgetOrPrunePath` (chaos #7 by ref). Agent cannot Submit prune/verify. |
-| 10 | Missed/failed backup emails within the window | ⚠️ partial | **Mechanism ✅:** chaos #9 `TestChaos09_MissedBackupWatchdog` + `notify.Watchdog` with FakeSender. Failure alert path exercised in #4. **Production wiring ⏳:** `breakwaterd` does not yet schedule a periodic watchdog/digest loop (notify package is library-proven; M6 wires cron + SMTP config into main). |
+| 10 | Missed/failed backup emails within the window | ✅ | **Production-wired (CHAOS-F2):** `wireAlerting` in `breakwaterd` — failure alerts via `OnJobTerminal`, watchdog + daily digest on injected clock. E2E: `TestCHAOS_F2_FailureAlertThroughWireAlerting`, `TestCHAOS_F2_WatchdogThroughWireAlerting`, `TestCHAOS_F2_DigestThroughWireAlerting`. SMTP from catalog settings; unconfigured SMTP logs visibly at startup (`LogSender`), not silent. Chaos #9 still covers the notify library path. |
 | 11 | Zero VSS shadow-copy leaks across 100 runs | ❌ | **Windows/M3.** Chaos #1 Linux half only (`TestChaos01_AgentKilledMidUpload`); VSS leak half gated. |
 | 12 | Server-loss drill: metadata rebuilt from repo dir alone; restore succeeds | ⚠️ partial | **Index rebuild ✅:** `TestM4_ServerLossDrill` (wipe catalog snapshots → rescan from repo → restore). **Full container replace ⏳:** still M6 (fresh container + recovery kit end-to-end). |
 | 13 | Runbooks executed cold following only the doc | ❌ | **M6.** Runbooks not yet written/executed cold. |
@@ -37,7 +37,7 @@ Implemented under `server/internal/chaos/`. Numbers match [PLAN.md](../PLAN.md) 
 | 6 | Token/cert pinning | *by ref* `TestM1_EnrollmentAndWrongCertRejection` | Matrix index asserts file still contains evidence. |
 | 7 | Agent cannot prune | *by ref* `TestM5_AgentHasNoForgetOrPrunePath` | Same. |
 | 8 | Bit-flip pack → scrub | `TestChaos08_BitFlipPack` | Affected snapshots + corruption alert. |
-| 9 | Machine silent → watchdog | `TestChaos09_MissedBackupWatchdog` | Email kind=watchdog. |
+| 9 | Machine silent → watchdog | `TestChaos09_*` + `TestCHAOS_F2_WatchdogThroughWireAlerting` | Library + production wire (CHAOS-F2). |
 | 10 | kill -9 fuzz backup+prune | `TestChaos10_Kill9Fuzz` + `ProcessKill9` | Flagship; 500 full / reduced CI. |
 
 **CI:** reduced matrix on every push (`-short`); full (`CHAOS_FULL=1`) nightly + `workflow_dispatch` (mirrors engine-gate pattern).

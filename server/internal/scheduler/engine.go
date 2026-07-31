@@ -796,13 +796,11 @@ func (e *Engine) releaseLease(jobID string) {
 	if ok && l != nil {
 		l.Release()
 	}
-	// Always notify hooks when a lease was held (M4-F2 reachability eviction).
-	// Also notify when no lease was tracked so hooks stay idempotent for jobs
-	// that never acquired one (inventory/noop) — callers must tolerate no-ops.
-	if ok {
-		for _, fn := range hooks {
-			fn(jobID)
-		}
+	// Always notify terminal hooks (M4-F2 reachability eviction; CHAOS-F2
+	// failure alerts). Hooks must tolerate jobs that never held a lease
+	// (inventory/noop) — eviction is a no-op when the cache has no entry.
+	for _, fn := range hooks {
+		fn(jobID)
 	}
 }
 
