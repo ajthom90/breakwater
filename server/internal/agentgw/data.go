@@ -17,11 +17,17 @@ import (
 	breakwaterv1 "github.com/ajthom90/breakwater/pkg/proto/breakwater/v1"
 	"github.com/ajthom90/breakwater/server/internal/audit"
 	"github.com/ajthom90/breakwater/server/internal/catalog"
+	"github.com/ajthom90/breakwater/server/internal/clock"
 	"github.com/ajthom90/breakwater/server/internal/keystore"
 	"github.com/ajthom90/breakwater/server/internal/scheduler"
 	"github.com/ajthom90/breakwater/server/internal/vault"
 	"github.com/oklog/ulid/v2"
 )
+
+// ClockSkewWarnThreshold is how far an agent-reported FinishedAt may diverge
+// from the server clock before a warning is logged and audited (chaos drill #5 /
+// PLAN: server clock governs snapshot timestamps).
+const ClockSkewWarnThreshold = time.Hour
 
 // MaxCheckContentsBatch is the have/want batch limit (proto / PLAN).
 const MaxCheckContentsBatch = 4096
@@ -41,6 +47,8 @@ const ImageBlockSizeBytes = 4 << 20 // 4 MiB
 //   - Append-only: only Put/Has/Write/Commit-shaped vault calls.
 //   - PutContents re-validates the lease on every message (S3-F2).
 //   - PutContents computes the content ID before writing (S3-F3).
+//   - Snapshot timestamps use the server Clock (chaos #5); agent FinishedAt is
+//     advisory only and skew is warned when |Δ| > ClockSkewWarnThreshold.
 type DataServer struct {
 	breakwaterv1.UnimplementedDataServiceServer
 
@@ -50,6 +58,15 @@ type DataServer struct {
 	Vaults   *vault.Manager
 	Auditor  *audit.Writer
 	Log      *slog.Logger
+	// Clock governs CommitSnapshot timestamps. Nil → clock.System().
+	Clock clock.Clock
+}
+
+func (d *DataServer) now() time.Time {
+	if d.Clock != nil {
+		return d.Clock.Now().UTC()
+	}
+	return clock.System().Now().UTC()
 }
 
 // CheckContents is the have/want handshake. Batches of up to 4096 IDs.
@@ -229,6 +246,11 @@ func (d *DataServer) PutImageManifest(ctx context.Context, req *breakwaterv1.Put
 }
 
 // CommitSnapshot finalizes a snapshot record and mirrors it into the catalog.
+//
+// Timestamp authority (chaos drill #5 / PLAN): the server Clock always sets the
+// vault SnapshotRecord.Timestamp and catalog created_at. Agent FinishedAt is
+// recorded in Extra/audit only; large skew is warned so operators can fix the
+// agent host clock without the agent skewing retention.
 func (d *DataServer) CommitSnapshot(ctx context.Context, req *breakwaterv1.CommitSnapshotRequest) (*breakwaterv1.CommitSnapshotResponse, error) {
 	v, job, err := d.vaultForJobRPCFull(ctx, req.GetJobId())
 	if err != nil {
@@ -238,25 +260,55 @@ func (d *DataServer) CommitSnapshot(ctx context.Context, req *breakwaterv1.Commi
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-	ts := time.Now().UTC()
+
+	serverTS := d.now()
+	var agentTS time.Time
+	var skew time.Duration
+	skewWarned := false
 	if req.GetFinishedAt() != nil {
-		ts = req.GetFinishedAt().AsTime().UTC()
+		agentTS = req.GetFinishedAt().AsTime().UTC()
+		skew = serverTS.Sub(agentTS)
+		if skew < 0 {
+			skew = -skew
+		}
+		if skew > ClockSkewWarnThreshold {
+			skewWarned = true
+			if d.Log != nil {
+				d.Log.Warn("agent clock skew on CommitSnapshot; server clock governs",
+					"machine_id", job.MachineID,
+					"job_id", job.ID,
+					"server_ts", serverTS.Format(time.RFC3339Nano),
+					"agent_finished_at", agentTS.Format(time.RFC3339Nano),
+					"skew", skew.String(),
+				)
+			}
+		}
 	}
+
+	extra := map[string]string{}
+	if !agentTS.IsZero() {
+		extra["agent_finished_at"] = agentTS.Format(time.RFC3339Nano)
+		if skewWarned {
+			extra["agent_clock_skew"] = skew.String()
+		}
+	}
+
 	rec := vault.SnapshotRecord{
 		Kind:         kind,
 		MachineID:    job.MachineID,
-		Timestamp:    ts,
+		Timestamp:    serverTS, // server clock — never agent FinishedAt
 		RootObjectID: vault.ObjectID(req.GetRootObjectId()),
 		Source:       req.GetSource(),
 		JobID:        job.ID,
+		Extra:        extra,
 	}
 	manifestID, err := v.PutSnapshotRecord(ctx, rec)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "PutSnapshotRecord: %v", err)
 	}
 
-	// Catalog mirror (rebuildable index).
-	snapID := ulid.MustNew(ulid.Timestamp(time.Now()), ulid.Monotonic(rand.Reader, 0)).String()
+	// Catalog mirror (rebuildable index) — created_at is serverTS (retention input).
+	snapID := ulid.MustNew(ulid.Timestamp(serverTS), ulid.Monotonic(rand.Reader, 0)).String()
 	catalogKind := catalogKind(kind)
 	if d.Catalog != nil {
 		if err := d.Catalog.InsertSnapshot(ctx, catalog.Snapshot{
@@ -269,6 +321,7 @@ func (d *DataServer) CommitSnapshot(ctx context.Context, req *breakwaterv1.Commi
 			JobID:        job.ID,
 			BytesRead:    req.GetBytesRead(),
 			BytesStored:  req.GetBytesStored(),
+			CreatedAt:    serverTS,
 		}); err != nil {
 			return nil, status.Errorf(codes.Internal, "catalog InsertSnapshot: %v", err)
 		}
@@ -276,18 +329,27 @@ func (d *DataServer) CommitSnapshot(ctx context.Context, req *breakwaterv1.Commi
 
 	// Audit: snapshot.commit (not per-chunk).
 	if d.Auditor != nil {
+		detail := map[string]any{
+			"manifest_ref":   string(manifestID),
+			"root_object_id": req.GetRootObjectId(),
+			"job_id":         job.ID,
+			"kind":           catalogKind,
+			"source":         req.GetSource(),
+			"server_ts":      serverTS.Format(time.RFC3339Nano),
+		}
+		if !agentTS.IsZero() {
+			detail["agent_finished_at"] = agentTS.Format(time.RFC3339Nano)
+		}
+		if skewWarned {
+			detail["agent_clock_skew"] = skew.String()
+			detail["clock_skew_warned"] = true
+		}
 		if aerr := d.Auditor.Append(context.WithoutCancel(ctx), audit.Event{
 			Actor:     job.MachineID,
 			ActorType: audit.ActorAgent,
 			Action:    audit.ActionSnapshotCommit,
 			Target:    snapID,
-			Detail: map[string]any{
-				"manifest_ref":   string(manifestID),
-				"root_object_id": req.GetRootObjectId(),
-				"job_id":         job.ID,
-				"kind":           catalogKind,
-				"source":         req.GetSource(),
-			},
+			Detail:    detail,
 		}); aerr != nil && d.Log != nil {
 			d.Log.Error("audit append failed", "action", audit.ActionSnapshotCommit, "err", aerr)
 		}

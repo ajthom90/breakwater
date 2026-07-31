@@ -103,6 +103,12 @@ jobs:
           BW_GATE_BYTES: "268435456" # 256 MiB
         run: go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -timeout 15m -v
 
+      # Chaos drill matrix (Linux-provable subset) — reduced iteration counts on push.
+      # Full kill -9 fuzz (500 iters) runs nightly; see chaos-drills-full job.
+      - name: Chaos drills (reduced)
+        working-directory: server
+        run: go test ./internal/chaos/ -count=1 -short -race -timeout 15m -v
+
       - name: Enrollment + mTLS demo
         working-directory: server
         run: |
@@ -144,6 +150,22 @@ jobs:
       - name: Full 10GB engine gate
         working-directory: server
         run: go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -timeout 45m -v
+
+  # PLAN chaos drill #10 flagship: full kill -9 fuzz (≥500) + full matrix.
+  chaos-drills-full:
+    name: Chaos drills (full nightly)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23.x"
+      - name: Full chaos matrix (CHAOS_FULL=1)
+        working-directory: server
+        env:
+          CHAOS_FULL: "1"
+        run: go test ./internal/chaos/ -count=1 -race -timeout 60m -v
 
   windows:
     name: Windows agent + MSI

@@ -19,6 +19,15 @@ type Auditor interface {
 	Append(ctx context.Context, e audit.Event) error
 }
 
+// Alerter delivers operator-facing alerts (email/webhook). Optional; when nil,
+// scrub corruption still audits but does not notify.
+// Implemented by *notify.Notifier in production.
+type Alerter interface {
+	AlertFailure(machine, jobID, errMsg string)
+	AlertMissedBackup(machine string, lastSuccess time.Time, expectedWindow string)
+	AlertCorruption(machine string, affectedSnapshots []string, detail string)
+}
+
 // Service implements forget / undelete / prune / apply-retention.
 // All vault-touching paths take exclusive leases (same as prune/verify).
 //
@@ -30,6 +39,8 @@ type Service struct {
 	Locks    *scheduler.RepoLocks
 	Clock    clock.Clock
 	Auditor  Auditor
+	// Notifier is optional; scrub corruption fires AlertCorruption when set.
+	Notifier Alerter
 	Log      *slog.Logger
 
 	// MinContentAge for vault.Prune (default DefaultPruneMinContentAge).

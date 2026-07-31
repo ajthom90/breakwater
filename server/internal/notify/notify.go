@@ -305,6 +305,19 @@ func (n *Notifier) AlertMissedBackup(machine string, lastSuccess time.Time, expe
 	})
 }
 
+// AlertCorruption enqueues an alert when scrub detects damaged content.
+// affectedSnapshots lists catalog snapshot IDs known to reference bad contents.
+func (n *Notifier) AlertCorruption(machine string, affectedSnapshots []string, detail string) {
+	body := fmt.Sprintf(
+		"Machine %s: scrub detected repository corruption.\nAffected snapshots (%d): %s\nDetail: %s\n",
+		machine, len(affectedSnapshots), strings.Join(affectedSnapshots, ", "), detail)
+	n.Enqueue(Message{
+		Kind:    "corruption",
+		Subject: fmt.Sprintf("[Breakwater] Corruption detected: %s", machine),
+		Body:    body,
+	})
+}
+
 // DigestRow is one machine line in the daily digest table.
 type DigestRow struct {
 	Machine     string

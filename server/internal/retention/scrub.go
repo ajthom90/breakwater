@@ -175,17 +175,29 @@ func (s *Service) Scrub(ctx context.Context, machineID, mode string, slices int)
 		"contents_checked", res.ContentsChecked, "contents_failed", res.ContentsFailed,
 		"manifests_checked", res.ManifestsChecked, "affected", len(res.AffectedSnapshots),
 	)
-	if s.Auditor != nil && (res.ContentsFailed > 0 || res.ManifestsFailed > 0) {
-		_ = s.Auditor.Append(ctx, audit.Event{
-			Actor: "system", ActorType: audit.ActorSystem,
-			Action: "scrub.corruption",
-			Target: machineID,
-			Detail: map[string]any{
-				"affected_snapshots": res.AffectedSnapshots,
-				"contents_failed":    res.ContentsFailed,
-				"manifests_failed":   res.ManifestsFailed,
-			},
-		})
+	if res.ContentsFailed > 0 || res.ManifestsFailed > 0 {
+		if s.Auditor != nil {
+			_ = s.Auditor.Append(ctx, audit.Event{
+				Actor: "system", ActorType: audit.ActorSystem,
+				Action: "scrub.corruption",
+				Target: machineID,
+				Detail: map[string]any{
+					"affected_snapshots": res.AffectedSnapshots,
+					"contents_failed":    res.ContentsFailed,
+					"manifests_failed":   res.ManifestsFailed,
+				},
+			})
+		}
+		// Operator alert (Trust Checklist #6): corruption is not silent.
+		if s.Notifier != nil {
+			host := machineID
+			if m, err := s.DB.MachineByID(ctx, machineID); err == nil && m != nil && m.Hostname != "" {
+				host = m.Hostname
+			}
+			detail := fmt.Sprintf("contents_failed=%d manifests_failed=%d mode=%s",
+				res.ContentsFailed, res.ManifestsFailed, mode)
+			s.Notifier.AlertCorruption(host, res.AffectedSnapshots, detail)
+		}
 	}
 	return res, nil
 }

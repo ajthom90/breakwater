@@ -4,11 +4,15 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
+**Phase 1 — Chaos drill matrix (PLAN M5–M6 verification)** — ✅ **Linux-provable subset COMPLETE** (2026-07-31). See [Chaos drill matrix](#chaos-drill-matrix-linux-provable) and [docs/trust-checklist.md](docs/trust-checklist.md).
+
 **Phase 1 — M5 (schedules, GFS retention, forget/prune, scrub, alerts; PLAN wk9–10)** — ✅ **COMPLETE** on Linux/darwin evidence (2026-07-31)
 
 **Phase 1 — M4 (restore path; PLAN wk7–8, pulled forward)** — ✅ **COMPLETE** on portable Linux/darwin evidence (2026-07-30)
 
 **Phase 1 — M3 (VSS; PLAN wk5–6)** — ⏸️ **BLOCKED** on Windows VM availability (not available yet). M4 does not depend on VSS: it restores plain-directory backups M2 already produces.
+
+**Next highest-value (no Windows):** M6 surface (audit UI, multi-admin, daily digest wiring into `breakwaterd`, runbooks) and full-container server-loss drill. **Windows-gated:** M3 VSS + Trust Checklist #1/#11.
 
 **Phase 1 — M2 (weeks 3–4)** — ✅ **COMPLETE** on Linux/darwin evidence (stage 5 + S5-F1/F2; Windows demo subset still gated — see [M2 closeout](#m2-closeout))
 
@@ -1209,4 +1213,49 @@ ok  pkg/format
 
 ## Trust Checklist status
 
-See [docs/trust-checklist.md](docs/trust-checklist.md). **Not production-ready.** Item 8 (mTLS) green from M1 (including body/connection mismatch).
+See [docs/trust-checklist.md](docs/trust-checklist.md) for the honest 13-item table (rewritten 2026-07-31 against chaos + M4/M5 evidence).
+
+**Not production-ready as sole backup.** Summary:
+
+| Green | Partial | Red (blocked) |
+|-------|---------|----------------|
+| #3 cross-machine restore, #5 prune/grace, #6 corruption+alert, #7 ENOSPC, #8 mTLS, #9 append-only | #2 restore (portable only), #4 kill-9 (Linux full/reduced; nightly 500), #10 watchdog (lib ✅ / main cron ⏳), #12 server-loss (index rebuild ✅ / container ⏳) | #1 full C: VSS, #11 VSS leaks, #13 cold runbooks |
+
+---
+
+## Chaos drill matrix (Linux-provable)
+
+PLAN schedules the chaos matrix for M5–M6. Implemented in `server/internal/chaos/` (2026-07-31).
+
+### Coverage
+
+| # | Drill | Status | Test |
+|---|--------|--------|------|
+| 1 | Kill agent mid-upload | ✅ Linux half | `TestChaos01_*` — VSS leak half → Windows/M3 |
+| 2 | Server killed mid-upload | ✅ | `TestChaos02_*` |
+| 3 | Network partition mid-backup | ✅ | `TestChaos03_*` |
+| 4 | Server ENOSPC | ✅ | `TestChaos04_*` (tiny FS) |
+| 5 | Agent clock ±3d | ✅ (+ **CHAOS-F1 fix**) | `TestChaos05_*` |
+| 6 | Token/cert pinning | ✅ by ref | `TestM1_EnrollmentAndWrongCertRejection` |
+| 7 | Agent cannot prune | ✅ by ref | `TestM5_AgentHasNoForgetOrPrunePath` |
+| 8 | Bit-flip pack → scrub | ✅ | `TestChaos08_*` |
+| 9 | Missed backup watchdog | ✅ mechanism | `TestChaos09_*` — production cron still M6 |
+| 10 | kill -9 fuzz ≥500 | ✅ | `TestChaos10_Kill9Fuzz` + `ProcessKill9` |
+
+### CI
+
+- **Push/PR:** `go test ./internal/chaos/ -short -race` (reduced iters).
+- **Nightly + workflow_dispatch:** `CHAOS_FULL=1` (500 kill-9 fuzz + full matrix), job `chaos-drills-full` in `.github/workflows/ci.yml`.
+
+### Defect found (prominently)
+
+**CHAOS-F1 — agent clock could govern vault snapshot timestamps**
+
+- **Drill:** #5. Pre-fix `CommitSnapshot` set vault `Timestamp` from agent `FinishedAt`.
+- **Impact:** mis-set or malicious agent clock (±3d) could skew vault timestamps; retention used catalog `created_at` (server SQL now) but vault authority and any future vault→catalog path were wrong.
+- **Fix:** server `Clock` always owns vault Timestamp + catalog `created_at`; agent time in Extra/audit only; warn when skew > 1h.
+- **Mutation:** trust agent time → `TestChaos05` **FAILS**; restore → **PASS**.
+
+### Crash model justification (#10)
+
+Process-level kill of the test harness is self-defeating. Flagship loop uses concurrent backup+prune with random `Manager.Close` (session death equivalent for open kopia handles) for density (500 iters), plus true `SIGKILL` of a worker subprocess (`TestChaos10_ProcessKill9`) for OS-level durability. Both assert full restore of every survivor after every iteration; seeds printed.
