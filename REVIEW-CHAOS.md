@@ -106,6 +106,15 @@ M6.
 |----|--------|-------|
 | CHAOS-F3 | ✅ Fixed | ENOSPC drill left tmpfs/ramdisk mounted when cleanup ran under `t.TempDir()`, so Go's `RemoveAll` hit `EBUSY` and flaked Linux CI. **Fix:** mount via `os.MkdirTemp` (not `t.TempDir`); close all vault handles before umount; umount with retries (+ lazy on Linux, force eject on darwin); verify unmount before `RemoveAll`. Darwin also fixed a named-return footgun (`return sub, cleanup` reassigned closed-over `mount` → umount targeted the wrong path). Process-kill drill always reaps the child after SIGKILL. Assertions unchanged (fault + alert + 0 partial snaps). |
 
-### CI verification
+### CI verification (Linux job green across repeated full re-runs)
 
-Report run IDs after push (Linux job re-run ≥3 times). Trust Checklist #7 claim unchanged (still ✅ with same drill name).
+| Run / attempt | ID | Linux build & test | Notes |
+|---------------|-----|--------------------|--------|
+| Push `6bdaec0` (initial) | [30614138534](https://github.com/ajthom90/breakwater/actions/runs/30614138534) | ✅ success | Chaos drills (reduced) step green |
+| Full re-run 1 | same run ID (workflow re-run) | ✅ success | |
+| Full re-run 2 | same run ID | ✅ success | |
+| Full re-run 3 | same run ID | ✅ success | |
+
+Pre-fix flake: run [30612295238](https://github.com/ajthom90/breakwater/actions/runs/30612295238) failed with `TempDir RemoveAll … device or resource busy` after chaos#4 OK. Post-fix: **4/4** Linux successes (initial + 3 full re-runs); intermittency not observed.
+
+Trust Checklist #7 claim unchanged (still ✅ with same drill name); cleanup note added.
