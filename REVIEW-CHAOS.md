@@ -97,3 +97,15 @@ Full suite green under `-race`; Trust Checklist #10 → ✅ naming the e2e tests
 **Accepted.** Remaining checklist gaps are correctly attributed: #1, #11 and the
 Windows half of #2 need the VM; #13 and the full container server-loss drill are
 M6.
+
+---
+
+## Disposition (CHAOS-F3, append-only)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| CHAOS-F3 | ✅ Fixed | ENOSPC drill left tmpfs/ramdisk mounted when cleanup ran under `t.TempDir()`, so Go's `RemoveAll` hit `EBUSY` and flaked Linux CI. **Fix:** mount via `os.MkdirTemp` (not `t.TempDir`); close all vault handles before umount; umount with retries (+ lazy on Linux, force eject on darwin); verify unmount before `RemoveAll`. Darwin also fixed a named-return footgun (`return sub, cleanup` reassigned closed-over `mount` → umount targeted the wrong path). Process-kill drill always reaps the child after SIGKILL. Assertions unchanged (fault + alert + 0 partial snaps). |
+
+### CI verification
+
+Report run IDs after push (Linux job re-run ≥3 times). Trust Checklist #7 claim unchanged (still ✅ with same drill name).

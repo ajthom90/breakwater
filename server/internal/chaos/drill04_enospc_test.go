@@ -20,17 +20,26 @@ import (
 // as a snapshot, no corrupt index).
 //
 // Primary path: real small filesystem (Linux tmpfs via sudo; macOS hdiutil).
-// Fallback: write into a pre-filled directory until ENOSPC, or skip with reason
-// if the platform cannot create a limited FS (documented — not a silent pass).
+// Fallback: skip with reason if the platform cannot create a limited FS
+// (documented — not a silent pass).
+//
+// CHAOS-F3: tiny FS is mounted outside t.TempDir; vault handles are closed
+// before umount; umount is retried and must succeed before RemoveAll. Mounting
+// inside t.TempDir left CI intermittent-red on Linux (EBUSY on cleanup).
 func TestChaos04_ENOSPC(t *testing.T) {
 	seed := chaos.Seed(t, time.Now().UnixNano())
 	t.Logf("chaos#4 seed=%d", seed)
 
-	mount, cleanup, err := createTinyFS(t, 1<<20) // ~1 MiB
+	mount, cleanup, err := createTinyFS(1 << 20) // ~1 MiB
 	if err != nil {
 		t.Skipf("cannot create tiny filesystem for real ENOSPC (platform=%s): %v", runtime.GOOS, err)
 	}
-	defer cleanup()
+	// Register umount/remove first so LIFO runs it *after* CloseAll below.
+	t.Cleanup(func() {
+		if err := cleanup(); err != nil {
+			t.Errorf("tiny FS cleanup (umount/remove): %v", err)
+		}
+	})
 	t.Logf("FAULT surface: tiny FS at %s (≤1MiB)", mount)
 
 	ctx := context.Background()
@@ -45,11 +54,13 @@ func TestChaos04_ENOSPC(t *testing.T) {
 	// Close default vault first.
 	_ = env.VM.CloseAll(ctx)
 	vmTiny := vault.NewManager(tinyRepos, env.Dir)
-	t.Cleanup(func() { _ = vmTiny.CloseAll(ctx) })
+	// CloseAll before umount (registered later → runs first under LIFO).
+	t.Cleanup(func() {
+		if err := vmTiny.CloseAll(ctx); err != nil {
+			t.Logf("vmTiny.CloseAll: %v", err)
+		}
+	})
 
-	// Remove keystore entry? We need Create on tiny path with same machine id.
-	// Manager.Create uses machineID as repoID.
-	// Existing password is fine.
 	v, err := vmTiny.Create(ctx, env.MachineID, env.Password)
 	if err != nil {
 		t.Fatalf("create vault on tiny FS: %v", err)
@@ -102,7 +113,7 @@ func TestChaos04_ENOSPC(t *testing.T) {
 	t.Logf("alert fired: subject=%q", msg.Subject)
 
 	// Repo still openable / not corrupt: ListSnapshotRecords works; no partial snap.
-	// May need reopen if kopia session poisoned.
+	// Close after verify so no live handle pins the mount at cleanup (CHAOS-F3).
 	_ = vmTiny.Close(ctx, env.MachineID)
 	v2, err := vmTiny.Open(ctx, env.MachineID, env.Password)
 	if err != nil {
@@ -111,15 +122,22 @@ func TestChaos04_ENOSPC(t *testing.T) {
 	}
 	metas, err := v2.ListSnapshotRecords(ctx, vault.KindFileSnapshot)
 	if err != nil {
+		_ = vmTiny.CloseAll(ctx)
 		t.Fatalf("ListSnapshotRecords after ENOSPC: %v", err)
 	}
 	if len(metas) != 0 {
+		_ = vmTiny.CloseAll(ctx)
 		t.Fatalf("partial snapshot committed under ENOSPC: %d manifests", len(metas))
 	}
 	// Catalog should also have no snapshots for this machine (we never committed).
 	live, _ := env.DB.ListSnapshotsByMachine(ctx, env.MachineID, 100)
 	if len(live) != 0 {
+		_ = vmTiny.CloseAll(ctx)
 		t.Fatalf("catalog has %d snapshots after ENOSPC abort", len(live))
+	}
+	// Deterministic pre-cleanup: drop all vault FDs before umount cleanup runs.
+	if err := vmTiny.CloseAll(ctx); err != nil {
+		t.Logf("CloseAll before umount: %v", err)
 	}
 	t.Logf("chaos#4 OK: ENOSPC clean fail, alert fired, 0 partial snapshots")
 }
@@ -158,14 +176,14 @@ func fillUntilNearFull(t *testing.T, path string) {
 	}
 }
 
-// createTinyFS returns a mountpoint of ~sizeBytes free capacity.
-func createTinyFS(t *testing.T, sizeBytes int64) (mount string, cleanup func(), err error) {
-	t.Helper()
+// createTinyFS returns a mountpoint of ~sizeBytes free capacity and a cleanup
+// that umounts then removes the directory. Does not use t.TempDir (CHAOS-F3).
+func createTinyFS(sizeBytes int64) (mount string, cleanup func() error, err error) {
 	switch runtime.GOOS {
 	case "linux":
-		return createTinyFSLinux(t, sizeBytes)
+		return createTinyFSLinux(sizeBytes)
 	case "darwin":
-		return createTinyFSDarwin(t, sizeBytes)
+		return createTinyFSDarwin(sizeBytes)
 	default:
 		return "", nil, fmt.Errorf("unsupported OS %s", runtime.GOOS)
 	}

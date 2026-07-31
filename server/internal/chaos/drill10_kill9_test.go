@@ -291,6 +291,15 @@ func TestChaos10_ProcessKill9(t *testing.T) {
 		if err := cmd.Start(); err != nil {
 			t.Fatalf("start worker: %v", err)
 		}
+		// Always reap the child so a killed worker cannot leave an unreaped
+		// process holding paths under t.TempDir (CHAOS-F3 sibling hygiene).
+		waited := false
+		reap := func() {
+			if !waited && cmd.Process != nil {
+				_ = cmd.Wait()
+				waited = true
+			}
+		}
 		// Wait until worker signals it is mid-work (or timeout).
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
@@ -300,18 +309,19 @@ func TestChaos10_ProcessKill9(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 		if _, err := os.Stat(marker); err != nil {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
+			_ = kill9(cmd.Process.Pid)
+			reap()
 			t.Fatalf("iter %d: worker never set started marker (fault not proven)", i)
 		}
 		// True kill -9.
 		if err := kill9(cmd.Process.Pid); err != nil {
+			reap()
 			t.Fatalf("kill -9: %v", err)
 		}
-		_ = cmd.Wait()
+		reap()
 		kills++
 
-		// Reopen and verify.
+		// Reopen and verify (opens+closes vault; no mount left behind).
 		if err := verifyKill9Workdir(t, dir); err != nil {
 			t.Fatalf("SEED %d process-kill iter %d: %v", seed, i, err)
 		}

@@ -1274,3 +1274,7 @@ Process-level kill of the test harness is self-defeating. Flagship loop uses con
 - **Mutation:** unwire OnJobTerminal failure hook → failure e2e **FAILS**; noop `RunOnce` → watchdog e2e **FAILS**; restore → both **PASS**
 
 Trust Checklist #10 → ✅.
+
+### CHAOS-F3 — ENOSPC drill CI flake (tmpfs cleanup EBUSY)
+
+Linux CI failed intermittently when Go's `t.TempDir()` `RemoveAll` hit a still-mounted tmpfs after `TestChaos04_ENOSPC`. Drill assertions were green; cleanup was not. Fixed by mounting outside `t.TempDir`, closing vault handles before umount, retrying umount, and failing the cleanup path loudly if unmount does not succeed. Process-kill always reaps the SIGKILL'd child.
