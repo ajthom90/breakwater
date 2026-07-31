@@ -71,3 +71,29 @@ Remaining gaps are correctly attributed and not actionable here: Trust Checklist
 ## Status (after CHAOS-F2)
 
 CHAOS-F1 ✅ · CHAOS-F2 ✅ — chaos matrix accepted; production alerting live in `breakwaterd`.
+
+---
+
+## Reviewer verification — CHAOS-F2 closed (2026-07-31)
+
+Verified `6ce61c9`. Alerting now runs in the production `breakwaterd`
+construction path: `wireAlerting()` builds the notifier from catalog SMTP
+settings, registers failure alerts on `Engine.OnJobTerminal` (reusing the M4-F2
+hook rather than adding a parallel path), and runs watchdog + daily digest on a
+scheduler driven by the **injected clock**.
+
+Four end-to-end tests exercise `wireAlerting` itself rather than the notify
+package — which is the point, since the package already passed while production
+was inert. **Mutation-killed, re-run by the reviewer:** early-returning the
+`OnJobTerminal` hook fails `TestCHAOS_F2_FailureAlertThroughWireAlerting`
+(0 messages); restoring it passes.
+
+Good judgement call in the fix: with no SMTP configured the server logs a
+startup **WARN** and routes alerts to a `LogSender` rather than erroring on every
+event — visible degradation instead of silent success *or* log spam.
+
+Full suite green under `-race`; Trust Checklist #10 → ✅ naming the e2e tests.
+
+**Accepted.** Remaining checklist gaps are correctly attributed: #1, #11 and the
+Windows half of #2 need the VM; #13 and the full container server-loss drill are
+M6.
