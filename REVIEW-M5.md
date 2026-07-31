@@ -71,3 +71,48 @@ BW_GATE_BYTES=268435456 go test ./internal/vault/ -count=1 -run TestEngineGate_K
 | M5-F2 | ✅ Fixed | Scrub uses `scheduler.Shared`; package comment documents why shared suffices (prune exclusion structural; exclusive would starve backups under S2-F3 writer preference). Tests: `TestM5F2_ScrubSharedDoesNotBlockBackup`, `TestM5F2_PruneBlockedWhileScrubRunning`, `TestM5F2_ScrubCompatibleWithConcurrentShared`. |
 | M5-F1 | ✅ Fixed | `--enable-destructive-api` defaults **off**; forget/undelete/prune/retention/scrub return 403 when disabled; reads still work. Decision recorded in PROGRESS as known pre-auth limitation until M6. Audit actor plumbing unchanged. Tests: `TestM5F1_DestructiveAPIDisabledByDefault`, `TestM5F1_DestructiveAPIEnabledPassesGate`. |
 | Nit | ✅ Fixed | `propertyRegressionSeeds` run every pass; fresh `time.Now().UnixNano()` seed still logged for new coverage. |
+
+---
+
+## Reviewer verification (fix round, 2026-07-31) — one new finding
+
+Verified `4b54d6a`. Full suite green under `-race`; retention at `-count=3`;
+scrub-lease and destructive-API tests pass.
+
+**M5-F1 fix is genuine.** `--enable-destructive-api` defaults off; forget /
+undelete / prune / retention / scrub return 403 when disabled while reads still
+work. **Mutation-killed:** forcing the gate open fails
+`TestM5F1_DestructiveAPIDisabledByDefault`. (First mutation attempt silently
+didn't apply — wrong field name — and was re-run correctly rather than reported.)
+
+**M5-F2's code fix is correct** — `Scrub` now acquires `scheduler.Shared` with an
+accurate rationale comment. **But its regression tests do not pin it:**
+
+### M5-F3 · Medium — the M5-F2 regression tests pass vacuously; scrub's lease mode is unguarded
+`server/internal/retention/scrub_lease_test.go:20,42,96`
+All three tests **hardcode `scheduler.Shared`** to "simulate scrub" and never
+invoke the real `Scrub` path — `grep` confirms no test in the package calls
+`Scrub(ctx, …)`. They therefore assert a property of `RepoLocks`
+(shared-doesn't-block-shared; exclusive-blocked-while-shared-held), which was
+already true before this milestone, rather than anything about scrub.
+
+**Empirically confirmed:** reverting `scrub.go` to
+`scheduler.Acquire(..., Exclusive, ...)` — the exact regression M5-F2 exists to
+prevent — leaves all three tests **passing**. The fix is real but unguarded; a
+future edit can silently restore the backup-window stall.
+
+This is the same pattern this project has hit repeatedly (a test named for a
+behavior it does not exercise: the `HeartbeatInterval: time.Hour` control tests,
+the 3 MiB "multi-chunk" case). Worth fixing here because scrub's lease mode is a
+silent-availability property — nothing fails loudly if it regresses.
+
+**Fix:** make at least one test exercise the real `Scrub`: hold a shared lease
+from another goroutine (simulating an in-flight backup), call `Scrub` with a
+short timeout against a small repo, and assert it completes. Under an exclusive
+lease it would block on the held shared lease and time out. Keep the primitive
+tests if useful, but rename them so they do not claim to cover scrub.
+
+## Status
+
+M5-F1 ✅ closed (mutation-verified). M5-F2 code ✅ closed; **its regression guard
+is M5-F3, open.** M5 closes when M5-F3 lands.
