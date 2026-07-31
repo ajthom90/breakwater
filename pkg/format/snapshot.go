@@ -10,6 +10,16 @@ import "time"
 // and image manifests so fixed-block image objects can be added later.
 const FormatVersion = 1
 
+// MaxTreeDepth is the shared runaway guard for TreeObject walks (prune mark
+// and restore reachability). Both walkers MUST use this same bound so they
+// never disagree about what is walkable (M4-F1).
+//
+// Raised from the historical prune-only limit of 256 (which could fail-closed
+// on legitimate deep trees and wedge retention permanently) to a value well
+// beyond plausible real-world nesting. Exceeding this fails loudly with an
+// actionable error; it is not a silent retention skip.
+const MaxTreeDepth = 4096
+
 // TreeObject is a directory tree (DIDX-analog). Stored as a JSON object in the vault.
 type TreeObject struct {
 	Version int         `json:"v"`

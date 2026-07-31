@@ -920,6 +920,16 @@ cross-machine A→B bytes identical; prune blocked while restore shared lease he
 server-loss: DeleteAllSnapshots → rescan added=1 → restore drill.txt OK
 ```
 
+
+### Fix round M4-F1 / M4-F2 (post-`0d8057f` review `REVIEW-M4.md`)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| M4-F1 | ✅ Fixed | `format.MaxTreeDepth=4096` shared by prune mark + restore reachability; path-aware over-limit errors; depth=300 prune+restore green (old 256 would fail) |
+| M4-F2 | ✅ Fixed | `Engine.OnJobTerminal` → `RestoreServer.EvictReachCache`; test asserts eviction after terminal |
+
+**Decision:** tree-walk depth bound raised 256→4096 (runaway guard, not data-shape limit). See REVIEW-M4 disposition.
+
 ### bwctl transport note
 
 `bwctl restore` / `bwctl rescan` use **REST on :8443** with the dev API token

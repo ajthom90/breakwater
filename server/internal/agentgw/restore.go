@@ -54,8 +54,32 @@ type RestoreServer struct {
 	Log      *slog.Logger
 
 	// reachCache holds precomputed reachable sets for restore jobs.
+	// Entries are evicted when the job's vault lease is released (M4-F2) —
+	// wired via Engine.OnJobTerminal so sets do not live for process lifetime.
 	reachMu    sync.Mutex
 	reachCache map[string]*reachableSet // jobID → set
+}
+
+// EvictReachCache drops the reachable set for jobID (M4-F2). Safe to call when
+// no entry exists. Registered as Engine.OnJobTerminal from gateway wiring.
+func (r *RestoreServer) EvictReachCache(jobID string) {
+	if r == nil || jobID == "" {
+		return
+	}
+	r.reachMu.Lock()
+	defer r.reachMu.Unlock()
+	delete(r.reachCache, jobID)
+}
+
+// ReachCacheHas reports whether jobID still has a cached reachable set (tests).
+func (r *RestoreServer) ReachCacheHas(jobID string) bool {
+	if r == nil {
+		return false
+	}
+	r.reachMu.Lock()
+	defer r.reachMu.Unlock()
+	_, ok := r.reachCache[jobID]
+	return ok
 }
 
 // reachableSet is the set of object IDs and content IDs a restore job may read.
@@ -559,6 +583,7 @@ func (r *RestoreServer) reachableForJob(ctx context.Context, j catalog.Job, snap
 }
 
 // walkReachable marks all object IDs and data content IDs reachable from root.
+// Depth is bounded by format.MaxTreeDepth (shared with prune mark — M4-F1).
 func walkReachable(ctx context.Context, v vault.Vault, rootOID string, set *reachableSet) error {
 	if rootOID == "" {
 		return fmt.Errorf("empty root object id")
@@ -573,11 +598,21 @@ func walkReachable(ctx context.Context, v vault.Vault, rootOID string, set *reac
 		// Root might not be a tree if misconfigured; fail closed for reachability.
 		return fmt.Errorf("decode root tree: %w", err)
 	}
-	return walkTreeReachable(ctx, v, &tree, set)
+	return walkTreeReachable(ctx, v, &tree, set, 0, "")
 }
 
-func walkTreeReachable(ctx context.Context, v vault.Vault, tree *format.TreeObject, set *reachableSet) error {
+func walkTreeReachable(ctx context.Context, v vault.Vault, tree *format.TreeObject, set *reachableSet, depth int, pathPrefix string) error {
+	if depth > format.MaxTreeDepth {
+		return fmt.Errorf("restore: tree depth exceeds %d (runaway guard); path=%q snapshot=%s — forget this snapshot or flatten the source tree",
+			format.MaxTreeDepth, pathPrefix, set.SnapshotID)
+	}
 	for _, ent := range tree.Entries {
+		childPath := pathPrefix
+		if childPath == "" {
+			childPath = ent.Name
+		} else if ent.Name != "" {
+			childPath = pathPrefix + "/" + ent.Name
+		}
 		switch ent.Type {
 		case format.EntryDir:
 			if ent.ObjectID == "" {
@@ -592,7 +627,7 @@ func walkTreeReachable(ctx context.Context, v vault.Vault, tree *format.TreeObje
 			if err := json.Unmarshal(raw, &child); err != nil {
 				return err
 			}
-			if err := walkTreeReachable(ctx, v, &child, set); err != nil {
+			if err := walkTreeReachable(ctx, v, &child, set, depth+1, childPath); err != nil {
 				return err
 			}
 		case format.EntryFile:

@@ -125,9 +125,12 @@ func main() {
 		Engine: jobEngine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
 	}
 	// M4: read-only RestoreService (own-repo + restore-job cross-machine).
-	gw.RestoreService = &agentgw.RestoreServer{
+	// Reachability cache is evicted when the job lease is released (M4-F2).
+	restoreSrv := &agentgw.RestoreServer{
 		Engine: jobEngine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
 	}
+	jobEngine.OnJobTerminal(restoreSrv.EvictReachCache)
+	gw.RestoreService = restoreSrv
 	if _, err := gw.Start(*agentAddr); err != nil {
 		log.Error("agent gateway", "err", err)
 		os.Exit(1)

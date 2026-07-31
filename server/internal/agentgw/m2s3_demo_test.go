@@ -39,6 +39,7 @@ type dataEnv struct {
 	Vaults   *vault.Manager
 	Keystore *keystore.Store
 	Auditor  *audit.Writer
+	Restore  *agentgw.RestoreServer
 	Addr     string
 	ServerFP string
 }
@@ -84,9 +85,12 @@ func startDataEnv(t *testing.T) *dataEnv {
 		Engine: engine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
 	}
 	// M4: RestoreService on the same gateway (own-repo + restore-job authz).
-	gw.RestoreService = &agentgw.RestoreServer{
+	// OnJobTerminal evicts reachability cache when the job lease is released (M4-F2).
+	restoreSrv := &agentgw.RestoreServer{
 		Engine: engine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
 	}
+	engine.OnJobTerminal(restoreSrv.EvictReachCache)
+	gw.RestoreService = restoreSrv
 	addr, err := gw.Start("127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("start: %v", err)
@@ -95,7 +99,8 @@ func startDataEnv(t *testing.T) *dataEnv {
 
 	return &dataEnv{
 		t: t, DB: db, GW: gw, Engine: engine, Registry: reg,
-		Vaults: vm, Keystore: ks, Auditor: auditor, Addr: addr, ServerFP: serverFP,
+		Vaults: vm, Keystore: ks, Auditor: auditor, Restore: restoreSrv,
+		Addr: addr, ServerFP: serverFP,
 	}
 }
 

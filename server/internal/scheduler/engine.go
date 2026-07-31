@@ -55,6 +55,21 @@ type Engine struct {
 	runningByMachine map[string]map[string]struct{}
 	// cancelTimers force-fail cancelling jobs after CancelTimeout (S3-F10).
 	cancelTimers map[string]*time.Timer
+	// onJobTerminal hooks run after a job's vault lease is released (success,
+	// failed, cancelled, disconnect, undelivered revert). Used by RestoreServer
+	// to evict reachability cache entries (M4-F2).
+	onJobTerminal []func(jobID string)
+}
+
+// OnJobTerminal registers a hook invoked after releaseLease for a job.
+// Safe to call before Start; hooks run outside the engine mutex.
+func (e *Engine) OnJobTerminal(fn func(jobID string)) {
+	if e == nil || fn == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.onJobTerminal = append(e.onJobTerminal, fn)
 }
 
 // NewEngine constructs a job engine. locks may be shared with vault Close/Open callers.
@@ -776,9 +791,18 @@ func (e *Engine) releaseLease(jobID string) {
 	if ok {
 		delete(e.leases, jobID)
 	}
+	hooks := append([]func(string){}, e.onJobTerminal...)
 	e.mu.Unlock()
 	if ok && l != nil {
 		l.Release()
+	}
+	// Always notify hooks when a lease was held (M4-F2 reachability eviction).
+	// Also notify when no lease was tracked so hooks stay idempotent for jobs
+	// that never acquired one (inventory/noop) — callers must tolerate no-ops.
+	if ok {
+		for _, fn := range hooks {
+			fn(jobID)
+		}
 	}
 }
 

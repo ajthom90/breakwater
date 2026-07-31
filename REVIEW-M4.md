@@ -58,3 +58,15 @@ go test ./internal/vault/ -count=1 -run 'Prune|Depth' -v
 cd ../pkg && go test ./... -count=1 -race
 BW_GATE_BYTES=268435456 go test ../server/internal/vault/ -count=1 -run TestEngineGate_Kopia -v
 ```
+
+## Disposition (fix round)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| M4-F1 | ✅ Fixed | Shared `format.MaxTreeDepth = 4096` used by prune mark and restore reachability. Raised from 256 so it is a runaway guard, not a data-shape limit. Over-limit errors name manifest + path prefix (actionable). Tests: `TestPruneDeepTreeBeyondOld256Limit` (depth=300), `TestTreeDepthExceededError_Actionable`, `TestMarkTreeDepthPathPrefix`, `TestM4F1_DeepTreeRestoreReachability`. |
+| M4-F2 | ✅ Fixed | `Engine.OnJobTerminal` hooks fire from `releaseLease`; `RestoreServer.EvictReachCache` registered in `breakwaterd` + test env. `TestM4F2_ReachCacheEvictedOnTerminal` asserts no entry after terminal. |
+
+### Decision (depth bound)
+
+Historical prune-only `maxTreeDepth = 256` could fail-closed on legitimate deep trees and permanently wedge retention (same failure class as R2-2/S2-F3, via data shape). Bound is now **4096**, shared by both walkers, documented on `pkg/format.MaxTreeDepth`. Exceeding it still fails prune/restore **loudly** with operator-actionable wording (forget snapshot / flatten tree) — never silent skip.
+

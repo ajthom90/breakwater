@@ -941,7 +941,7 @@ func markLiveContents(ctx context.Context, rep repo.Repository) (map[content.ID]
 func markSnapshotContents(ctx context.Context, rep repo.Repository, live map[content.ID]struct{}, kind SnapshotKind, root ObjectID, manifestID manifest.ID) error {
 	switch kind {
 	case KindFileSnapshot:
-		return markTreeObject(ctx, rep, live, root, string(manifestID), 0)
+		return markTreeObject(ctx, rep, live, root, string(manifestID), 0, "")
 	case KindImageSnapshot:
 		return markImageManifest(ctx, rep, live, root, string(manifestID))
 	default:
@@ -949,13 +949,15 @@ func markSnapshotContents(ctx context.Context, rep repo.Repository, live map[con
 	}
 }
 
-const maxTreeDepth = 256
-
 // markTreeObject recursively marks a TreeObject and all referenced file/dir/ADS objects.
 // Decode failure ALWAYS fails the prune (R3-1 fail closed — no leaf heuristic).
-func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.ID]struct{}, oid ObjectID, manifestID string, depth int) error {
-	if depth > maxTreeDepth {
-		return fmt.Errorf("prune: tree depth exceeds %d (manifest %s, oid %s)", maxTreeDepth, manifestID, oid)
+//
+// Depth is bounded by format.MaxTreeDepth (shared with restore reachability — M4-F1).
+// Over-limit fails the prune with an actionable error naming the manifest and path
+// prefix so operators can forget the snapshot rather than discover silent retention stop.
+func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.ID]struct{}, oid ObjectID, manifestID string, depth int, pathPrefix string) error {
+	if depth > format.MaxTreeDepth {
+		return treeDepthExceededError("prune", manifestID, pathPrefix, string(oid))
 	}
 	if err := markObjectContents(ctx, rep, live, oid, manifestID); err != nil {
 		return err
@@ -977,9 +979,10 @@ func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.I
 			continue
 		}
 		child := ObjectID(ent.ObjectID)
+		childPath := joinTreePath(pathPrefix, ent.Name)
 		switch ent.Type {
 		case format.EntryDir:
-			if err := markTreeObject(ctx, rep, live, child, manifestID, depth+1); err != nil {
+			if err := markTreeObject(ctx, rep, live, child, manifestID, depth+1, childPath); err != nil {
 				return err
 			}
 		default:
@@ -998,6 +1001,22 @@ func markTreeObject(ctx context.Context, rep repo.Repository, live map[content.I
 		}
 	}
 	return nil
+}
+
+// treeDepthExceededError is the shared actionable wording for prune/restore walks.
+func treeDepthExceededError(op, manifestID, pathPrefix, oid string) error {
+	return fmt.Errorf("%s: tree depth exceeds %d (runaway guard); manifest=%s path=%q oid=%s — forget this snapshot or flatten the source tree; retention/restore cannot proceed while this tree is live",
+		op, format.MaxTreeDepth, manifestID, pathPrefix, oid)
+}
+
+func joinTreePath(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	if name == "" {
+		return prefix
+	}
+	return prefix + "/" + name
 }
 
 // markImageManifest marks the image manifest object and every block content ID.
