@@ -24,6 +24,9 @@ type Config struct {
 	Vaults    *vault.Manager
 	Keystore  *keystore.Store
 	Retention *retention.Service
+	// EnableDestructiveAPI opts in M5 forget/prune/retention/scrub REST
+	// (default false until M6 sessions — M5-F1).
+	EnableDestructiveAPI bool
 	// APIToken is the dev local token (from LoadOrCreateAPIToken).
 	APIToken string
 	Version  string
@@ -57,15 +60,16 @@ func NewHandler(cfg Config) http.Handler {
 	})
 
 	api := &API{
-		DB:        cfg.DB,
-		Auditor:   cfg.Auditor,
-		Events:    cfg.Events,
-		Engine:    cfg.Engine,
-		Vaults:    cfg.Vaults,
-		Keystore:  cfg.Keystore,
-		Retention: cfg.Retention,
-		Version:   cfg.Version,
-		Log:       cfg.Log,
+		DB:                   cfg.DB,
+		Auditor:              cfg.Auditor,
+		Events:               cfg.Events,
+		Engine:               cfg.Engine,
+		Vaults:               cfg.Vaults,
+		Keystore:             cfg.Keystore,
+		Retention:            cfg.Retention,
+		EnableDestructiveAPI: cfg.EnableDestructiveAPI,
+		Version:              cfg.Version,
+		Log:                  cfg.Log,
 	}
 	api.Mount(mux, cfg.APIToken)
 

@@ -32,6 +32,14 @@ import (
 //	POST /api/v1/machines/{id}/scrub
 //
 // Auth remains the single dev API token (M6 replaces with sessions).
+//
+// # Destructive API gate (M5-F1)
+//
+// Forget / undelete / prune / retention-apply / scrub are opt-in until M6
+// sessions exist. Production defaults EnableDestructiveAPI=false
+// (--enable-destructive-api). The read token alone must not grant destroy.
+// Audit still records actor/actorType when enabled so M6 can drop real
+// identities in without changing call sites.
 type API struct {
 	DB        *catalog.DB
 	Auditor   *audit.Writer
@@ -40,8 +48,10 @@ type API struct {
 	Vaults    *vault.Manager
 	Keystore  *keystore.Store
 	Retention *retention.Service
-	Version   string
-	Log       *slog.Logger
+	// EnableDestructiveAPI gates M5 retention-mutating endpoints (default false).
+	EnableDestructiveAPI bool
+	Version              string
+	Log                  *slog.Logger
 }
 
 // Register mounts /api/v1/* handlers on mux behind auth middleware.
@@ -56,13 +66,26 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/audit", a.handleListAudit)
 	mux.HandleFunc("GET /api/v1/events", a.handleSSE)
 	mux.HandleFunc("POST /api/v1/rescan", a.handleRescan)
-	// M5 retention — human-authenticated :8443 only.
-	mux.HandleFunc("POST /api/v1/snapshots/{id}/forget", a.handleForget)
-	mux.HandleFunc("POST /api/v1/snapshots/{id}/undelete", a.handleUndelete)
-	mux.HandleFunc("POST /api/v1/machines/{id}/prune", a.handlePrune)
-	mux.HandleFunc("POST /api/v1/machines/{id}/retention", a.handleApplyRetention)
-	mux.HandleFunc("POST /api/v1/machines/{id}/scrub", a.handleScrub)
+	// M5 retention — human-authenticated :8443 only; further gated by
+	// EnableDestructiveAPI (M5-F1). Always register so paths 403 cleanly when off.
+	mux.HandleFunc("POST /api/v1/snapshots/{id}/forget", a.requireDestructive(a.handleForget))
+	mux.HandleFunc("POST /api/v1/snapshots/{id}/undelete", a.requireDestructive(a.handleUndelete))
+	mux.HandleFunc("POST /api/v1/machines/{id}/prune", a.requireDestructive(a.handlePrune))
+	mux.HandleFunc("POST /api/v1/machines/{id}/retention", a.requireDestructive(a.handleApplyRetention))
+	mux.HandleFunc("POST /api/v1/machines/{id}/scrub", a.requireDestructive(a.handleScrub))
 	mux.HandleFunc("GET /api/v1/policies", a.handleListPolicies)
+}
+
+// requireDestructive rejects retention-mutating calls when the opt-in is off.
+func (a *API) requireDestructive(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !a.EnableDestructiveAPI {
+			writeJSONError(w, http.StatusForbidden,
+				"destructive retention API disabled; pass --enable-destructive-api (pre-M6; see PROGRESS.md)")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // Mount registers API routes under auth on the given mux.

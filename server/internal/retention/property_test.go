@@ -20,22 +20,47 @@ import (
 	"github.com/oklog/ulid/v2"
 )
 
+// Pinned regression seeds (M5 nit): known-interesting cases run every time
+// alongside a fresh random seed. Failures print seed= for reproduction.
+var propertyRegressionSeeds = []int64{
+	1,
+	42,
+	1785476453578342000, // first M5 property-test seed from closeout log
+	99,
+	123456789,
+}
+
 // TestProperty_RandomForgetPruneNeverOrphans is PLAN's explicit M5 property:
 // random snapshot sets + policies + forget/prune interleavings never leave a
 // surviving snapshot unable to fully restore. Prints the seed on failure.
 func TestProperty_RandomForgetPruneNeverOrphans(t *testing.T) {
-	seed := time.Now().UnixNano()
-	// Allow override for reproduction: go test -args is awkward; use env-less fixed
-	// re-run by editing seed or failing with printed seed.
-	t.Logf("property seed=%d", seed)
-	rng := rand.New(rand.NewSource(seed))
-
-	const iters = 12
-	for i := 0; i < iters; i++ {
-		if err := runOnePropertyIter(t, rng, seed, i); err != nil {
-			t.Fatalf("SEED %d iter %d: %v", seed, i, err)
-		}
+	// Pinned regression seeds first (deterministic every CI run).
+	for _, seed := range propertyRegressionSeeds {
+		seed := seed
+		t.Run(fmt.Sprintf("pinned/%d", seed), func(t *testing.T) {
+			t.Logf("property seed=%d", seed)
+			rng := rand.New(rand.NewSource(seed))
+			// Fewer iters per pinned seed — cover variety without exploding runtime.
+			for i := 0; i < 3; i++ {
+				if err := runOnePropertyIter(t, rng, seed, i); err != nil {
+					t.Fatalf("SEED %d iter %d: %v", seed, i, err)
+				}
+			}
+		})
 	}
+
+	// Fresh random seed (logged for reproduction).
+	seed := time.Now().UnixNano()
+	t.Run(fmt.Sprintf("random/%d", seed), func(t *testing.T) {
+		t.Logf("property seed=%d", seed)
+		rng := rand.New(rand.NewSource(seed))
+		const iters = 12
+		for i := 0; i < iters; i++ {
+			if err := runOnePropertyIter(t, rng, seed, i); err != nil {
+				t.Fatalf("SEED %d iter %d: %v", seed, i, err)
+			}
+		}
+	})
 }
 
 func runOnePropertyIter(t *testing.T, rng *rand.Rand, seed int64, iter int) error {
@@ -236,58 +261,74 @@ func walkRestoreAll(ctx context.Context, v vault.Vault, root vault.ObjectID) err
 
 // TestProperty_KeepSetInvariants pure keep-set properties with printed seed.
 func TestProperty_KeepSetInvariants(t *testing.T) {
+	runKeepSet := func(t *testing.T, seed int64, nIters int) {
+		t.Helper()
+		t.Logf("keepset seed=%d", seed)
+		rng := rand.New(rand.NewSource(seed))
+		now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+		for i := 0; i < nIters; i++ {
+			runOneKeepSetIter(t, rng, seed, i, now)
+		}
+	}
+	for _, seed := range propertyRegressionSeeds {
+		seed := seed
+		t.Run(fmt.Sprintf("pinned/%d", seed), func(t *testing.T) {
+			runKeepSet(t, seed, 50)
+		})
+	}
 	seed := time.Now().UnixNano()
-	t.Logf("keepset seed=%d", seed)
-	rng := rand.New(rand.NewSource(seed))
-	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+	t.Run(fmt.Sprintf("random/%d", seed), func(t *testing.T) {
+		runKeepSet(t, seed, 200)
+	})
+}
 
-	for i := 0; i < 200; i++ {
-		n := 1 + rng.Intn(40)
-		var snaps []retention.Snapshot
-		for j := 0; j < n; j++ {
-			snaps = append(snaps, retention.Snapshot{
-				ID:        fmt.Sprintf("s%04d", j),
-				Timestamp: now.Add(-time.Duration(rng.Intn(365*24)) * time.Hour),
-			})
-		}
-		p := retention.Policy{
-			KeepLast: rng.Intn(10), KeepHourly: rng.Intn(24),
-			KeepDaily: rng.Intn(30), KeepWeekly: rng.Intn(12),
-			KeepMonthly: rng.Intn(24), KeepYearly: rng.Intn(5),
-		}
-		r := retention.ComputeKeepSet(snaps, p, now)
+func runOneKeepSetIter(t *testing.T, rng *rand.Rand, seed int64, i int, now time.Time) {
+	t.Helper()
+	n := 1 + rng.Intn(40)
+	var snaps []retention.Snapshot
+	for j := 0; j < n; j++ {
+		snaps = append(snaps, retention.Snapshot{
+			ID:        fmt.Sprintf("s%04d", j),
+			Timestamp: now.Add(-time.Duration(rng.Intn(365*24)) * time.Hour),
+		})
+	}
+	p := retention.Policy{
+		KeepLast: rng.Intn(10), KeepHourly: rng.Intn(24),
+		KeepDaily: rng.Intn(30), KeepWeekly: rng.Intn(12),
+		KeepMonthly: rng.Intn(24), KeepYearly: rng.Intn(5),
+	}
+	r := retention.ComputeKeepSet(snaps, p, now)
 
-		// newest always kept
-		newest := snaps[0]
-		for _, s := range snaps {
-			if s.Timestamp.After(newest.Timestamp) || (s.Timestamp.Equal(newest.Timestamp) && s.ID > newest.ID) {
-				newest = s
-			}
+	// newest always kept
+	newest := snaps[0]
+	for _, s := range snaps {
+		if s.Timestamp.After(newest.Timestamp) || (s.Timestamp.Equal(newest.Timestamp) && s.ID > newest.ID) {
+			newest = s
 		}
-		if _, ok := r.KeepIDs[newest.ID]; !ok {
-			t.Fatalf("SEED %d iter %d: newest %s not kept", seed, i, newest.ID)
-		}
+	}
+	if _, ok := r.KeepIDs[newest.ID]; !ok {
+		t.Fatalf("SEED %d iter %d: newest %s not kept", seed, i, newest.ID)
+	}
 
-		// never fewer than min(keep-last, n)
-		wantMin := p.KeepLast
-		if wantMin > n {
-			wantMin = n
-		}
-		if wantMin > 0 && len(r.KeepIDs) < wantMin {
-			t.Fatalf("SEED %d iter %d: keep %d < keep-last %d", seed, i, len(r.KeepIDs), wantMin)
-		}
+	// never fewer than min(keep-last, n)
+	wantMin := p.KeepLast
+	if wantMin > n {
+		wantMin = n
+	}
+	if wantMin > 0 && len(r.KeepIDs) < wantMin {
+		t.Fatalf("SEED %d iter %d: keep %d < keep-last %d", seed, i, len(r.KeepIDs), wantMin)
+	}
 
-		// idempotence
-		var survivors []retention.Snapshot
-		for _, s := range snaps {
-			if _, ok := r.KeepIDs[s.ID]; ok {
-				survivors = append(survivors, s)
-			}
+	// idempotence
+	var survivors []retention.Snapshot
+	for _, s := range snaps {
+		if _, ok := r.KeepIDs[s.ID]; ok {
+			survivors = append(survivors, s)
 		}
-		r2 := retention.ComputeKeepSet(survivors, p, now)
-		if len(r2.Forget) != 0 {
-			t.Fatalf("SEED %d iter %d: second pass forgot %v", seed, i, r2.Forget)
-		}
+	}
+	r2 := retention.ComputeKeepSet(survivors, p, now)
+	if len(r2.Forget) != 0 {
+		t.Fatalf("SEED %d iter %d: second pass forgot %v", seed, i, r2.Forget)
 	}
 }
 

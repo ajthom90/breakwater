@@ -45,13 +45,24 @@ type ScrubResult struct {
 	Errors            []string
 }
 
-// Scrub runs verification for one machine under an exclusive lease (same as
-// prune — must not race prune; exclusive also serializes with backup writers
-// so walks see a stable repo).
+// Scrub runs verification for one machine under a **shared** lease.
 //
-// Why exclusive (not shared): scrub's GetContent path would race a concurrent
-// prune's DeleteContent; PLAN groups verify with prune under exclusive.
-// Restore holds shared; scrub must not interleave with prune.
+// Why shared (not exclusive) — M5-F2:
+//
+//	Scrub is vault-read-only (GetContent / VerifyObject / OpenObject). Catalog
+//	verify_state is the only write, and it does not touch the vault. Content is
+//	immutable and content-addressed, so two shared holders (backup writer + scrub
+//	reader) cannot conflict.
+//
+//	Prune exclusion comes free from the shared/exclusive discipline: prune takes
+//	exclusive, and exclusive cannot be acquired while any shared holder exists.
+//	A concurrent scrub therefore blocks prune without needing exclusive itself.
+//
+//	Holding exclusive for scrub would be actively harmful under S2-F3 writer
+//	preference: an exclusive waiter blocks *new* shared acquisitions, so a
+//	queued full monthly scrub would stall that machine's entire backup window.
+//	Keep exclusive for prune and any future repair-style verify that mutates
+//	the vault.
 //
 // Corruption detection records which snapshots are affected (not only that a
 // chunk is bad) via content→snapshot ownership from VerifyObject walks.
@@ -73,9 +84,10 @@ func (s *Service) Scrub(ctx context.Context, machineID, mode string, slices int)
 	if locks == nil {
 		locks = scheduler.NewRepoLocks()
 	}
-	lease, err := locks.Acquire(ctx, machineID, scheduler.Exclusive, "scrub-"+machineID)
+	// Shared: vault-read-only; prune exclusion is structural (see package comment).
+	lease, err := locks.Acquire(ctx, machineID, scheduler.Shared, "scrub-"+machineID)
 	if err != nil {
-		return nil, fmt.Errorf("exclusive lease: %w", err)
+		return nil, fmt.Errorf("shared lease: %w", err)
 	}
 	defer lease.Release()
 

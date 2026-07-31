@@ -953,11 +953,11 @@ much) over uncertain deletion.
 | Soft-deleted in-grace survives prune | ✅ | `TestM5_GraceWindowSurvivesPrune` (red-first safety) |
 | Injected `Clock`; production = `clock.System()` only | ✅ | `TestProductionUsesSystemClock`; no env override |
 | Scheduler: cron parse + windows + catch-up + retry | ✅ | `scheduler/schedule.go` + `cronloop.go`; window does not kill |
-| Scrub: exclusive lease, 1/Nth slice, affected snapshots | ✅ | `retention.Scrub`; verify_state on catalog + REST |
-| Property tests (seed printed on failure) | ✅ | `TestProperty_*`; `-count=5 -race` green |
+| Scrub: **shared** lease, 1/Nth slice, affected snapshots | ✅ | `retention.Scrub` (M5-F2); verify_state on catalog + REST |
+| Property tests (seed printed + pinned regression seeds) | ✅ | `TestProperty_*`; `-count=5 -race` green |
 | 90-day time-warp harness | ✅ | `TestM5_TimeWarp90Days` — fires=91 final_keep=21 in ~10ms |
 | SMTP notify + watchdog + digest (fake sender in tests) | ✅ | `server/internal/notify`; wneessen/go-mail |
-| REST :8443 forget/undelete/prune/retention/scrub | ✅ | `web/api.go` |
+| REST :8443 forget/undelete/prune/retention/scrub | ✅ | `web/api.go`; **opt-in** `--enable-destructive-api` (M5-F1) |
 | robfig/cron + go-mail in THIRD_PARTY_NOTICES | ✅ | MIT, pre-approved |
 
 ### Decisions (explicit)
@@ -979,15 +979,29 @@ much) over uncertain deletion.
 
 3. **Property-test seed policy:** every randomized test logs `seed=<int64>` via
    `t.Logf` at start. On failure the seed is in the FAIL line message
-   (`SEED %d …`). Re-run by hardcoding that seed in the test source. No flaky
-   unreproducible failures (M2 lesson).
+   (`SEED %d …`). Re-run by hardcoding that seed in the test source. Additionally
+   a fixed set of **pinned regression seeds** (`propertyRegressionSeeds`) runs
+   every CI pass alongside a fresh random seed (M5 nit).
 
-4. **Scrub lease = exclusive** (same as prune/verify): must not race
-   `DeleteContent`. Restore keeps shared.
+4. **Scrub lease = shared** (M5-F2; was exclusive in `cfb0a82`):
+   Scrub is vault-read-only (verify_state writes go to the catalog only). Content
+   is immutable/content-addressed, so backup (shared) + scrub (shared) cannot
+   conflict. Prune exclusion is free: exclusive cannot be acquired while any
+   shared holder exists. Exclusive for scrub would starve backups under S2-F3
+   writer preference during monthly full read-back. Keep exclusive for prune
+   and any future vault-mutating repair verify.
 
 5. **Window close does not kill** in-flight jobs — windows gate dispatch start
    only. Missed-window catch-up fires **once** on recovery (`ShouldDispatch`
    with last success), not every missed cron tick.
+
+6. **Destructive REST opt-in (M5-F1) — known pre-auth limitation:**
+   Forget / undelete / prune / retention-apply / scrub on `:8443` require
+   `--enable-destructive-api` (default **off**). The single static dev API token
+   alone must not grant destroy until M6 sessions/admin exist. Audit still
+   records actor/actorType when enabled so M6 can drop real identities without
+   changing call sites. Job submit + rescan (M4) remain token-gated only —
+   they do not forget/prune vault data.
 
 ### Red-first safety properties
 
@@ -1024,6 +1038,14 @@ cd ../../server && BW_GATE_BYTES=268435456 go test ./internal/vault/ -run TestEn
 docker build -f ../packaging/docker/Dockerfile -t breakwater:m5test ..        # PASS
 ```
 
+### Fix round M5-F1 / M5-F2 (post-`cfb0a82` review `REVIEW-M5.md`)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| M5-F2 | ✅ Fixed | Scrub acquires **shared**; rationale rewritten; `TestM5F2_*` (backup not blocked; prune blocked while scrub runs) |
+| M5-F1 | ✅ Fixed | `--enable-destructive-api` default off; `TestM5F1_DestructiveAPIDisabledByDefault` |
+| Nit | ✅ Fixed | `propertyRegressionSeeds` pinned + random |
+
 ### Carried forward / not in M5
 
 | Item | Note |
@@ -1031,6 +1053,7 @@ docker build -f ../packaging/docker/Dockerfile -t breakwater:m5test ..        # 
 | SMTP live integration against real mail server | Fake sender in unit tests; production wires `SMTPSender` when settings configured |
 | Web UI retention editor / undelete button | REST ready; Settings screen still stub |
 | Assign Long Retention policy variant at enrollment | Standard Server seeded; second policy can be added later |
+| M6 sessions replace destructive-api flag + dev token | M5-F1 gate is explicit pre-auth limitation |
 | M3 VSS | Still Windows-VM blocked |
 
 **Decision:** tree-walk depth bound raised 256→4096 (runaway guard, not data-shape limit). See REVIEW-M4 disposition.

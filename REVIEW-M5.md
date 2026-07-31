@@ -61,3 +61,13 @@ go test ./internal/scheduler/ -count=1 -race -v
 go test ./internal/web/ -count=1 -race -v      # destructive-endpoint gating tests
 BW_GATE_BYTES=268435456 go test ./internal/vault/ -count=1 -run TestEngineGate_Kopia -v
 ```
+
+---
+
+## Disposition (fix round, append-only)
+
+| ID | Status | Notes |
+|----|--------|-------|
+| M5-F2 | ✅ Fixed | Scrub uses `scheduler.Shared`; package comment documents why shared suffices (prune exclusion structural; exclusive would starve backups under S2-F3 writer preference). Tests: `TestM5F2_ScrubSharedDoesNotBlockBackup`, `TestM5F2_PruneBlockedWhileScrubRunning`, `TestM5F2_ScrubCompatibleWithConcurrentShared`. |
+| M5-F1 | ✅ Fixed | `--enable-destructive-api` defaults **off**; forget/undelete/prune/retention/scrub return 403 when disabled; reads still work. Decision recorded in PROGRESS as known pre-auth limitation until M6. Audit actor plumbing unchanged. Tests: `TestM5F1_DestructiveAPIDisabledByDefault`, `TestM5F1_DestructiveAPIEnabledPassesGate`. |
+| Nit | ✅ Fixed | `propertyRegressionSeeds` run every pass; fresh `time.Now().UnixNano()` seed still logged for new coverage. |

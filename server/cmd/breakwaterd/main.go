@@ -36,7 +36,11 @@ func main() {
 		agentAddr = flag.String("agent-addr", ":9443", "agent gRPC listen address (mTLS)")
 		webAddr   = flag.String("web-addr", ":8443", "web/REST listen address (HTTPS)")
 		hostname  = flag.String("hostname", "breakwater", "server certificate CN / hostname")
-		showVer   = flag.Bool("version", false, "print version and exit")
+		// M5-F1: destructive retention REST is off until M6 sessions. Opt in
+		// only for trusted admin tooling; the read token alone must not destroy.
+		enableDestructiveAPI = flag.Bool("enable-destructive-api", false,
+			"enable forget/prune/retention/scrub REST on :8443 (default off until M6 auth)")
+		showVer = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
 	if *showVer {
@@ -150,18 +154,22 @@ func main() {
 
 	// HTTPS :8443 — REST + SSE + embedded UI (M2-S5). Auth: dev API token.
 	// M4: mutating job submit + catalog rescan (audited).
-	// M5: retention forget/undelete/prune/scrub (server-side only).
+	// M5: retention forget/undelete/prune/scrub (server-side only; opt-in M5-F1).
+	if *enableDestructiveAPI {
+		log.Warn("destructive retention API enabled on :8443 (pre-M6; protect the API token)")
+	}
 	webHandler := web.NewHandler(web.Config{
-		DB:        db,
-		Auditor:   auditor,
-		Events:    eventHub,
-		Engine:    jobEngine,
-		Vaults:    vm,
-		Keystore:  ks,
-		Retention: retentionSvc,
-		APIToken:  apiToken,
-		Version:   version,
-		Log:       log,
+		DB:                   db,
+		Auditor:              auditor,
+		Events:               eventHub,
+		Engine:               jobEngine,
+		Vaults:               vm,
+		Keystore:             ks,
+		Retention:            retentionSvc,
+		EnableDestructiveAPI: *enableDestructiveAPI,
+		APIToken:             apiToken,
+		Version:              version,
+		Log:                  log,
 	})
 
 	webSrv := &http.Server{
