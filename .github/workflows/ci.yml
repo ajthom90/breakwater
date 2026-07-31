@@ -56,6 +56,14 @@ jobs:
           npx tsc --noEmit -p tsconfig.app.json
           npm run build
 
+      # REVIEW-M2-S5: committed embed bundle must match a fresh build.
+      - name: Committed UI bundle is fresh
+        run: |
+          git diff --exit-code -- server/internal/web/dist || {
+            echo "server/internal/web/dist is stale vs web build — run 'make web' and commit"
+            exit 1
+          }
+
       - name: Build breakwaterd
         working-directory: server
         run: |

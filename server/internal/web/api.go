@@ -1,21 +1,37 @@
 package web
 
 import (
+	"encoding/json"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/ajthom90/breakwater/server/internal/audit"
 	"github.com/ajthom90/breakwater/server/internal/catalog"
+	"github.com/ajthom90/breakwater/server/internal/keystore"
+	"github.com/ajthom90/breakwater/server/internal/rescan"
 	"github.com/ajthom90/breakwater/server/internal/scheduler"
+	"github.com/ajthom90/breakwater/server/internal/vault"
 )
 
-// API is the read-only REST surface for the embedded UI and future bwctl.
+// API is the REST surface for the embedded UI and bwctl.
+//
+// M2 was GET-only. M4 adds audited mutating endpoints:
+//
+//	POST /api/v1/jobs   — submit agent jobs (file backup, restore, …)
+//	POST /api/v1/rescan — rebuild snapshot index from vault manifests
+//
+// Auth remains the single dev API token (M6 replaces with sessions).
 type API struct {
-	DB      *catalog.DB
-	Auditor *audit.Writer
-	Events  *scheduler.EventHub
-	Version string
+	DB       *catalog.DB
+	Auditor  *audit.Writer
+	Events   *scheduler.EventHub
+	Engine   *scheduler.Engine
+	Vaults   *vault.Manager
+	Keystore *keystore.Store
+	Version  string
+	Log      *slog.Logger
 }
 
 // Register mounts /api/v1/* handlers on mux behind auth middleware.
@@ -25,9 +41,11 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/machines", a.handleListMachines)
 	mux.HandleFunc("GET /api/v1/machines/{id}", a.handleGetMachine)
 	mux.HandleFunc("GET /api/v1/jobs", a.handleListJobs)
+	mux.HandleFunc("POST /api/v1/jobs", a.handleSubmitJob)
 	mux.HandleFunc("GET /api/v1/snapshots", a.handleListSnapshots)
 	mux.HandleFunc("GET /api/v1/audit", a.handleListAudit)
 	mux.HandleFunc("GET /api/v1/events", a.handleSSE)
+	mux.HandleFunc("POST /api/v1/rescan", a.handleRescan)
 }
 
 // Mount registers API routes under auth on the given mux.
@@ -193,6 +211,106 @@ func (a *API) handleListJobs(w http.ResponseWriter, r *http.Request) {
 		out = append(out, toJobDTO(j))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jobs": out})
+}
+
+// submitJobRequest is POST /api/v1/jobs body.
+// type: file|restore|inventory|noop|… (catalog job type strings)
+// For restore: params must include source_snapshot_id, target_path, conflict_policy;
+// optional source_machine_id for cross-machine (target is machine_id).
+type submitJobRequest struct {
+	MachineID string          `json:"machine_id"`
+	Type      string          `json:"type"`
+	Params    json.RawMessage `json:"params"`
+	Initiator string          `json:"initiator"`
+}
+
+func (a *API) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
+	if a.Engine == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "job engine not configured")
+		return
+	}
+	var req submitJobRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if req.MachineID == "" || req.Type == "" {
+		writeJSONError(w, http.StatusBadRequest, "machine_id and type required")
+		return
+	}
+	// Map wire-friendly names to catalog types.
+	jobType := req.Type
+	switch req.Type {
+	case "file", "file_backup", "JOB_TYPE_FILE_BACKUP":
+		jobType = scheduler.TypeFileBackup
+	case "restore", "JOB_TYPE_RESTORE":
+		jobType = scheduler.TypeRestore
+	case "inventory":
+		jobType = scheduler.TypeInventory
+	case "noop":
+		jobType = scheduler.TypeNoop
+	}
+	params := "{}"
+	if len(req.Params) > 0 {
+		params = string(req.Params)
+	}
+	initiator := req.Initiator
+	if initiator == "" {
+		initiator = "api"
+	}
+	jobID, err := a.Engine.Submit(r.Context(), scheduler.SubmitRequest{
+		MachineID:  req.MachineID,
+		Type:       jobType,
+		ParamsJSON: params,
+		Initiator:  initiator,
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if a.Auditor != nil {
+		_ = a.Auditor.Append(r.Context(), audit.Event{
+			Actor: initiator, ActorType: audit.ActorUser,
+			Action: audit.ActionJobRunManual, Target: jobID,
+			Detail: map[string]any{
+				"machine_id": req.MachineID,
+				"type":       jobType,
+			},
+		})
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"job_id": jobID, "type": jobType})
+}
+
+func (a *API) handleRescan(w http.ResponseWriter, r *http.Request) {
+	if a.Vaults == nil || a.Keystore == nil || a.DB == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "rescan not configured")
+		return
+	}
+	res, err := rescan.Run(r.Context(), rescan.Options{
+		DB: a.DB, Keystore: a.Keystore, Vaults: a.Vaults, Log: a.Log,
+	})
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if a.Auditor != nil {
+		_ = a.Auditor.Append(r.Context(), audit.Event{
+			Actor: "api", ActorType: audit.ActorUser,
+			Action: audit.ActionCatalogRescan, Target: "snapshots",
+			Detail: map[string]any{
+				"machines_scanned": res.MachinesScanned,
+				"snapshots_found":  res.SnapshotsFound,
+				"snapshots_added":  res.SnapshotsAdded,
+				"errors":           len(res.Errors),
+			},
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"machines_scanned": res.MachinesScanned,
+		"snapshots_found":  res.SnapshotsFound,
+		"snapshots_added":  res.SnapshotsAdded,
+		"errors":           res.Errors,
+	})
 }
 
 func (a *API) handleListSnapshots(w http.ResponseWriter, r *http.Request) {

@@ -4,9 +4,17 @@ Single tracking file for milestone status, decisions, and deviations from [PLAN.
 
 ## Current milestone
 
+**Phase 1 — M4 (restore path; PLAN wk7–8, pulled forward)** — ✅ **COMPLETE** on portable Linux/darwin evidence (2026-07-30)
+
+**Phase 1 — M3 (VSS; PLAN wk5–6)** — ⏸️ **BLOCKED** on Windows VM availability (not available yet). M4 does not depend on VSS: it restores plain-directory backups M2 already produces.
+
 **Phase 1 — M2 (weeks 3–4)** — ✅ **COMPLETE** on Linux/darwin evidence (stage 5 + S5-F1/F2; Windows demo subset still gated — see [M2 closeout](#m2-closeout))
 
 **Phase 1 — M1 (weeks 1–2)** — ✅ **COMPLETE** (2026-07-30; closed at `161fb18`)
+
+### Milestone reorder (M3 ↔ M4)
+
+M2 closed green at `4a0bf14`. M3 (VSS) is almost entirely Windows-runtime work and is blocked until a Windows VM is available. **M4 was pulled forward** so the product can restore through its own API on Linux/darwin now — the single biggest gap for a backup product, and almost all of it is portable. Recorded here so PLAN week numbers stay as written while execution order is honest.
 
 Addressed [REVIEW-M1.md](REVIEW-M1.md), [REVIEW-M1-ROUND2.md](REVIEW-M1-ROUND2.md), and [REVIEW-M1-ROUND3.md](REVIEW-M1-ROUND3.md) against `f92837f` → `755f417` → `eea1a46` → this fix set. Round-3 closed remaining fail-open mark heuristic, canceled-ctx compensation, empty-algorithm upgrade hole, and related mediums.
 
@@ -814,13 +822,109 @@ The untested-on-Windows list (stage 4) remains the gating checklist for that cla
 
 ### Next after M2
 
-- **M3 (PLAN wk5-6): VSS wired in** — full C: from shadow device, exclusion
-  defaults, guaranteed snapshot cleanup on every exit path, `vsscheck.exe`
-  diagnostics. Note this milestone is almost entirely Windows-runtime work, so it
-  is gated on a Windows VM being available — CI alone cannot validate it.
-- Windows **VM** validation of the remaining untested-runtime items (8 open;
-  see "Windows CI vs still-unproven runtime")
+- ~~**M4 restore path**~~ — **done** (pulled forward; see [M4](#m4--restore-path-portable-subset) below)
+- **M3 (PLAN wk5-6): VSS wired in** — still blocked on Windows VM
+- Windows **VM** validation of remaining untested-runtime items
 - M6: real web auth replacing the dev token middleware
+
+---
+
+## M4 — restore path (portable subset)
+
+**Closed 2026-07-30** on Linux/darwin. PLAN wk7–8 content delivered ahead of M3
+because M3 is Windows-VM-gated and M4 does not need VSS.
+
+### Deliverables
+
+| Item | Status | Evidence |
+|------|--------|----------|
+| `RestoreService` on :9443 (ListSnapshots/GetSnapshot/GetObject/GetContentRange) | ✅ | `server/internal/agentgw/restore.go`; registered in gateway + `breakwaterd` |
+| Authz: own-repo only by default | ✅ | cert → machine; cross-repo denied without job |
+| Authz: cross-machine only via restore job + reachable set | ✅ | `TestM4_RedFirst_*` + `TestM4_CrossMachineRestore` |
+| Shared lease on SOURCE repo for restore streams/jobs | ✅ | engine `SourceRepoFromParams`; `TestM4_RestoreLeaseBlocksPrune` |
+| Per-stream lease revalidation (S3-F2 analog) | ✅ | `revalidateLease` before each chunk send |
+| Audit `restore.browse` / `restore.file` (not per-chunk range) | ✅ | audit taxonomy + package docs |
+| `pkg/restore` engine (walk, conflict, skips, symlinks) | ✅ | unit tests + E2E |
+| Agent `JOB_TYPE_RESTORE` | ✅ | `agent/internal/control`; terminal JobResult always |
+| Conflict policy overwrite/rename/skip | ✅ | `pkg/restore` + `TestM4_ConflictRenameAgent` |
+| Alternate path + cross-machine restore | ✅ | round-trip + cross tests |
+| `bwctl restore` / `bwctl rescan` (REST + API token) | ✅ | `cli/cmd/bwctl`; POST `/api/v1/jobs`, `/api/v1/rescan` |
+| Server-loss drill (wipe snapshot index → rescan → restore) | ✅ | `TestM4_ServerLossDrill` |
+| Golden round-trip via RestoreService | ✅ | `TestM4_RestoreRoundTrip` matched=13 |
+| CI committed UI bundle guard | ✅ | `git diff --exit-code server/internal/web/dist` after npm build |
+| `golden.Compare` nil-on-error contract | ✅ | returns partial result + error (no nil panic) |
+| Windows ACL/ADS restore via BackupWrite | ⚠️ stub only | **untested-on-Windows** — do not claim |
+
+### Security (red-first)
+
+Two properties written before implementation; captured against a deliberately
+permissive stub (any enrolled peer could open any vault object):
+
+```
+=== RUN   TestM4_RedFirst_CrossMachineWithoutJobDenied
+    B GetSnapshot of A's snap succeeded without restore job (authz hole)
+--- FAIL
+=== RUN   TestM4_RedFirst_JobDoesNotAuthorizeOutsideReachableSet
+    B GetObject of out-of-snapshot object succeeded under job for snap X
+--- FAIL
+```
+
+After structural authz (own-repo default; restore job + precomputed reachable
+object/content set for cross; no foreign vault open without job):
+
+```
+TestM4_RedFirst_CrossMachineWithoutJobDenied     PASS
+TestM4_RedFirst_JobDoesNotAuthorizeOutsideReachableSet  PASS
+  (out-of-reach → PermissionDenied)
+```
+
+### Authz design (summary)
+
+- **Default:** Peer machine may list/get/stream only its own repo.
+- **Cross-machine:** running/cancelling `JOB_TYPE_RESTORE` on the **target**
+  machine with params `(source_snapshot_id, source_machine_id, …)`; Shared lease
+  on the **source** repo; GetObject/GetContentRange only for IDs in the
+  snapshot's reachable set (tree walk + `ObjectDataContentIDs` for file contents —
+  not unordered `VerifyObject`).
+- **No mutating RPC on :9443.** Restore is read-only.
+- **Audit:** one `restore.browse` / `restore.file` per operation; GetContentRange
+  is not audited per byte range.
+
+### Untested-on-Windows (new for M4)
+
+1. **ACL restore via BackupWrite / SeRestorePrivilege** — portable path records
+   `acl_restore_untested_on_windows` skip when SD present; platform hook stubbed.
+2. **ADS restore via BackupWrite** — same; `ads_restore_untested_on_windows` skip.
+3. **Reparse points / junctions** — portable skip with record; Windows restore of
+   reparse entries not claimed.
+4. All prior stage-4 runtime items remain open (MSI install, SCM, etc.).
+
+### Verification (M4 closeout)
+
+```
+gofmt -l server pkg agent cli restore tools   # empty
+cd server && go vet ./... && go test ./... -count=1 -short -race -timeout 10m  # PASS
+cd pkg && go test ./... -count=1 -race                                        # PASS (incl. restore)
+cd agent && go test ./... -count=1 -race                                      # PASS
+cd cli && go test ./... -count=1 -race                                        # PASS
+cd tools/golden && go test ./... -count=1 -race                               # PASS
+cd server && go test ./internal/agentgw/ -count=1 -race -run 'TestM4|Restore' -v  # PASS
+BW_GATE_BYTES=268435456 go test ./internal/vault/ -run TestEngineGate_Kopia -v  # PASS
+docker build -f packaging/docker/Dockerfile -t breakwater:m4test .              # PASS
+```
+
+Demo numbers (`TestM4_RestoreRoundTrip`):
+```
+golden created=12 portable fixtures; restore matched=13; files=11 bytes≈80MiB
+cross-machine A→B bytes identical; prune blocked while restore shared lease held
+server-loss: DeleteAllSnapshots → rescan added=1 → restore drill.txt OK
+```
+
+### bwctl transport note
+
+`bwctl restore` / `bwctl rescan` use **REST on :8443** with the dev API token
+(`Authorization: Bearer` / `X-API-Token`). Agent mTLS :9443 remains agent-only.
+Documented in `cli/cmd/bwctl/main.go`.
 
 ---
 

@@ -32,6 +32,7 @@ import (
 	"github.com/ajthom90/breakwater/pkg/backup"
 	"github.com/ajthom90/breakwater/pkg/contentid"
 	breakwaterv1 "github.com/ajthom90/breakwater/pkg/proto/breakwater/v1"
+	"github.com/ajthom90/breakwater/pkg/restore"
 )
 
 // ClientParameters match the stage-2 channel contract.
@@ -227,8 +228,9 @@ func (a *Agent) session(ctx context.Context) error {
 		"server_version", msg.GetHelloAck().GetServerVersion(),
 	)
 
-	// DataService client shares the same mTLS conn.
+	// DataService + RestoreService share the same mTLS conn.
 	dataCl := breakwaterv1.NewDataServiceClient(conn)
+	restoreCl := breakwaterv1.NewRestoreServiceClient(conn)
 	hasher, err := a.hasher()
 	if err != nil {
 		return err
@@ -273,7 +275,7 @@ func (a *Agent) session(ctx context.Context) error {
 				readErr <- err
 				return
 			}
-			a.handleServer(sessCtx, stream, dataCl, hasher, m)
+			a.handleServer(sessCtx, stream, dataCl, restoreCl, hasher, m)
 		}
 	}()
 
@@ -335,6 +337,7 @@ func (a *Agent) handleServer(
 	ctx context.Context,
 	stream breakwaterv1.ControlService_ChannelClient,
 	dataCl breakwaterv1.DataServiceClient,
+	restoreCl breakwaterv1.RestoreServiceClient,
 	hasher *contentid.Hasher,
 	msg *breakwaterv1.ServerToAgent,
 ) {
@@ -350,7 +353,7 @@ func (a *Agent) handleServer(
 	case *breakwaterv1.ServerToAgent_JobCancel:
 		a.cancelJob(m.JobCancel.GetJobId(), m.JobCancel.GetReason())
 	case *breakwaterv1.ServerToAgent_JobStart:
-		a.startJob(ctx, stream, dataCl, hasher, m.JobStart)
+		a.startJob(ctx, stream, dataCl, restoreCl, hasher, m.JobStart)
 	}
 }
 
@@ -377,6 +380,7 @@ func (a *Agent) startJob(
 	ctx context.Context,
 	stream breakwaterv1.ControlService_ChannelClient,
 	dataCl breakwaterv1.DataServiceClient,
+	restoreCl breakwaterv1.RestoreServiceClient,
 	hasher *contentid.Hasher,
 	js *breakwaterv1.JobStart,
 ) {
@@ -422,7 +426,7 @@ func (a *Agent) startJob(
 			a.mu.Unlock()
 			cancel()
 		}()
-		res := a.runJob(jobCtx, stream, dataCl, hasher, js)
+		res := a.runJob(jobCtx, stream, dataCl, restoreCl, hasher, js)
 		// Always send a terminal JobResult (cancel confirmation contract).
 		if err := a.send(stream, &breakwaterv1.AgentToServer{
 			Msg: &breakwaterv1.AgentToServer_JobResult{JobResult: res},
@@ -442,6 +446,7 @@ func (a *Agent) runJob(
 	ctx context.Context,
 	stream breakwaterv1.ControlService_ChannelClient,
 	dataCl breakwaterv1.DataServiceClient,
+	restoreCl breakwaterv1.RestoreServiceClient,
 	hasher *contentid.Hasher,
 	js *breakwaterv1.JobStart,
 ) *breakwaterv1.JobResult {
@@ -474,6 +479,9 @@ func (a *Agent) runJob(
 
 	case breakwaterv1.JobType_JOB_TYPE_FILE_BACKUP:
 		return a.runFileBackup(ctx, stream, dataCl, hasher, js)
+
+	case breakwaterv1.JobType_JOB_TYPE_RESTORE:
+		return a.runRestore(ctx, stream, restoreCl, js)
 
 	default:
 		res.Success = false
@@ -529,5 +537,116 @@ func (a *Agent) runFileBackup(
 	res.BytesRead = stats.BytesRead
 	res.BytesStored = stats.BytesUploaded
 	res.SnapshotId = stats.SnapshotID
+	return res
+}
+
+// restoreParams is the JOB_TYPE_RESTORE params_json contract.
+//
+//	source_snapshot_id  — catalog (or manifest) snapshot id
+//	source_machine_id   — optional; defaults to this machine (own-repo restore)
+//	target_path         — directory to restore into
+//	conflict_policy     — overwrite | rename | skip
+//	root_object_id      — optional; if empty, fetched via GetSnapshot
+type restoreParams struct {
+	SourceSnapshotID string `json:"source_snapshot_id"`
+	SourceMachineID  string `json:"source_machine_id"`
+	TargetPath       string `json:"target_path"`
+	ConflictPolicy   string `json:"conflict_policy"`
+	RootObjectID     string `json:"root_object_id"`
+}
+
+func (a *Agent) runRestore(
+	ctx context.Context,
+	stream breakwaterv1.ControlService_ChannelClient,
+	restoreCl breakwaterv1.RestoreServiceClient,
+	js *breakwaterv1.JobStart,
+) *breakwaterv1.JobResult {
+	jobID := js.GetJobId()
+	res := &breakwaterv1.JobResult{JobId: jobID}
+	if restoreCl == nil {
+		res.Success = false
+		res.ErrorMessage = "RestoreService client not available"
+		return res
+	}
+
+	var params restoreParams
+	if err := json.Unmarshal(js.GetParamsJson(), &params); err != nil {
+		res.Success = false
+		res.ErrorMessage = "RESTORE requires valid params_json"
+		return res
+	}
+	if params.TargetPath == "" {
+		res.Success = false
+		res.ErrorMessage = "RESTORE requires params_json.target_path"
+		return res
+	}
+	if params.SourceSnapshotID == "" && params.RootObjectID == "" {
+		res.Success = false
+		res.ErrorMessage = "RESTORE requires source_snapshot_id or root_object_id"
+		return res
+	}
+	policy := restore.ConflictPolicy(params.ConflictPolicy)
+	if policy == "" {
+		policy = restore.ConflictOverwrite
+	}
+	if !restore.ValidConflict(policy) {
+		res.Success = false
+		res.ErrorMessage = fmt.Sprintf("invalid conflict_policy %q", params.ConflictPolicy)
+		return res
+	}
+
+	rootOID := params.RootObjectID
+	if rootOID == "" {
+		snap, err := restoreCl.GetSnapshot(ctx, &breakwaterv1.GetSnapshotRequest{
+			SnapshotId: params.SourceSnapshotID,
+		})
+		if err != nil {
+			res.Success = false
+			if ctx.Err() != nil {
+				res.ErrorMessage = "cancelled"
+			} else {
+				res.ErrorMessage = fmt.Sprintf("GetSnapshot: %v", err)
+			}
+			return res
+		}
+		rootOID = snap.GetRootObjectId()
+	}
+	if rootOID == "" {
+		res.Success = false
+		res.ErrorMessage = "snapshot has empty root_object_id"
+		return res
+	}
+
+	stats, err := restore.Run(ctx, restore.Options{
+		RootObjectID: rootOID,
+		TargetRoot:   params.TargetPath,
+		Conflict:     policy,
+		Reader:       &restore.GRPCReader{Client: restoreCl},
+		Progress: func(done int64, phase, msg string) {
+			_ = a.send(stream, &breakwaterv1.AgentToServer{
+				Msg: &breakwaterv1.AgentToServer_JobProgress{
+					JobProgress: &breakwaterv1.JobProgress{
+						JobId: jobID, BytesDone: done, Phase: phase, Message: msg,
+					},
+				},
+			})
+		},
+	})
+	if err != nil {
+		res.Success = false
+		if ctx.Err() != nil {
+			res.ErrorMessage = "cancelled"
+		} else {
+			res.ErrorMessage = err.Error()
+		}
+		return res
+	}
+	// Visible skips never make the job fail by themselves — but we surface count.
+	if len(stats.Skipped) > 0 {
+		a.log.Info("restore completed with skips", "job_id", jobID, "skips", len(stats.Skipped))
+	}
+	res.Success = true
+	res.BytesRead = stats.Bytes
+	res.SnapshotId = params.SourceSnapshotID
 	return res
 }

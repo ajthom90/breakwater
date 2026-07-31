@@ -54,6 +54,10 @@ type Gateway struct {
 	// When nil, TestDataService may still be registered for pin tests.
 	DataService breakwaterv1.DataServiceServer
 
+	// RestoreService is the production read-only restore plane (M4).
+	// When nil, RestoreService is not registered.
+	RestoreService breakwaterv1.RestoreServiceServer
+
 	// TestDataService, when non-nil and DataService is nil, registers DataService
 	// for post-enroll pin tests only. Production main never sets this.
 	TestDataService breakwaterv1.DataServiceServer
@@ -147,6 +151,9 @@ func (g *Gateway) Start(addr string) (string, error) {
 		breakwaterv1.RegisterDataServiceServer(g.gs, g.DataService)
 	case g.TestDataService != nil:
 		breakwaterv1.RegisterDataServiceServer(g.gs, g.TestDataService)
+	}
+	if g.RestoreService != nil {
+		breakwaterv1.RegisterRestoreServiceServer(g.gs, g.RestoreService)
 	}
 
 	lis, err := net.Listen("tcp", addr)

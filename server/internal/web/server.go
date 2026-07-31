@@ -9,14 +9,19 @@ import (
 
 	"github.com/ajthom90/breakwater/server/internal/audit"
 	"github.com/ajthom90/breakwater/server/internal/catalog"
+	"github.com/ajthom90/breakwater/server/internal/keystore"
 	"github.com/ajthom90/breakwater/server/internal/scheduler"
+	"github.com/ajthom90/breakwater/server/internal/vault"
 )
 
 // Config wires the HTTPS :8443 handler tree.
 type Config struct {
-	DB      *catalog.DB
-	Auditor *audit.Writer
-	Events  *scheduler.EventHub
+	DB       *catalog.DB
+	Auditor  *audit.Writer
+	Events   *scheduler.EventHub
+	Engine   *scheduler.Engine
+	Vaults   *vault.Manager
+	Keystore *keystore.Store
 	// APIToken is the dev local token (from LoadOrCreateAPIToken).
 	APIToken string
 	Version  string
@@ -50,10 +55,14 @@ func NewHandler(cfg Config) http.Handler {
 	})
 
 	api := &API{
-		DB:      cfg.DB,
-		Auditor: cfg.Auditor,
-		Events:  cfg.Events,
-		Version: cfg.Version,
+		DB:       cfg.DB,
+		Auditor:  cfg.Auditor,
+		Events:   cfg.Events,
+		Engine:   cfg.Engine,
+		Vaults:   cfg.Vaults,
+		Keystore: cfg.Keystore,
+		Version:  cfg.Version,
+		Log:      cfg.Log,
 	}
 	api.Mount(mux, cfg.APIToken)
 

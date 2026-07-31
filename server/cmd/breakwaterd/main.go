@@ -124,6 +124,10 @@ func main() {
 	gw.DataService = &agentgw.DataServer{
 		Engine: jobEngine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
 	}
+	// M4: read-only RestoreService (own-repo + restore-job cross-machine).
+	gw.RestoreService = &agentgw.RestoreServer{
+		Engine: jobEngine, Catalog: db, Keystore: ks, Vaults: vm, Auditor: auditor, Log: log,
+	}
 	if _, err := gw.Start(*agentAddr); err != nil {
 		log.Error("agent gateway", "err", err)
 		os.Exit(1)
@@ -131,10 +135,14 @@ func main() {
 	defer gw.GracefulStop()
 
 	// HTTPS :8443 — REST + SSE + embedded UI (M2-S5). Auth: dev API token.
+	// M4: mutating job submit + catalog rescan (audited).
 	webHandler := web.NewHandler(web.Config{
 		DB:       db,
 		Auditor:  auditor,
 		Events:   eventHub,
+		Engine:   jobEngine,
+		Vaults:   vm,
+		Keystore: ks,
 		APIToken: apiToken,
 		Version:  version,
 		Log:      log,

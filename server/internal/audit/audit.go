@@ -29,16 +29,18 @@
 //
 //   - Audited: machine.enroll (success + reject), auth.fail (unknown cert pin denials
 //     on non-enroll methods), snapshot.commit (agent CommitSnapshot — first-class
-//     backup completion, not per-chunk noise).
+//     backup completion, not per-chunk noise), restore.browse / restore.file (M4
+//     RestoreService List/GetSnapshot and GetObject — one event per operation),
+//     job.run_manual (POST /api/v1/jobs), catalog.rescan (POST /api/v1/rescan).
 //   - NOT audited: agent heartbeats, control-channel traffic (Hello/JobProgress/…),
 //     automatic job state transitions, inventory reports, per-chunk PutContents /
-//     CheckContents (would drown the log).
+//     CheckContents, per-chunk GetContentRange (range reads are not first-class
+//     restore events — the parent restore job / GetObject is).
 //   - NOT audited (M2-S5 decision): read-only REST GETs on :8443
 //     (/api/v1/machines, /jobs, /snapshots, /audit, /summary, /events). Auditing
 //     every dashboard poll would drown the chain; list/read noise is not admin action.
-//   - MUST audit (when added): every mutating REST endpoint on :8443 (job submit/
+//   - MUST audit: every mutating REST endpoint on :8443 (job submit/
 //     cancel, policy change, enroll token mint, user/settings, forget/undelete/prune).
-//     job.run_manual and job.cancel begin when those become human-triggerable.
 //     The job engine already stores `initiator` in params_json so those events can
 //     name the actor without a schema change.
 //
@@ -75,6 +77,13 @@ const (
 	ActionMachineEnroll  = "machine.enroll"
 	ActionAuthFail       = "auth.fail"
 	ActionSnapshotCommit = "snapshot.commit" // M2-S3: agent CommitSnapshot (not per-chunk)
+	// Restores are first-class audit events (PLAN taxonomy). One event per
+	// browse/list or file GetObject — NOT per GetContentRange chunk.
+	ActionRestoreBrowse = "restore.browse"
+	ActionRestoreFile   = "restore.file"
+	// Mutating :8443 (M4): job submit + catalog rescan.
+	ActionJobRunManual  = "job.run_manual"
+	ActionCatalogRescan = "catalog.rescan"
 )
 
 // Event is an audit event to append.

@@ -177,7 +177,15 @@ func (e *Engine) tryDispatch(ctx context.Context, jobID string) error {
 		return nil // another dispatcher claimed it
 	}
 
+	// Vault lease target: for restore jobs the Shared lease is on the SOURCE
+	// repo (cross-machine restore reads A's vault while dispatched to B).
+	// All other vault types lease the job's machine repo (backup writes home).
 	repoID := j.MachineID
+	if j.Type == TypeRestore {
+		if src := SourceRepoFromParams(j.ParamsJSON); src != "" {
+			repoID = src
+		}
+	}
 	if mode, ok := LockModeForJobType(j.Type); ok {
 		// Non-blocking / short-timeout (M2-S3): if prune holds exclusive, revert
 		// to pending and do not stall DeliverPending for other jobs.
@@ -511,12 +519,14 @@ func (e *Engine) tryAcquireLease(ctx context.Context, repoID string, mode LockMo
 }
 
 // VaultForJob returns a vault handle only when this engine holds a lease for
-// jobID (structural lease discipline for DataService). The opener is provided
-// by the data plane (keystore password + Manager.Open); this method only
-// gates access on the lease table.
+// jobID (structural lease discipline for DataService / RestoreService). The
+// opener is provided by the data plane (keystore password + Manager.Open); this
+// method only gates access on the lease table.
 //
 // Manager.Open must not be called from the data plane for job RPCs without
 // going through this check first.
+//
+// For TypeRestore, repoID is the SOURCE machine's repo (see SourceRepoFromParams).
 func (e *Engine) VaultForJob(jobID string) (leaseOK bool, repoID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -525,6 +535,81 @@ func (e *Engine) VaultForJob(jobID string) (leaseOK bool, repoID string) {
 		return false, ""
 	}
 	return true, l.RepoID()
+}
+
+// ActiveRestoreJobs returns running/cancelling restore jobs for targetMachine
+// that currently hold a vault lease (M4 cross-machine restore authz).
+func (e *Engine) ActiveRestoreJobs(ctx context.Context, targetMachine string) ([]catalog.Job, error) {
+	if targetMachine == "" {
+		return nil, nil
+	}
+	// Running first, then cancelling (still authorized until terminal).
+	var out []catalog.Job
+	for _, state := range []string{catalog.JobStateRunning, catalog.JobStateCancelling} {
+		jobs, err := e.DB.ListJobs(ctx, catalog.JobListFilter{
+			MachineID: targetMachine,
+			State:     state,
+			Limit:     64,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, j := range jobs {
+			if j.Type != TypeRestore {
+				continue
+			}
+			if !e.HasLease(j.ID) {
+				continue
+			}
+			out = append(out, j)
+		}
+	}
+	return out, nil
+}
+
+// AcquireStreamLease obtains a shared lease for a restore browse stream that is
+// not bound to a job (own-repo GetObject/GetContentRange without a restore job).
+// Caller must Release exactly once when the stream ends. streamID is diagnostic.
+func (e *Engine) AcquireStreamLease(ctx context.Context, repoID, streamID string) (Lease, error) {
+	if e.Locks == nil {
+		return nil, fmt.Errorf("no repo locks")
+	}
+	return e.Locks.AcquireShared(ctx, repoID, "stream:"+streamID)
+}
+
+// SourceRepoFromParams extracts source_machine_id from restore job params_json.
+// Empty means "same as target" (caller should fall back to job.MachineID).
+func SourceRepoFromParams(paramsJSON string) string {
+	if paramsJSON == "" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(paramsJSON), &m); err != nil {
+		return ""
+	}
+	if v, ok := m["source_machine_id"].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// SnapshotIDFromParams extracts source_snapshot_id from restore job params.
+func SnapshotIDFromParams(paramsJSON string) string {
+	if paramsJSON == "" {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(paramsJSON), &m); err != nil {
+		return ""
+	}
+	if v, ok := m["source_snapshot_id"].(string); ok {
+		return v
+	}
+	// Also accept snapshot_id alias.
+	if v, ok := m["snapshot_id"].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // HasLease reports whether the engine currently holds a lease for jobID (tests).

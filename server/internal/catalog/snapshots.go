@@ -112,6 +112,15 @@ func (db *DB) SoftDeleteSnapshot(ctx context.Context, id string) error {
 	})
 }
 
+// DeleteAllSnapshots removes every snapshot row (server-loss drill: wipe the
+// rebuildable index before rescan). Does not touch vaults or machines/keystore.
+func (db *DB) DeleteAllSnapshots(ctx context.Context) error {
+	return db.WithTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM snapshots`)
+		return err
+	})
+}
+
 func scanSnapshot(row scannable) (*Snapshot, error) {
 	var s Snapshot
 	var deleted sql.NullString

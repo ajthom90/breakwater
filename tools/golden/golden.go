@@ -343,6 +343,10 @@ func Compare(original, restored string, opts CompareOptions) (*CompareResult, er
 	}
 
 	// Walk original; every path must exist in restored with equal content/type.
+	// Contract: on walk failure, return the partial CompareResult alongside the
+	// error so callers can inspect Diffs/SkippedChecks. Never return (nil, err)
+	// after out has been allocated — callers that log res.Equal() before checking
+	// err would nil-panic.
 	err := filepath.WalkDir(original, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -448,7 +452,7 @@ func Compare(original, restored string, opts CompareOptions) (*CompareResult, er
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return out, fmt.Errorf("original walk: %w", err)
 	}
 
 	// Extra files in restored (not in original) — report as diffs.
@@ -471,7 +475,7 @@ func Compare(original, restored string, opts CompareOptions) (*CompareResult, er
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("restored walk: %w", err)
+		return out, fmt.Errorf("restored walk: %w", err)
 	}
 
 	return out, nil
