@@ -1,0 +1,78 @@
+# Breakwater server — TrueNAS SCALE / bare-metal Docker deployment.
+#
+# Differs from docker-compose.yml (dev, named volumes) by using BIND MOUNTS to
+# ZFS datasets you control, per PLAN §Deployment:
+#
+#   /data   → recordsize=64K            (catalog + keys; small random I/O)
+#   /repos  → recordsize=1M, lz4, dedup=off  (bulk content; kopia already
+#                                             compresses + encrypts, so ZFS
+#                                             dedup would burn RAM for nothing)
+#
+# ---------------------------------------------------------------------------
+# BEFORE FIRST RUN — the container runs as distroless `nonroot` (uid/gid 65532),
+# so the bind-mounted directories must be writable by that uid:
+#
+#   sudo mkdir -p /mnt/tank/breakwater/data /mnt/tank/breakwater/repos
+#   sudo chown -R 65532:65532 /mnt/tank/breakwater
+#
+# Without this the server exits immediately on a permission error.
+# ---------------------------------------------------------------------------
+#
+# Run:
+#   docker compose -f packaging/docker/docker-compose.truenas.yml up -d --build
+#   docker compose -f packaging/docker/docker-compose.truenas.yml logs -f
+#
+# First boot prints the API token preview and the server fingerprint. Read the
+# full API token from the host:
+#   sudo cat /mnt/tank/breakwater/data/api-token
+#
+# NOTE: agents authenticate the server by CERTIFICATE FINGERPRINT (pinned inside
+# the enrollment token), not by hostname — so pointing agents at a bare IP is
+# fine and no DNS/SAN setup is required. Browsers hitting :8443 WILL warn about
+# the self-signed cert; that is expected until M11/M6 TLS work.
+#
+# The server identity is persisted at /data/keys/server.{crt,key}. Do NOT wipe
+# /data — the fingerprint would change and every enrolled agent would refuse to
+# connect (pin mismatch) and need re-enrollment.
+
+services:
+  breakwater:
+    image: breakwater:dev
+    build:
+      context: ../..
+      dockerfile: packaging/docker/Dockerfile
+    container_name: breakwater
+
+    # Change the host paths to your datasets. Container paths must stay /data
+    # and /repos unless you also change the -data/-repos flags below.
+    volumes:
+      - /mnt/tank/breakwater/data:/data
+      - /mnt/tank/breakwater/repos:/repos
+
+    ports:
+      - "9443:9443"   # agent mTLS (agents dial OUT to this — the only inbound port they need)
+      - "8443:8443"   # web UI + REST (HTTPS, self-signed)
+
+    command:
+      - "-data=/data"
+      - "-repos=/repos"
+      - "-agent-addr=:9443"
+      - "-web-addr=:8443"
+      # Cosmetic for agents (they pin by fingerprint); used as the cert CN.
+      - "-hostname=breakwater"
+      # Destructive REST (forget / prune / retention / scrub) is OFF by default.
+      # Leave it off until M6 adds real auth — today the only gate is the static
+      # dev API token, so enabling this makes a read-scoped token leak a
+      # destroy-scoped leak. Enable deliberately and temporarily if you need it:
+      # - "-enable-destructive-api"
+
+    restart: unless-stopped
+
+    # No HEALTHCHECK: the image is distroless (no shell, no curl/wget) so there
+    # is nothing in-container to probe with. Check from the host instead:
+    #   curl -sk https://<host>:8443/healthz
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
