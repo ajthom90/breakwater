@@ -88,7 +88,13 @@ services:
 
     # No HEALTHCHECK: distroless has no shell or curl to probe with.
     # From the TrueNAS host instead:
-    #   curl -sk https://127.0.0.1:48621/healthz
+    #   curl -sk https://127.0.0.1:48621/healthz     # → "ok"
+    #
+    # The web port requires TLS 1.3 (MinVersion in breakwaterd). TrueNAS/Debian
+    # curl is OpenSSL-based and works. macOS system curl is LibreSSL and will
+    # fail the handshake with "sslv3 alert handshake failure" — that is the
+    # client's limitation, not the server. Verified 2026-08-03: /healthz → 200
+    # "ok", /version → 200, via a TLS1.3-capable client.
     logging:
       driver: json-file
       options:

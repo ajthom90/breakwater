@@ -1278,3 +1278,16 @@ Trust Checklist #10 → ✅.
 ### CHAOS-F3 — ENOSPC drill CI flake (tmpfs cleanup EBUSY)
 
 Linux CI failed intermittently when Go's `t.TempDir()` `RemoveAll` hit a still-mounted tmpfs after `TestChaos04_ENOSPC`. Drill assertions were green; cleanup was not. Fixed by mounting outside `t.TempDir`, closing vault handles before umount, retrying umount, and failing the cleanup path loudly if unmount does not succeed. Process-kill always reaps the SIGKILL'd child.
+
+### Commit-record note (2026-08-03)
+
+`f219e9d` carries a **misleading message**: it says "packaging: publish image to
+GHCR…" but also contains the entire enrollment-token minting feature (REST
+`POST/GET /api/v1/enroll-tokens`, `bwctl token mint|list`, catalog helpers,
+audit `machine.token_create`, tests). Cause: the reviewer ran `git add -A` while
+the implementer was concurrently editing the same working tree, sweeping in
+in-flight work. Nothing is broken (CI green on that commit); history was not
+rewritten. Recorded here so future archaeology is not misled.
+
+**Process fix:** stage explicit paths, never `git add -A`, while a background
+implementer may be editing the tree.
