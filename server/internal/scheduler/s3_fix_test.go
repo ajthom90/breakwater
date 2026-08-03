@@ -202,25 +202,32 @@ func TestS3F10_CancelTimeoutReleasesLease(t *testing.T) {
 	if j.State != catalog.JobStateCancelling {
 		t.Fatalf("state=%s want cancelling", j.State)
 	}
-	// Wait for timeout force-fail.
-	deadline = time.Now().Add(2 * time.Second)
+	// Wait for the full S3-F10 post-timeout invariant — not merely "state=failed".
+	// failJob transitions the catalog row before releaseLease deletes the map
+	// entry, so a poll that exits on state alone races HasLease on loaded CI
+	// (nightly 30739892213). Poll until all three conditions hold.
+	deadline = time.Now().Add(3 * time.Second)
+	var (
+		state      string
+		hasLease   bool
+		shared, ex int
+	)
 	for time.Now().Before(deadline) {
 		j, _ = e.Job(ctx, id)
-		if j.State == catalog.JobStateFailed {
-			break
+		if j != nil {
+			state = j.State
+		} else {
+			state = ""
 		}
-		time.Sleep(10 * time.Millisecond)
+		hasLease = e.HasLease(id)
+		shared, ex = e.Locks.Held("mach1")
+		if state == catalog.JobStateFailed && !hasLease && shared == 0 && ex == 0 {
+			t.Logf("S3-F10 PASS: cancel timeout force-failed and released lease")
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-	j, _ = e.Job(ctx, id)
-	if j.State != catalog.JobStateFailed {
-		t.Fatalf("S3-F10: after cancel timeout state=%s want failed", j.State)
-	}
-	if e.HasLease(id) {
-		t.Fatal("S3-F10: lease not released after cancel timeout")
-	}
-	s, x := e.Locks.Held("mach1")
-	if s != 0 || x != 0 {
-		t.Fatalf("held shared=%d exclusive=%d", s, x)
-	}
-	t.Logf("S3-F10 PASS: cancel timeout force-failed and released lease")
+	t.Fatalf("S3-F10: timeout waiting for failed+lease-released+locks-zero; "+
+		"state=%q hasLease=%v held shared=%d exclusive=%d",
+		state, hasLease, shared, ex)
 }
