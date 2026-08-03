@@ -1,19 +1,25 @@
 package web
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ajthom90/breakwater/server/internal/audit"
 	"github.com/ajthom90/breakwater/server/internal/catalog"
+	"github.com/ajthom90/breakwater/server/internal/enroll"
 	"github.com/ajthom90/breakwater/server/internal/keystore"
 	"github.com/ajthom90/breakwater/server/internal/rescan"
 	"github.com/ajthom90/breakwater/server/internal/retention"
 	"github.com/ajthom90/breakwater/server/internal/scheduler"
 	"github.com/ajthom90/breakwater/server/internal/vault"
+	"github.com/oklog/ulid/v2"
 )
 
 // API is the REST surface for the embedded UI and bwctl.
@@ -31,6 +37,11 @@ import (
 //	POST /api/v1/machines/{id}/retention
 //	POST /api/v1/machines/{id}/scrub
 //
+// Enrollment (operator path — not destructive):
+//
+//	POST /api/v1/enroll-tokens — mint one-time agent enrollment token
+//	GET  /api/v1/enroll-tokens — list token metadata (never secrets)
+//
 // Auth remains the single dev API token (M6 replaces with sessions).
 //
 // # Destructive API gate (M5-F1)
@@ -40,6 +51,10 @@ import (
 // (--enable-destructive-api). The read token alone must not grant destroy.
 // Audit still records actor/actorType when enabled so M6 can drop real
 // identities in without changing call sites.
+//
+// Enroll-token mint is **not** behind EnableDestructiveAPI: minting creates a
+// credential, it does not destroy backup data, and gating it there would force
+// operators to enable destroy-capable endpoints just to enroll a machine.
 type API struct {
 	DB        *catalog.DB
 	Auditor   *audit.Writer
@@ -50,8 +65,10 @@ type API struct {
 	Retention *retention.Service
 	// EnableDestructiveAPI gates M5 retention-mutating endpoints (default false).
 	EnableDestructiveAPI bool
-	Version              string
-	Log                  *slog.Logger
+	// ServerFP is embedded in mint responses (running server identity).
+	ServerFP string
+	Version  string
+	Log      *slog.Logger
 }
 
 // Register mounts /api/v1/* handlers on mux behind auth middleware.
@@ -66,6 +83,10 @@ func (a *API) Register(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/v1/audit", a.handleListAudit)
 	mux.HandleFunc("GET /api/v1/events", a.handleSSE)
 	mux.HandleFunc("POST /api/v1/rescan", a.handleRescan)
+	// Enrollment tokens: mint is not destructive (see API doc comment).
+	// Gated only by RequireAPIToken (via Mount), never by --enable-destructive-api.
+	mux.HandleFunc("POST /api/v1/enroll-tokens", a.handleMintEnrollToken)
+	mux.HandleFunc("GET /api/v1/enroll-tokens", a.handleListEnrollTokens)
 	// M5 retention — human-authenticated :8443 only; further gated by
 	// EnableDestructiveAPI (M5-F1). Always register so paths 403 cleanly when off.
 	mux.HandleFunc("POST /api/v1/snapshots/{id}/forget", a.requireDestructive(a.handleForget))
@@ -516,6 +537,143 @@ func (a *API) handleListAudit(w http.ResponseWriter, r *http.Request) {
 		"chain_ok":  chainOK,
 		"chain_err": chainErr,
 	})
+}
+
+// mintEnrollTokenRequest is POST /api/v1/enroll-tokens body.
+//
+// advertise_addr is the host:port the *agent* will dial (often a LAN IP of the
+// TrueNAS box), not the server's own bind address. Required; never guessed from
+// the HTTP request. Server fingerprint always comes from a.ServerFP.
+type mintEnrollTokenRequest struct {
+	AdvertiseAddr string `json:"advertise_addr"`
+	TTLSeconds    int    `json:"ttl_seconds"` // optional; default 24h (PLAN)
+	Note          string `json:"note"`        // optional; audit only
+	CreatedBy     string `json:"created_by"`  // optional; defaults to "api"
+}
+
+func (a *API) handleMintEnrollToken(w http.ResponseWriter, r *http.Request) {
+	if a.DB == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "catalog not configured")
+		return
+	}
+	if a.ServerFP == "" {
+		writeJSONError(w, http.StatusServiceUnavailable, "server identity fingerprint not configured")
+		return
+	}
+	var req mintEnrollTokenRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	advertise := strings.TrimSpace(req.AdvertiseAddr)
+	if advertise == "" {
+		writeJSONError(w, http.StatusBadRequest, "advertise_addr required (host:port the agent will dial, e.g. 10.0.0.5:9443)")
+		return
+	}
+	if _, _, err := net.SplitHostPort(advertise); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "advertise_addr must be host:port (got "+advertise+")")
+		return
+	}
+
+	ttl := enroll.DefaultTTL
+	if req.TTLSeconds > 0 {
+		ttl = time.Duration(req.TTLSeconds) * time.Second
+	}
+	// Cap TTL to a sane upper bound (30d) to avoid permanent tokens by accident.
+	const maxTTL = 30 * 24 * time.Hour
+	if ttl > maxTTL {
+		writeJSONError(w, http.StatusBadRequest, "ttl_seconds exceeds maximum (30 days)")
+		return
+	}
+
+	raw, secret, err := enroll.Mint(advertise, a.ServerFP)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "mint failed")
+		return
+	}
+	// secret is plaintext of the token secret portion only — hashed before store.
+	id := ulid.MustNew(ulid.Timestamp(time.Now()), ulid.Monotonic(rand.Reader, 0)).String()
+	expires := time.Now().UTC().Add(ttl)
+	createdBy := strings.TrimSpace(req.CreatedBy)
+	if createdBy == "" {
+		createdBy = "api"
+	}
+	if note := strings.TrimSpace(req.Note); note != "" && createdBy == "api" {
+		// Prefer note as created_by label when no explicit actor was given.
+		createdBy = note
+	}
+	if err := a.DB.InsertEnrollToken(r.Context(), id, secret, createdBy, expires); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "persist token failed")
+		return
+	}
+
+	// Log only id + advertise — never the token or secret.
+	if a.Log != nil {
+		a.Log.Info("enrollment token minted",
+			"token_id", id,
+			"advertise_addr", advertise,
+			"expires_at", expires.Format(time.RFC3339),
+			"created_by", createdBy,
+		)
+	}
+	if a.Auditor != nil {
+		// WithoutCancel: audit must survive client disconnect (S1-F1).
+		_ = a.Auditor.Append(context.WithoutCancel(r.Context()), audit.Event{
+			Actor: createdBy, ActorType: audit.ActorUser,
+			Action: audit.ActionMachineTokenCreate, Target: id,
+			Detail: map[string]any{
+				"advertise_addr": advertise,
+				"ttl_seconds":    int(ttl.Seconds()),
+				"note":           strings.TrimSpace(req.Note),
+				// secret intentionally omitted
+			},
+		})
+	}
+
+	// Full token string returned once; never again.
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"id":         id,
+		"token":      raw,
+		"expires_at": expires.Format(time.RFC3339Nano),
+		"advertise":  advertise,
+	})
+}
+
+func (a *API) handleListEnrollTokens(w http.ResponseWriter, r *http.Request) {
+	if a.DB == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "catalog not configured")
+		return
+	}
+	limit := 50
+	if s := r.URL.Query().Get("limit"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	rows, err := a.DB.ListEnrollTokens(r.Context(), limit)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Never return secret or secret_hash.
+	out := make([]map[string]any, 0, len(rows))
+	for _, t := range rows {
+		m := map[string]any{
+			"id":         t.ID,
+			"created_by": t.CreatedBy,
+			"created_at": formatTime(t.CreatedAt),
+			"expires_at": formatTime(t.ExpiresAt),
+			"used":       t.UsedAt != nil,
+		}
+		if t.UsedAt != nil {
+			m["used_at"] = formatTime(*t.UsedAt)
+		}
+		if t.MachineID != "" {
+			m["machine_id"] = t.MachineID
+		}
+		out = append(out, m)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tokens": out})
 }
 
 func toMachineDTO(m catalog.Machine) machineDTO {

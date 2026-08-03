@@ -29,6 +29,9 @@ type Config struct {
 	EnableDestructiveAPI bool
 	// APIToken is the dev local token (from LoadOrCreateAPIToken).
 	APIToken string
+	// ServerFP is the SHA-256 hex fingerprint of the running server identity.
+	// Embedded in enrollment tokens (never accepted from the client).
+	ServerFP string
 	Version  string
 	Log      *slog.Logger
 }
@@ -68,6 +71,7 @@ func NewHandler(cfg Config) http.Handler {
 		Keystore:             cfg.Keystore,
 		Retention:            cfg.Retention,
 		EnableDestructiveAPI: cfg.EnableDestructiveAPI,
+		ServerFP:             cfg.ServerFP,
 		Version:              cfg.Version,
 		Log:                  cfg.Log,
 	}

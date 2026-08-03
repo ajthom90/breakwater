@@ -95,3 +95,81 @@ func HashSecret(secret string) string {
 	sum := sha256.Sum256([]byte(secret))
 	return hex.EncodeToString(sum[:])
 }
+
+// EnrollTokenByID loads a token metadata row (never returns the secret; hash
+// is available for test assertions only — REST list omits it).
+func (db *DB) EnrollTokenByID(ctx context.Context, id string) (*EnrollToken, error) {
+	row := db.sql.QueryRowContext(ctx, `
+		SELECT id, secret_hash, expires_at, used_at, COALESCE(created_by, ''),
+		       COALESCE(machine_id, ''), created_at
+		FROM enroll_tokens WHERE id = ?`, id)
+	return scanEnrollToken(row)
+}
+
+// ListEnrollTokens returns token metadata newest-first (no secrets).
+func (db *DB) ListEnrollTokens(ctx context.Context, limit int) ([]EnrollToken, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	rows, err := db.sql.QueryContext(ctx, `
+		SELECT id, secret_hash, expires_at, used_at, COALESCE(created_by, ''),
+		       COALESCE(machine_id, ''), created_at
+		FROM enroll_tokens
+		ORDER BY created_at DESC
+		LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EnrollToken
+	for rows.Next() {
+		t, err := scanEnrollToken(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+func scanEnrollToken(row scannable) (*EnrollToken, error) {
+	var t EnrollToken
+	var expires, created string
+	var used, machine sql.NullString
+	if err := row.Scan(&t.ID, &t.SecretHash, &expires, &used, &t.CreatedBy, &machine, &created); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var err error
+	t.ExpiresAt, err = parseTimeFlexible(expires)
+	if err != nil {
+		return nil, fmt.Errorf("expires_at: %w", err)
+	}
+	t.CreatedAt, err = parseTimeFlexible(created)
+	if err != nil {
+		return nil, fmt.Errorf("created_at: %w", err)
+	}
+	if used.Valid {
+		ut, err := parseTimeFlexible(used.String)
+		if err == nil {
+			t.UsedAt = &ut
+		}
+	}
+	if machine.Valid {
+		t.MachineID = machine.String
+	}
+	return &t, nil
+}
+
+func parseTimeFlexible(s string) (time.Time, error) {
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		t, err = time.Parse(time.RFC3339, s)
+	}
+	return t, err
+}

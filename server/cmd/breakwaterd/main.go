@@ -186,6 +186,7 @@ func main() {
 		Retention:            retentionSvc,
 		EnableDestructiveAPI: *enableDestructiveAPI,
 		APIToken:             apiToken,
+		ServerFP:             serverFP, // enroll-token mint embeds running identity
 		Version:              version,
 		Log:                  log,
 	})

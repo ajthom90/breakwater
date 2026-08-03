@@ -1,76 +1,94 @@
-# Breakwater server — TrueNAS SCALE / bare-metal Docker deployment.
+# Breakwater server — TrueNAS SCALE deployment (pull from GHCR, no local build).
 #
-# Differs from docker-compose.yml (dev, named volumes) by using BIND MOUNTS to
-# ZFS datasets you control, per PLAN §Deployment:
-#
-#   /data   → recordsize=64K            (catalog + keys; small random I/O)
-#   /repos  → recordsize=1M, lz4, dedup=off  (bulk content; kopia already
-#                                             compresses + encrypts, so ZFS
-#                                             dedup would burn RAM for nothing)
+# Image is published by .github/workflows/publish.yml on every push to main.
+# Pin to an immutable tag for anything you care about:
+#   ghcr.io/ajthom90/breakwater:sha-<short>
+# `:main` is the moving default-branch tag (pre-v0.1.0 there is no release tag).
 #
 # ---------------------------------------------------------------------------
-# BEFORE FIRST RUN — the container runs as distroless `nonroot` (uid/gid 65532),
-# so the bind-mounted directories must be writable by that uid:
+# 1. DATASETS  (pool AAPOOL)
 #
-#   sudo mkdir -p /mnt/tank/breakwater/data /mnt/tank/breakwater/repos
-#   sudo chown -R 65532:65532 /mnt/tank/breakwater
+# Create these as sub-datasets so ZFS properties can differ per PLAN §Deployment:
+#
+#   AAPOOL/apps/breakwater/data    → /mnt/AAPOOL/apps/breakwater/data
+#       zfs set recordsize=64K AAPOOL/apps/breakwater/data
+#
+#   AAPOOL/apps/breakwater/repos   → /mnt/AAPOOL/apps/breakwater/repos
+#       zfs set recordsize=1M     AAPOOL/apps/breakwater/repos
+#       zfs set compression=lz4   AAPOOL/apps/breakwater/repos
+#       zfs set dedup=off         AAPOOL/apps/breakwater/repos
+#
+# dedup=off is deliberate: kopia already content-addresses, compresses and
+# encrypts, so ZFS dedup would consume RAM for no additional saving.
+#
+# 2. PERMISSIONS — the image is distroless `nonroot` (uid/gid 65532):
+#
+#   sudo chown -R 65532:65532 /mnt/AAPOOL/apps/breakwater
 #
 # Without this the server exits immediately on a permission error.
+#
+# 3. GHCR ACCESS — packages default to PRIVATE. Either flip the package to
+#    public in the repo's Packages settings, or authenticate on TrueNAS:
+#
+#   echo <github-PAT-with-read:packages> | docker login ghcr.io -u ajthom90 --password-stdin
+#
+# 4. RUN
+#
+#   docker compose -f docker-compose.truenas.yml pull
+#   docker compose -f docker-compose.truenas.yml up -d
+#   docker compose -f docker-compose.truenas.yml logs -f
+#
+# 5. FIRST AGENT ENROLLMENT
+#
+#   export BW_API_TOKEN="$(sudo cat /mnt/AAPOOL/apps/breakwater/data/api-token)"
+#   # --advertise is the address the WINDOWS GUEST dials: TrueNAS LAN IP + 48620
+#   bwctl token mint --server https://127.0.0.1:48621 --insecure \
+#     --token "$BW_API_TOKEN" --advertise <TRUENAS_LAN_IP>:48620 --note "ws2022-vm"
+#   # stdout = BW1:… token (shown once) → msiexec /i breakwater-agent.msi /qn BWTOKEN=<token>
+#
 # ---------------------------------------------------------------------------
+# PORTS: host 48620/48621 → container 9443/8443.
+# The container keeps PLAN's canonical ports internally; only the published
+# host ports differ. Agents authenticate the server by CERTIFICATE FINGERPRINT
+# (pinned inside the enrollment token), not hostname — so a bare IP is fine and
+# no DNS/SAN setup is needed. Browsers on :48621 will warn about the
+# self-signed cert; expected until the M6 auth/TLS work.
 #
-# Run:
-#   docker compose -f packaging/docker/docker-compose.truenas.yml up -d --build
-#   docker compose -f packaging/docker/docker-compose.truenas.yml logs -f
-#
-# First boot prints the API token preview and the server fingerprint. Read the
-# full API token from the host:
-#   sudo cat /mnt/tank/breakwater/data/api-token
-#
-# NOTE: agents authenticate the server by CERTIFICATE FINGERPRINT (pinned inside
-# the enrollment token), not by hostname — so pointing agents at a bare IP is
-# fine and no DNS/SAN setup is required. Browsers hitting :8443 WILL warn about
-# the self-signed cert; that is expected until M11/M6 TLS work.
-#
-# The server identity is persisted at /data/keys/server.{crt,key}. Do NOT wipe
-# /data — the fingerprint would change and every enrolled agent would refuse to
-# connect (pin mismatch) and need re-enrollment.
+# DO NOT wipe the data dataset: the server identity lives at
+# /data/keys/server.{crt,key} and its fingerprint is embedded in every
+# enrollment token. Losing it forces re-enrollment of every agent.
+# ---------------------------------------------------------------------------
 
 services:
   breakwater:
-    image: breakwater:dev
-    build:
-      context: ../..
-      dockerfile: packaging/docker/Dockerfile
+    image: ghcr.io/ajthom90/breakwater:main
     container_name: breakwater
 
-    # Change the host paths to your datasets. Container paths must stay /data
-    # and /repos unless you also change the -data/-repos flags below.
     volumes:
-      - /mnt/tank/breakwater/data:/data
-      - /mnt/tank/breakwater/repos:/repos
+      - /mnt/AAPOOL/apps/breakwater/data:/data
+      - /mnt/AAPOOL/apps/breakwater/repos:/repos
 
     ports:
-      - "9443:9443"   # agent mTLS (agents dial OUT to this — the only inbound port they need)
-      - "8443:8443"   # web UI + REST (HTTPS, self-signed)
+      - "48620:9443"   # agent mTLS — the only port agents need (they dial out)
+      - "48621:8443"   # web UI + REST (HTTPS, self-signed)
 
     command:
       - "-data=/data"
       - "-repos=/repos"
       - "-agent-addr=:9443"
       - "-web-addr=:8443"
-      # Cosmetic for agents (they pin by fingerprint); used as the cert CN.
       - "-hostname=breakwater"
       # Destructive REST (forget / prune / retention / scrub) is OFF by default.
-      # Leave it off until M6 adds real auth — today the only gate is the static
-      # dev API token, so enabling this makes a read-scoped token leak a
-      # destroy-scoped leak. Enable deliberately and temporarily if you need it:
+      # Leave it off until M6 adds real auth: today the only gate is the static
+      # dev API token, so enabling this turns a read-scoped token leak into a
+      # destroy-scoped one. Enable deliberately and temporarily if needed:
       # - "-enable-destructive-api"
 
     restart: unless-stopped
 
-    # No HEALTHCHECK: the image is distroless (no shell, no curl/wget) so there
-    # is nothing in-container to probe with. Check from the host instead:
-    #   curl -sk https://<host>:8443/healthz
+    # No HEALTHCHECK: distroless has no shell or curl to probe with.
+    # From the TrueNAS host instead:
+    #   curl -sk https://127.0.0.1:48621/healthz
     logging:
       driver: json-file
       options:

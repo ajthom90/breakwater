@@ -74,9 +74,10 @@ const (
 
 // Action names used by the server (subset of PLAN audit taxonomy).
 const (
-	ActionMachineEnroll  = "machine.enroll"
-	ActionAuthFail       = "auth.fail"
-	ActionSnapshotCommit = "snapshot.commit" // M2-S3: agent CommitSnapshot (not per-chunk)
+	ActionMachineEnroll      = "machine.enroll"
+	ActionMachineTokenCreate = "machine.token_create" // POST /api/v1/enroll-tokens
+	ActionAuthFail           = "auth.fail"
+	ActionSnapshotCommit     = "snapshot.commit" // M2-S3: agent CommitSnapshot (not per-chunk)
 	// Restores are first-class audit events (PLAN taxonomy). One event per
 	// browse/list or file GetObject — NOT per GetContentRange chunk.
 	ActionRestoreBrowse = "restore.browse"

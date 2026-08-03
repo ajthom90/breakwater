@@ -26,8 +26,8 @@ Set up on WS2022 first — everything below can be done on that one guest.
 Several drills below need a pristine machine, and reverting is far faster than
 uninstalling. Take a second snapshot `enrolled` after step 2 succeeds.
 
-Networking: the guest must reach the Breakwater server on **:9443** (agent) and
-**:8443** (web/REST). Agents always dial out, so no inbound rules on the guest.
+Networking: the guest must reach the Breakwater server on **:48620** (agent) and
+**:48621** (web/REST). Agents always dial out, so no inbound rules on the guest.
 
 ---
 
@@ -47,10 +47,31 @@ Verify the published SHA256 matches before installing. Record the run ID used.
 
 ## 2. MSI install with enrollment token  → untested item **#4**, **#5**
 
-On the server, mint a token, then on the guest:
+### 2a. Mint an enrollment token (server host)
+
+Read the API token from the data volume, then mint. **`--advertise` is the
+address the Windows guest will dial** (TrueNAS LAN IP + port 48620), not
+the server's bind address:
+
+```bash
+export BW_API_TOKEN="$(sudo cat /mnt/AAPOOL/apps/breakwater/data/api-token)"
+# Replace with the TrueNAS LAN IP the guest can reach on :48620
+bwctl token mint \
+  --server https://127.0.0.1:48621 --insecure \
+  --token "$BW_API_TOKEN" \
+  --advertise <TRUENAS_LAN_IP>:48620 \
+  --note "ws2022-vm"
+# stdout = full BW1:… token (shown once). stderr prints the msiexec line.
+```
+
+REST equivalent: `POST /api/v1/enroll-tokens` with
+`{"advertise_addr":"<TRUENAS_LAN_IP>:48620"}` and `Authorization: Bearer <api-token>`.
+
+### 2b. Install the agent (Windows guest)
 
 ```powershell
 # Verbose log is deliberate — we are testing that the token is REDACTED from it.
+# Paste the token from bwctl stdout (or the BWTOKEN= line from stderr).
 msiexec /i breakwater-agent.msi /qn BWTOKEN=BW1:<host:port>:<fp>:<secret> /l*v C:\install.log
 ```
 
